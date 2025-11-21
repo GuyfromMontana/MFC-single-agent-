@@ -1,4 +1,4 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-zep-cloud==1.2.1
+zep-cloud>=2.0.0
 python-dotenv==1.0.0
