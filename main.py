@@ -218,19 +218,19 @@ async def get_caller_context(phone_number: str) -> dict:
             
             # Try to get their conversation history
             try:
-                # Get threads for this user
-                threads = zep.thread.list(user_id=phone_number)
-                thread_count = len(threads) if threads else 0
-                print(f"   ✓ Found {thread_count} conversation threads")
+                # Get sessions/memory for this user
+                sessions = zep.memory.list_sessions(user_id=phone_number)
+                session_count = len(sessions) if sessions else 0
+                print(f"   ✓ Found {session_count} conversation sessions")
                 
                 # User exists and has history
                 return {
                     "is_returning_caller": True,
-                    "conversation_count": thread_count,
-                    "summary": f"Returning caller with {thread_count} previous conversations."
+                    "conversation_count": session_count,
+                    "summary": f"Returning caller with {session_count} previous conversations."
                 }
-            except Exception as thread_error:
-                print(f"   ℹ Could not retrieve threads: {thread_error}")
+            except Exception as session_error:
+                print(f"   ℹ Could not retrieve sessions: {session_error}")
                 return {
                     "is_returning_caller": True,
                     "summary": "Returning caller with previous conversation history."
@@ -275,21 +275,29 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         if not name:
             name = "Unknown Caller"
         
+        # Build notes combining all relevant info
+        notes_parts = []
+        if primary_interest:
+            notes_parts.append(primary_interest)
+        if county:
+            notes_parts.append(f"County: {county}")
+        if herd_size:
+            notes_parts.append(f"Herd size: {herd_size}")
+        if livestock_type:
+            notes_parts.append(f"Livestock: {livestock_type}")
+        notes = " | ".join(notes_parts) if notes_parts else "No details provided"
+        
+        # Minimal lead data - only fields that definitely exist
         lead_data = {
             "name": name,
             "phone": lead_phone,
-            "email": email,
-            "county": county,
-            "notes": primary_interest,
-            "herd_size": herd_size,
-            "livestock_type": livestock_type,
-            "status": "new",
-            "created_at": datetime.utcnow().isoformat()
+            "notes": notes,
+            "status": "new"
         }
         
-        # Remove empty fields
-        lead_data = {k: v for k, v in lead_data.items() if v}
-        lead_data["status"] = "new"  # Always include status
+        # Only add email if provided
+        if email:
+            lead_data["email"] = email
         
         print(f"   📝 Lead data: {lead_data}")
         
@@ -388,10 +396,11 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
         
         # First create the thread, then add messages
         try:
-            # Create thread first
+            # Create thread first using the correct method
             try:
-                zep.thread.add(
-                    thread_id=thread_id,
+                # Try creating a new session/thread
+                zep.memory.add_session(
+                    session_id=thread_id,
                     user_id=user_id,
                     metadata={
                         "call_id": call_id,
@@ -400,21 +409,21 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
                         "created_at": datetime.utcnow().isoformat()
                     }
                 )
-                print(f"   ✓ Created thread: {thread_id}")
-            except Exception as thread_error:
-                # Thread might already exist, that's okay
-                if "already exists" in str(thread_error).lower():
-                    print(f"   ℹ Thread already exists: {thread_id}")
+                print(f"   ✓ Created session: {thread_id}")
+            except Exception as session_error:
+                # Session might already exist, that's okay
+                if "already exists" in str(session_error).lower():
+                    print(f"   ℹ Session already exists: {thread_id}")
                 else:
-                    print(f"   ⚠️ Thread creation note: {thread_error}")
+                    print(f"   ⚠️ Session creation note: {session_error}")
             
-            # Now add messages to the thread
-            zep.thread.add_messages(
-                thread_id=thread_id,
+            # Now add messages to the session using memory.add
+            zep.memory.add(
+                session_id=thread_id,
                 messages=zep_messages
             )
             
-            print(f"   ✓ Conversation saved successfully to thread: {thread_id}")
+            print(f"   ✓ Conversation saved successfully to session: {thread_id}")
             print(f"   Messages saved: {len(zep_messages)}")
             
         except Exception as e:
