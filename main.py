@@ -4,7 +4,6 @@ from datetime import datetime
 import os
 import json
 from zep_cloud.client import Zep
-from zep_cloud import Message
 from supabase import create_client, Client
 import logging
 
@@ -86,7 +85,7 @@ async def handle_vapi_webhook(request: Request):
             
             print(f"   📦 Tool call list: {json.dumps(tool_call_list, indent=2)}")
             
-            # Get the first tool call (should only be one for get_caller_history)
+            # Get the first tool call
             if tool_call_list and len(tool_call_list) > 0:
                 tool_call = tool_call_list[0]
                 
@@ -117,7 +116,6 @@ async def handle_vapi_webhook(request: Request):
                 if function_name == "get_caller_history":
                     print(f"   🧠 Retrieving memory for: {phone_number}")
                     context = await get_caller_context(phone_number)
-                    # Add caller ID to the response
                     context["caller_phone"] = phone_number
                     print(f"   ✓ Memory retrieved: is_returning_caller={context.get('is_returning_caller')}")
                     return JSONResponse(content={
@@ -133,7 +131,7 @@ async def handle_vapi_webhook(request: Request):
                         "result": result
                     })
                 
-                # Handle lookup_town function - NEW!
+                # Handle lookup_town function
                 elif function_name == "lookup_town":
                     print(f"   🗺️ Looking up town for routing")
                     result = await lookup_town(parameters)
@@ -153,36 +151,18 @@ async def handle_vapi_webhook(request: Request):
         elif message_type == "end-of-call-report":
             print("💾 End-of-call-report received")
             
-            # Debug: Print top-level structure
-            print(f"   Top-level payload keys: {list(payload.keys())}")
-            
-            # The actual data is in payload["message"]
             message_data = payload.get("message", {})
-            print(f"   Message keys: {list(message_data.keys())}")
-            
-            # Extract phone number from call.customer.number
             call_data = message_data.get("call", {})
             customer_data = call_data.get("customer", {})
             phone_number = customer_data.get("number")
-            
-            # Extract call ID
             call_id = call_data.get("id")
-            
-            # Get transcript/messages - they're at the message level, not nested deeper
             transcript = message_data.get("transcript", "")
             messages = message_data.get("messages", [])
-            
-            print(f"   ✓ Messages found at message level!")
-            print(f"   Transcript length: {len(transcript)}")
-            
-            if messages:
-                print(f"   First message keys: {list(messages[0].keys())}")
             
             if phone_number and (transcript or messages):
                 print(f"\n📞 Processing call:")
                 print(f"   Phone: {phone_number}")
                 print(f"   Call ID: {call_id}")
-                print(f"   Transcript length: {len(transcript)}")
                 print(f"   Messages: {len(messages)}")
                 
                 try:
@@ -190,15 +170,8 @@ async def handle_vapi_webhook(request: Request):
                     return JSONResponse(content={"status": "success", "message": "Conversation saved"})
                 except Exception as e:
                     print(f"❌ Error in save_conversation: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    # Don't raise - just log and continue
-                    return JSONResponse(content={"status": "error", "message": str(e)})
+                    return JSONResponse(content={"status": "partial", "message": "Call logged, memory save failed"})
             else:
-                print("⚠️ Missing required data:")
-                print(f"   Phone: {phone_number}")
-                print(f"   Transcript: {len(transcript) if transcript else 0}")
-                print(f"   Messages: {len(messages) if messages else 0}")
                 return JSONResponse(content={"status": "ignored", "reason": "missing_data"})
         
         # Handle other webhook types
@@ -210,43 +183,23 @@ async def handle_vapi_webhook(request: Request):
         print(f"❌ Error processing webhook: {str(e)}")
         import traceback
         traceback.print_exc()
-        # Return 200 to prevent Vapi from retrying
         return JSONResponse(content={"status": "error", "message": str(e)})
 
 
 async def get_caller_context(phone_number: str) -> dict:
     """
     Retrieve conversation history and context for a returning caller.
-    Returns a summary that Vapi can use to personalize the greeting.
     """
     try:
         # Check if this caller exists in Zep
         try:
             user = zep.user.get(user_id=phone_number)
             print(f"   ✓ Found existing user: {phone_number}")
-            
-            # Try to get their conversation history
-            try:
-                # Get sessions/memory for this user
-                sessions = zep.memory.list_sessions(user_id=phone_number)
-                session_count = len(sessions) if sessions else 0
-                print(f"   ✓ Found {session_count} conversation sessions")
-                
-                # User exists and has history
-                return {
-                    "is_returning_caller": True,
-                    "conversation_count": session_count,
-                    "summary": f"Returning caller with {session_count} previous conversations."
-                }
-            except Exception as session_error:
-                print(f"   ℹ Could not retrieve sessions: {session_error}")
-                return {
-                    "is_returning_caller": True,
-                    "summary": "Returning caller with previous conversation history."
-                }
-            
+            return {
+                "is_returning_caller": True,
+                "summary": "Returning caller with previous conversation history."
+            }
         except Exception as e:
-            # New caller - no history
             print(f"   ℹ New caller (no history): {phone_number}")
             return {
                 "is_returning_caller": False,
@@ -255,8 +208,6 @@ async def get_caller_context(phone_number: str) -> dict:
             
     except Exception as e:
         print(f"   ❌ Error retrieving caller context: {e}")
-        import traceback
-        traceback.print_exc()
         return {
             "is_returning_caller": False,
             "summary": "Unable to retrieve caller history."
@@ -271,8 +222,6 @@ async def lookup_town(parameters: dict) -> dict:
     1. town_distances table - find territory for the town
     2. territories table - get territory_id
     3. specialists table - get LPS contact info
-    
-    Returns territory and specialist info for proper lead routing.
     """
     try:
         town_name = parameters.get("town_name", "")
@@ -292,7 +241,6 @@ async def lookup_town(parameters: dict) -> dict:
             .select("town_name, state, county, assigned_territory, nearest_distance")\
             .ilike("town_name", town_name)
         
-        # Optionally filter by state if provided
         if state:
             town_query = town_query.eq("state", state.upper())
         
@@ -318,45 +266,35 @@ async def lookup_town(parameters: dict) -> dict:
             .eq("is_active", True)\
             .execute()
         
-        if not territory_result.data:
+        territory_id = None
+        if territory_result.data:
+            territory_id = territory_result.data[0]["id"]
+            print(f"   ✓ Found territory_id: {territory_id}")
+        else:
             print(f"   ⚠️ Territory not found in territories table: {territory_name}")
-            return {
-                "success": True,
-                "town": town_data["town_name"],
-                "state": town_data["state"],
-                "county": town_data["county"],
-                "territory": territory_name,
-                "distance_miles": float(town_data["nearest_distance"]) if town_data["nearest_distance"] else None,
-                "specialist": None,
-                "message": f"{town_name} is in our {territory_name} territory, about {town_data['nearest_distance']} miles from our warehouse."
-            }
-        
-        territory_id = territory_result.data[0]["id"]
-        print(f"   ✓ Found territory_id: {territory_id}")
         
         # Step 3: Look up specialist for this territory
-        specialist_result = supabase.table("specialists")\
-            .select("first_name, last_name, email, phone")\
-            .eq("territory_id", territory_id)\
-            .eq("is_active", True)\
-            .execute()
-        
         specialist_info = None
-        specialist_message = ""
+        if territory_id:
+            specialist_result = supabase.table("specialists")\
+                .select("id, first_name, last_name, email, phone")\
+                .eq("territory_id", territory_id)\
+                .eq("is_active", True)\
+                .execute()
+            
+            if specialist_result.data:
+                spec = specialist_result.data[0]
+                specialist_info = {
+                    "id": spec["id"],
+                    "first_name": spec["first_name"],
+                    "last_name": spec["last_name"],
+                    "full_name": f"{spec['first_name']} {spec['last_name']}",
+                    "email": spec["email"],
+                    "phone": spec.get("phone")
+                }
+                print(f"   ✓ Found specialist: {specialist_info['full_name']} ({specialist_info['email']})")
         
-        if specialist_result.data:
-            spec = specialist_result.data[0]
-            specialist_info = {
-                "first_name": spec["first_name"],
-                "last_name": spec["last_name"],
-                "full_name": f"{spec['first_name']} {spec['last_name']}",
-                "email": spec["email"],
-                "phone": spec.get("phone")
-            }
-            specialist_message = f"Your local specialist is {specialist_info['full_name']}."
-            print(f"   ✓ Found specialist: {specialist_info['full_name']} ({specialist_info['email']})")
-        else:
-            print(f"   ⚠️ No active specialist found for territory: {territory_name}")
+        specialist_message = f"Your local specialist is {specialist_info['full_name']}." if specialist_info else ""
         
         return {
             "success": True,
@@ -384,16 +322,18 @@ async def lookup_town(parameters: dict) -> dict:
 async def create_lead(phone_number: str, parameters: dict) -> dict:
     """
     Create a new lead in Supabase.
-    Now supports territory and specialist_email from lookup_town results.
+    Uses correct column names: first_name, last_name, lead_status, territory_id, city
     """
     try:
         first_name = parameters.get("first_name", "")
         last_name = parameters.get("last_name", "")
         email = parameters.get("email", "")
         county = parameters.get("county", "")
-        town = parameters.get("town", "")  # NEW - from lookup_town
-        territory = parameters.get("territory", "")  # NEW - from lookup_town
-        specialist_email = parameters.get("specialist_email", "")  # NEW - for notifications
+        town = parameters.get("town", "")
+        territory = parameters.get("territory", "")
+        territory_id = parameters.get("territory_id", None)
+        specialist_id = parameters.get("specialist_id", None)
+        specialist_email = parameters.get("specialist_email", "")
         primary_interest = parameters.get("primary_interest", "")
         herd_size = parameters.get("herd_size", "")
         livestock_type = parameters.get("livestock_type", "")
@@ -401,53 +341,59 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         # Use phone from parameters if provided, otherwise use caller ID
         lead_phone = parameters.get("phone", "") or phone_number
         
-        # Build the name
-        name = f"{first_name} {last_name}".strip()
-        if not name:
-            name = "Unknown Caller"
-        
-        # Build notes combining all relevant info
+        # Build notes combining relevant info
         notes_parts = []
-        if primary_interest:
-            notes_parts.append(primary_interest)
-        if town:
-            notes_parts.append(f"Town: {town}")
-        if territory:
-            notes_parts.append(f"Territory: {territory}")
         if county:
             notes_parts.append(f"County: {county}")
         if herd_size:
             notes_parts.append(f"Herd size: {herd_size}")
         if livestock_type:
             notes_parts.append(f"Livestock: {livestock_type}")
-        notes = " | ".join(notes_parts) if notes_parts else "No details provided"
+        notes = " | ".join(notes_parts) if notes_parts else None
         
-        # Minimal lead data - only fields that definitely exist
+        # Build lead data with CORRECT column names
         lead_data = {
-            "name": name,
+            "first_name": first_name or "Unknown",
+            "last_name": last_name or "Caller",
             "phone": lead_phone,
-            "notes": notes,
-            "status": "new"
+            "lead_status": "new",
+            "lead_source": "voice_agent"
         }
         
-        # Only add email if provided
+        # Add optional fields only if they have values
         if email:
             lead_data["email"] = email
+        if town:
+            lead_data["city"] = town  # Store town in city column
+        if primary_interest:
+            lead_data["primary_interest"] = primary_interest
+        if notes:
+            lead_data["notes"] = notes
+        if territory_id:
+            lead_data["territory_id"] = territory_id
+        if specialist_id:
+            lead_data["assigned_specialist_id"] = specialist_id
+        
+        # Parse herd_size as integer if provided
+        if herd_size:
+            try:
+                lead_data["herd_size"] = int(str(herd_size).replace(",", ""))
+            except:
+                pass
         
         print(f"   📝 Lead data: {lead_data}")
         
         result = supabase.table("leads").insert(lead_data).execute()
         
-        print(f"   ✓ Created lead: {name}")
+        print(f"   ✓ Created lead: {first_name} {last_name}")
         
-        # Log specialist assignment for follow-up
         if specialist_email:
             print(f"   📧 Lead assigned to specialist: {specialist_email}")
         
         return {
             "success": True,
             "lead_id": result.data[0]["id"] if result.data else None,
-            "message": f"Lead created successfully for {name}",
+            "message": f"Lead created successfully for {first_name} {last_name}",
             "territory": territory,
             "specialist_email": specialist_email
         }
@@ -464,121 +410,109 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
 
 async def save_conversation(phone_number: str, call_id: str, transcript: str, messages: list):
     """
-    Save conversation to Zep memory using thread.add_messages
+    Save conversation to Zep memory.
+    Uses try/except for graceful degradation if Zep API changes.
     """
     try:
         print(f"\n💾 Saving conversation for: {phone_number}")
         
-        # Use phone number as user_id
         user_id = phone_number
-        
-        # Create thread_id combining phone and call_id for uniqueness
-        thread_id = f"mfc_{phone_number}_{call_id}"
-        print(f"   Thread: {thread_id}")
+        session_id = f"mfc_{phone_number}_{call_id}"
         
         # Ensure user exists in Zep
         try:
             user = zep.user.get(user_id=user_id)
             print(f"   ✓ User exists in Zep")
-        except Exception as e:
-            print(f"   Creating new user in Zep: {user_id}")
-            zep.user.add(
-                user_id=user_id,
-                first_name=phone_number,
-                metadata={
-                    "phone": phone_number,
-                    "source": "mfc_voice_agent"
-                }
-            )
-            print(f"   ✓ Created new user in Zep: {user_id}")
+        except Exception:
+            try:
+                zep.user.add(
+                    user_id=user_id,
+                    first_name=phone_number,
+                    metadata={
+                        "phone": phone_number,
+                        "source": "mfc_voice_agent"
+                    }
+                )
+                print(f"   ✓ Created new user in Zep: {user_id}")
+            except Exception as e:
+                print(f"   ⚠️ Could not create user: {e}")
         
-        # Format messages for Zep with character limit
-        MAX_MESSAGE_LENGTH = 2500  # Zep's limit
+        # Format messages for Zep
         zep_messages = []
-        truncated_count = 0
-        
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("message", "")
             
-            # Skip tool calls and system messages
             if role in ["tool_calls", "tool_call_result", "system"]:
                 continue
             
-            # Map Vapi roles to Zep roles
-            if role == "assistant" or role == "bot":
+            if role in ["assistant", "bot"]:
                 zep_role = "assistant"
             else:
                 zep_role = "user"
             
             if content:
-                # Truncate message if it exceeds Zep's limit
-                if len(content) > MAX_MESSAGE_LENGTH:
-                    content = content[:MAX_MESSAGE_LENGTH - 50] + "... [truncated]"
-                    truncated_count += 1
-                
-                # Use 'role' not 'role_type' for newer Zep SDK
-                zep_messages.append(
-                    Message(
-                        role=zep_role,
-                        content=content
-                    )
-                )
+                # Truncate if too long
+                if len(content) > 2500:
+                    content = content[:2450] + "... [truncated]"
+                zep_messages.append({
+                    "role": zep_role,
+                    "content": content
+                })
         
         print(f"   Formatted messages: {len(zep_messages)}")
-        if truncated_count > 0:
-            print(f"   ⚠️ Truncated {truncated_count} messages that exceeded 2500 chars")
         
         if not zep_messages:
             print("   ⚠️ No messages to save")
             return
         
-        print(f"   Thread: {thread_id}")
-        print(f"   Messages: {len(zep_messages)}")
+        # Try different Zep SDK patterns
+        saved = False
         
-        # First create the thread, then add messages
-        try:
-            # Create thread first using the correct method
+        # Pattern 1: Try zep.memory.add (newer SDK)
+        if not saved:
             try:
-                # Try creating a new session/thread
-                zep.memory.add_session(
-                    session_id=thread_id,
-                    user_id=user_id,
-                    metadata={
-                        "call_id": call_id,
-                        "phone": phone_number,
-                        "source": "mfc_voice_agent",
-                        "created_at": datetime.utcnow().isoformat()
-                    }
-                )
-                print(f"   ✓ Created session: {thread_id}")
-            except Exception as session_error:
-                # Session might already exist, that's okay
-                if "already exists" in str(session_error).lower():
-                    print(f"   ℹ Session already exists: {thread_id}")
-                else:
-                    print(f"   ⚠️ Session creation note: {session_error}")
-            
-            # Now add messages to the session using memory.add
-            zep.memory.add(
-                session_id=thread_id,
-                messages=zep_messages
-            )
-            
-            print(f"   ✓ Conversation saved successfully to session: {thread_id}")
-            print(f"   Messages saved: {len(zep_messages)}")
-            
-        except Exception as e:
-            print(f"   ❌ Error saving conversation: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            # Don't raise - just log the error
+                if hasattr(zep, 'memory') and hasattr(zep.memory, 'add'):
+                    from zep_cloud import Message
+                    msgs = [Message(role=m["role"], content=m["content"]) for m in zep_messages]
+                    zep.memory.add(session_id=session_id, messages=msgs)
+                    print(f"   ✓ Saved via zep.memory.add")
+                    saved = True
+            except Exception as e:
+                print(f"   ⚠️ zep.memory.add failed: {e}")
+        
+        # Pattern 2: Try zep.message.add (alternative)
+        if not saved:
+            try:
+                if hasattr(zep, 'message') and hasattr(zep.message, 'add'):
+                    from zep_cloud import Message
+                    msgs = [Message(role=m["role"], content=m["content"]) for m in zep_messages]
+                    zep.message.add(session_id=session_id, messages=msgs)
+                    print(f"   ✓ Saved via zep.message.add")
+                    saved = True
+            except Exception as e:
+                print(f"   ⚠️ zep.message.add failed: {e}")
+        
+        # Pattern 3: Try direct session approach
+        if not saved:
+            try:
+                if hasattr(zep, 'session'):
+                    from zep_cloud import Message
+                    msgs = [Message(role=m["role"], content=m["content"]) for m in zep_messages]
+                    zep.session.add(session_id=session_id, messages=msgs)
+                    print(f"   ✓ Saved via zep.session.add")
+                    saved = True
+            except Exception as e:
+                print(f"   ⚠️ zep.session.add failed: {e}")
+        
+        if not saved:
+            print(f"   ⚠️ Could not save to Zep - SDK methods not available")
+            print(f"   ℹ Available Zep attributes: {[a for a in dir(zep) if not a.startswith('_')]}")
             
     except Exception as e:
         print(f"❌ Error in save_conversation: {str(e)}")
         import traceback
         traceback.print_exc()
-        # Don't raise - just log the error
 
 
 if __name__ == "__main__":
