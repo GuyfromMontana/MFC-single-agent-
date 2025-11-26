@@ -121,7 +121,7 @@ async def handle_vapi_webhook(request: Request):
                     print(f"   🧠 Retrieving memory for: {phone_number}")
                     context = await get_caller_context(phone_number)
                     context["caller_phone"] = phone_number
-                    print(f"   ✓ Memory retrieved: is_returning_caller={context.get('is_returning_caller')}")
+                    print(f"   ✓ Memory retrieved: is_returning_caller={context.get('is_returning_caller')}, name={context.get('caller_name')}")
                     
                     # Return in Vapi's expected format with toolCallId
                     return JSONResponse(content={
@@ -221,27 +221,134 @@ async def handle_vapi_webhook(request: Request):
 async def get_caller_context(phone_number: str) -> dict:
     """
     Retrieve conversation history and context for a returning caller.
+    Returns caller name, past topics, and whether they're a returning caller.
     """
     try:
-        # Check if this caller exists in Zep
+        caller_name = None
+        last_topic = None
+        last_town = None
+        
+        # Step 1: Check if this caller exists in Zep and get their info
         try:
             user = zep.user.get(user_id=phone_number)
             print(f"   ✓ Found existing user: {phone_number}")
-            return {
-                "is_returning_caller": True,
-                "summary": "Returning caller with previous conversation history."
-            }
+            
+            # Get name from user metadata or first_name field
+            if hasattr(user, 'first_name') and user.first_name and user.first_name != phone_number:
+                caller_name = user.first_name
+                print(f"   ✓ Found caller name from user: {caller_name}")
+            
+            if hasattr(user, 'metadata') and user.metadata:
+                if 'name' in user.metadata:
+                    caller_name = user.metadata['name']
+                elif 'first_name' in user.metadata:
+                    caller_name = user.metadata['first_name']
+                if 'town' in user.metadata:
+                    last_town = user.metadata['town']
+                print(f"   ✓ User metadata: {user.metadata}")
+                
         except Exception as e:
-            print(f"   ℹ New caller (no history): {phone_number}")
+            print(f"   ℹ New caller (no Zep user): {phone_number}")
             return {
                 "is_returning_caller": False,
+                "caller_name": None,
                 "summary": "First time caller - no previous conversation history."
             }
+        
+        # Step 2: Try to get recent conversation threads for this user
+        try:
+            # Search for threads belonging to this user
+            threads = zep.thread.list(user_id=phone_number, limit=5)
+            
+            if threads and len(threads) > 0:
+                print(f"   ✓ Found {len(threads)} past conversation threads")
+                
+                # Try to get messages from the most recent thread
+                try:
+                    recent_thread = threads[0]
+                    thread_id = recent_thread.thread_id if hasattr(recent_thread, 'thread_id') else str(recent_thread)
+                    
+                    messages = zep.thread.get_messages(thread_id=thread_id, limit=10)
+                    
+                    if messages and len(messages) > 0:
+                        # Look through messages for context
+                        for msg in messages:
+                            content = msg.content if hasattr(msg, 'content') else str(msg)
+                            content_lower = content.lower()
+                            
+                            # Try to extract name if mentioned
+                            if not caller_name:
+                                if "my name is" in content_lower:
+                                    # Extract name after "my name is"
+                                    parts = content_lower.split("my name is")
+                                    if len(parts) > 1:
+                                        name_part = parts[1].strip().split()[0]
+                                        caller_name = name_part.capitalize()
+                                        print(f"   ✓ Extracted name from conversation: {caller_name}")
+                            
+                            # Look for topics of interest
+                            if any(word in content_lower for word in ['mineral', 'minerals']):
+                                last_topic = 'minerals'
+                            elif any(word in content_lower for word in ['protein', 'tub', 'tubs']):
+                                last_topic = 'protein tubs'
+                            elif any(word in content_lower for word in ['bulk', 'mix']):
+                                last_topic = 'bulk mix'
+                                
+                except Exception as msg_err:
+                    print(f"   ⚠️ Could not get thread messages: {msg_err}")
+                    
+        except Exception as thread_err:
+            print(f"   ⚠️ Could not list threads: {thread_err}")
+        
+        # Step 3: Also check Supabase leads for this phone number
+        if not caller_name:
+            try:
+                lead_result = supabase.table("leads")\
+                    .select("first_name, last_name, city, primary_interest")\
+                    .eq("phone", phone_number)\
+                    .order("created_at", desc=True)\
+                    .limit(1)\
+                    .execute()
+                
+                if lead_result.data and len(lead_result.data) > 0:
+                    lead = lead_result.data[0]
+                    if lead.get("first_name") and lead["first_name"] not in ["Unknown", "Caller"]:
+                        caller_name = lead["first_name"]
+                        print(f"   ✓ Found caller name from leads: {caller_name}")
+                    if lead.get("city"):
+                        last_town = lead["city"]
+                    if lead.get("primary_interest"):
+                        last_topic = lead["primary_interest"]
+                        
+            except Exception as lead_err:
+                print(f"   ⚠️ Could not check leads: {lead_err}")
+        
+        # Build the summary
+        summary_parts = ["Returning caller"]
+        if caller_name:
+            summary_parts = [f"Returning caller named {caller_name}"]
+        if last_town:
+            summary_parts.append(f"from {last_town}")
+        if last_topic:
+            summary_parts.append(f"previously interested in {last_topic}")
+        
+        summary = ". ".join(summary_parts) + "."
+        
+        return {
+            "is_returning_caller": True,
+            "caller_name": caller_name,
+            "last_town": last_town,
+            "last_topic": last_topic,
+            "summary": summary
+        }
             
     except Exception as e:
         print(f"   ❌ Error retrieving caller context: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "is_returning_caller": False,
+            "caller_name": None,
             "summary": "Unable to retrieve caller history."
         }
 
@@ -362,6 +469,7 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
     """
     Create a new lead in Supabase.
     Uses correct column names: first_name, last_name, lead_status, territory_id, city
+    Also updates Zep user with the caller's name for future calls.
     """
     try:
         first_name = parameters.get("first_name", "")
@@ -429,6 +537,23 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         if specialist_email:
             print(f"   📧 Lead assigned to specialist: {specialist_email}")
         
+        # Update Zep user with the caller's name for future recognition
+        if first_name and first_name not in ["Unknown", "Caller"]:
+            try:
+                zep.user.update(
+                    user_id=phone_number,
+                    first_name=first_name,
+                    last_name=last_name if last_name and last_name != "Caller" else None,
+                    metadata={
+                        "name": first_name,
+                        "town": town,
+                        "last_interest": primary_interest
+                    }
+                )
+                print(f"   ✓ Updated Zep user with name: {first_name}")
+            except Exception as zep_err:
+                print(f"   ⚠️ Could not update Zep user: {zep_err}")
+        
         return {
             "success": True,
             "lead_id": result.data[0]["id"] if result.data else None,
@@ -451,6 +576,7 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
     """
     Save conversation to Zep using thread API.
     Zep SDK v2 uses: zep.thread for conversation management
+    Also extracts caller name from conversation if mentioned.
     """
     try:
         print(f"\n💾 Saving conversation for: {phone_number}")
@@ -458,15 +584,54 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
         user_id = phone_number
         thread_id = f"mfc_{phone_number}_{call_id}"
         
-        # Ensure user exists in Zep
+        # Try to extract name from conversation
+        extracted_name = None
+        extracted_town = None
+        
+        for msg in messages:
+            content = msg.get("message", "").lower()
+            
+            # Look for name patterns
+            if "my name is" in content:
+                parts = content.split("my name is")
+                if len(parts) > 1:
+                    name_part = parts[1].strip().split()[0]
+                    extracted_name = name_part.capitalize().rstrip('.,!?')
+                    print(f"   ✓ Extracted name from conversation: {extracted_name}")
+            
+            # Also check for "i'm [name]" pattern
+            if " i'm " in content or content.startswith("i'm "):
+                parts = content.split("i'm")
+                if len(parts) > 1:
+                    name_candidate = parts[1].strip().split()[0]
+                    # Filter out common words that aren't names
+                    if name_candidate not in ['in', 'at', 'from', 'near', 'looking', 'calling', 'interested', 'a', 'the']:
+                        extracted_name = name_candidate.capitalize().rstrip('.,!?')
+                        print(f"   ✓ Extracted name from 'I'm' pattern: {extracted_name}")
+        
+        # Ensure user exists in Zep with any extracted info
         try:
             user = zep.user.get(user_id=user_id)
             print(f"   ✓ User exists in Zep")
+            
+            # Update user with extracted name if we found one and they don't have one
+            if extracted_name:
+                current_name = getattr(user, 'first_name', None)
+                if not current_name or current_name == phone_number:
+                    try:
+                        zep.user.update(
+                            user_id=user_id,
+                            first_name=extracted_name
+                        )
+                        print(f"   ✓ Updated Zep user with extracted name: {extracted_name}")
+                    except:
+                        pass
+                        
         except Exception:
             try:
                 zep.user.add(
                     user_id=user_id,
-                    first_name=phone_number,
+                    first_name=extracted_name or phone_number,
                     metadata={
                         "phone": phone_number,
                         "source": "mfc_voice_agent"
@@ -546,6 +711,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
