@@ -35,6 +35,55 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Words that should NEVER be extracted as names
+# Includes places, common words, and terms that come up in MFC calls
+EXCLUDED_NAME_WORDS = {
+    # Places - Montana towns and regions
+    'montana', 'missoula', 'darby', 'hamilton', 'dillon', 'billings', 'bozeman',
+    'butte', 'helena', 'kalispell', 'lewistown', 'miles', 'city', 'columbus',
+    'glasgow', 'havre', 'great', 'falls', 'wyoming', 'riverton', 'buffalo',
+    # Common conversation words
+    'in', 'at', 'from', 'near', 'looking', 'calling', 'interested', 'a', 'the',
+    'here', 'there', 'just', 'really', 'very', 'good', 'fine', 'great', 'well',
+    'yeah', 'yes', 'no', 'not', 'ok', 'okay', 'sure', 'right', 'hi', 'hello',
+    'thanks', 'thank', 'please', 'sorry', 'um', 'uh', 'so', 'and', 'but', 'or',
+    # Business terms
+    'feed', 'company', 'purina', 'specialist', 'agent', 'customer', 'caller',
+    'unknown', 'rancher', 'farmer', 'producer',
+    # Livestock terms
+    'cattle', 'cow', 'cows', 'bull', 'bulls', 'calf', 'calves', 'herd', 'head',
+    'chicken', 'chickens', 'sheep', 'horse', 'horses',
+}
+
+
+def is_valid_name(name: str) -> bool:
+    """Check if a string is likely a real person's name."""
+    if not name:
+        return False
+    
+    name_lower = name.lower().strip()
+    
+    # Too short or too long
+    if len(name_lower) < 2 or len(name_lower) > 20:
+        return False
+    
+    # In exclusion list
+    if name_lower in EXCLUDED_NAME_WORDS:
+        return False
+    
+    # Contains numbers
+    if any(c.isdigit() for c in name_lower):
+        return False
+    
+    # All consonants or all vowels (probably not a name)
+    vowels = set('aeiou')
+    has_vowel = any(c in vowels for c in name_lower)
+    has_consonant = any(c.isalpha() and c not in vowels for c in name_lower)
+    if not (has_vowel and has_consonant):
+        return False
+    
+    return True
+
 
 @app.get("/")
 async def root():
@@ -221,7 +270,7 @@ async def handle_vapi_webhook(request: Request):
 async def get_caller_context(phone_number: str) -> dict:
     """
     Retrieve conversation history and context for a returning caller.
-    Returns caller name, past topics, and whether they're a returning caller.
+    Returns caller name (only if valid), past topics, and whether they're a returning caller.
     """
     try:
         caller_name = None
@@ -233,19 +282,31 @@ async def get_caller_context(phone_number: str) -> dict:
             user = zep.user.get(user_id=phone_number)
             print(f"   ✓ Found existing user: {phone_number}")
             
-            # Get name from user metadata or first_name field
-            if hasattr(user, 'first_name') and user.first_name and user.first_name != phone_number:
-                caller_name = user.first_name
-                print(f"   ✓ Found caller name from user: {caller_name}")
+            # Get name from user first_name field (only if it's a valid name)
+            if hasattr(user, 'first_name') and user.first_name:
+                potential_name = user.first_name
+                if potential_name != phone_number and is_valid_name(potential_name):
+                    caller_name = potential_name
+                    print(f"   ✓ Found valid caller name: {caller_name}")
+                else:
+                    print(f"   ⚠️ Stored name '{potential_name}' is not valid, ignoring")
             
+            # Check metadata
             if hasattr(user, 'metadata') and user.metadata:
-                if 'name' in user.metadata:
-                    caller_name = user.metadata['name']
-                elif 'first_name' in user.metadata:
-                    caller_name = user.metadata['first_name']
-                if 'town' in user.metadata:
-                    last_town = user.metadata['town']
-                print(f"   ✓ User metadata: {user.metadata}")
+                meta = user.metadata
+                # Only use name from metadata if we don't have one yet
+                if not caller_name:
+                    if meta.get('name') and is_valid_name(meta.get('name')):
+                        caller_name = meta['name']
+                    elif meta.get('first_name') and is_valid_name(meta.get('first_name')):
+                        caller_name = meta['first_name']
+                
+                if meta.get('town'):
+                    last_town = meta['town']
+                if meta.get('last_interest'):
+                    last_topic = meta['last_interest']
+                    
+                print(f"   ✓ User metadata: {meta}")
                 
         except Exception as e:
             print(f"   ℹ New caller (no Zep user): {phone_number}")
@@ -255,52 +316,7 @@ async def get_caller_context(phone_number: str) -> dict:
                 "summary": "First time caller - no previous conversation history."
             }
         
-        # Step 2: Try to get recent conversation threads for this user
-        try:
-            # Search for threads belonging to this user
-            threads = zep.thread.list(user_id=phone_number, limit=5)
-            
-            if threads and len(threads) > 0:
-                print(f"   ✓ Found {len(threads)} past conversation threads")
-                
-                # Try to get messages from the most recent thread
-                try:
-                    recent_thread = threads[0]
-                    thread_id = recent_thread.thread_id if hasattr(recent_thread, 'thread_id') else str(recent_thread)
-                    
-                    messages = zep.thread.get_messages(thread_id=thread_id, limit=10)
-                    
-                    if messages and len(messages) > 0:
-                        # Look through messages for context
-                        for msg in messages:
-                            content = msg.content if hasattr(msg, 'content') else str(msg)
-                            content_lower = content.lower()
-                            
-                            # Try to extract name if mentioned
-                            if not caller_name:
-                                if "my name is" in content_lower:
-                                    # Extract name after "my name is"
-                                    parts = content_lower.split("my name is")
-                                    if len(parts) > 1:
-                                        name_part = parts[1].strip().split()[0]
-                                        caller_name = name_part.capitalize()
-                                        print(f"   ✓ Extracted name from conversation: {caller_name}")
-                            
-                            # Look for topics of interest
-                            if any(word in content_lower for word in ['mineral', 'minerals']):
-                                last_topic = 'minerals'
-                            elif any(word in content_lower for word in ['protein', 'tub', 'tubs']):
-                                last_topic = 'protein tubs'
-                            elif any(word in content_lower for word in ['bulk', 'mix']):
-                                last_topic = 'bulk mix'
-                                
-                except Exception as msg_err:
-                    print(f"   ⚠️ Could not get thread messages: {msg_err}")
-                    
-        except Exception as thread_err:
-            print(f"   ⚠️ Could not list threads: {thread_err}")
-        
-        # Step 3: Also check Supabase leads for this phone number
+        # Step 2: Check Supabase leads for this phone number (most reliable source of names)
         if not caller_name:
             try:
                 lead_result = supabase.table("leads")\
@@ -312,8 +328,9 @@ async def get_caller_context(phone_number: str) -> dict:
                 
                 if lead_result.data and len(lead_result.data) > 0:
                     lead = lead_result.data[0]
-                    if lead.get("first_name") and lead["first_name"] not in ["Unknown", "Caller"]:
-                        caller_name = lead["first_name"]
+                    potential_name = lead.get("first_name")
+                    if potential_name and is_valid_name(potential_name):
+                        caller_name = potential_name
                         print(f"   ✓ Found caller name from leads: {caller_name}")
                     if lead.get("city"):
                         last_town = lead["city"]
@@ -324,15 +341,18 @@ async def get_caller_context(phone_number: str) -> dict:
                 print(f"   ⚠️ Could not check leads: {lead_err}")
         
         # Build the summary
-        summary_parts = ["Returning caller"]
+        summary_parts = []
         if caller_name:
-            summary_parts = [f"Returning caller named {caller_name}"]
+            summary_parts.append(f"Returning caller named {caller_name}")
+        else:
+            summary_parts.append("Returning caller")
+        
         if last_town:
             summary_parts.append(f"from {last_town}")
         if last_topic:
             summary_parts.append(f"previously interested in {last_topic}")
         
-        summary = ". ".join(summary_parts) + "."
+        summary = " ".join(summary_parts) + "."
         
         return {
             "is_returning_caller": True,
@@ -538,12 +558,13 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
             print(f"   📧 Lead assigned to specialist: {specialist_email}")
         
         # Update Zep user with the caller's name for future recognition
-        if first_name and first_name not in ["Unknown", "Caller"]:
+        # Only update if we have a VALID name (not Unknown, Caller, or excluded words)
+        if first_name and is_valid_name(first_name):
             try:
                 zep.user.update(
                     user_id=phone_number,
                     first_name=first_name,
-                    last_name=last_name if last_name and last_name != "Caller" else None,
+                    last_name=last_name if last_name and last_name not in ["Caller", "Unknown"] else None,
                     metadata={
                         "name": first_name,
                         "town": town,
@@ -576,7 +597,7 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
     """
     Save conversation to Zep using thread API.
     Zep SDK v2 uses: zep.thread for conversation management
-    Also extracts caller name from conversation if mentioned.
+    NOTE: We no longer extract names from conversation - only trust names from create_lead
     """
     try:
         print(f"\n💾 Saving conversation for: {phone_number}")
@@ -584,54 +605,15 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
         user_id = phone_number
         thread_id = f"mfc_{phone_number}_{call_id}"
         
-        # Try to extract name from conversation
-        extracted_name = None
-        extracted_town = None
-        
-        for msg in messages:
-            content = msg.get("message", "").lower()
-            
-            # Look for name patterns
-            if "my name is" in content:
-                parts = content.split("my name is")
-                if len(parts) > 1:
-                    name_part = parts[1].strip().split()[0]
-                    extracted_name = name_part.capitalize().rstrip('.,!?')
-                    print(f"   ✓ Extracted name from conversation: {extracted_name}")
-            
-            # Also check for "i'm [name]" pattern
-            if " i'm " in content or content.startswith("i'm "):
-                parts = content.split("i'm")
-                if len(parts) > 1:
-                    name_candidate = parts[1].strip().split()[0]
-                    # Filter out common words that aren't names
-                    if name_candidate not in ['in', 'at', 'from', 'near', 'looking', 'calling', 'interested', 'a', 'the']:
-                        extracted_name = name_candidate.capitalize().rstrip('.,!?')
-                        print(f"   ✓ Extracted name from 'I'm' pattern: {extracted_name}")
-        
-        # Ensure user exists in Zep with any extracted info
+        # Ensure user exists in Zep
         try:
             user = zep.user.get(user_id=user_id)
             print(f"   ✓ User exists in Zep")
-            
-            # Update user with extracted name if we found one and they don't have one
-            if extracted_name:
-                current_name = getattr(user, 'first_name', None)
-                if not current_name or current_name == phone_number:
-                    try:
-                        zep.user.update(
-                            user_id=user_id,
-                            first_name=extracted_name
-                        )
-                        print(f"   ✓ Updated Zep user with extracted name: {extracted_name}")
-                    except:
-                        pass
-                        
         except Exception:
             try:
                 zep.user.add(
                     user_id=user_id,
-                    first_name=extracted_name or phone_number,
+                    first_name=phone_number,  # Use phone as placeholder, will be updated by create_lead
                     metadata={
                         "phone": phone_number,
                         "source": "mfc_voice_agent"
@@ -711,6 +693,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
