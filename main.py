@@ -220,7 +220,7 @@ async def lookup_town(parameters: dict) -> dict:
     
     Queries:
     1. town_distances table - find territory for the town
-    2. territories table - get territory_id
+    2. territories table - get territory_id (NOTE: appends " Territory" to match naming)
     3. specialists table - get LPS contact info
     """
     try:
@@ -260,9 +260,14 @@ async def lookup_town(parameters: dict) -> dict:
         print(f"   ✓ Found town: {town_data['town_name']} → Territory: {territory_name}")
         
         # Step 2: Look up territory to get territory_id
+        # FIX: town_distances has "Missoula" but territories table has "Missoula Territory"
+        # So we append " Territory" to match the naming convention
+        territory_name_for_lookup = f"{territory_name} Territory"
+        print(f"   🔍 Looking up territory: {territory_name_for_lookup}")
+        
         territory_result = supabase.table("territories")\
             .select("id, territory_name, territory_code")\
-            .eq("territory_name", territory_name)\
+            .eq("territory_name", territory_name_for_lookup)\
             .eq("is_active", True)\
             .execute()
         
@@ -271,7 +276,7 @@ async def lookup_town(parameters: dict) -> dict:
             territory_id = territory_result.data[0]["id"]
             print(f"   ✓ Found territory_id: {territory_id}")
         else:
-            print(f"   ⚠️ Territory not found in territories table: {territory_name}")
+            print(f"   ⚠️ Territory not found in territories table: {territory_name_for_lookup}")
         
         # Step 3: Look up specialist for this territory
         specialist_info = None
@@ -293,6 +298,8 @@ async def lookup_town(parameters: dict) -> dict:
                     "phone": spec.get("phone")
                 }
                 print(f"   ✓ Found specialist: {specialist_info['full_name']} ({specialist_info['email']})")
+            else:
+                print(f"   ⚠️ No active specialist found for territory_id: {territory_id}")
         
         specialist_message = f"Your local specialist is {specialist_info['full_name']}." if specialist_info else ""
         
@@ -507,6 +514,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
