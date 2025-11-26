@@ -89,6 +89,9 @@ async def handle_vapi_webhook(request: Request):
             if tool_call_list and len(tool_call_list) > 0:
                 tool_call = tool_call_list[0]
                 
+                # IMPORTANT: Get the tool call ID for the response
+                tool_call_id = tool_call.get("id")
+                
                 # Extract function details from the tool call
                 function_name = tool_call.get("function", {}).get("name")
                 if not function_name:
@@ -109,6 +112,7 @@ async def handle_vapi_webhook(request: Request):
                 phone_number = message_data.get("call", {}).get("customer", {}).get("number")
                 
                 print(f"   Function: {function_name}")
+                print(f"   Tool Call ID: {tool_call_id}")
                 print(f"   Phone: {phone_number}")
                 print(f"   Parameters: {parameters}")
                 
@@ -118,8 +122,15 @@ async def handle_vapi_webhook(request: Request):
                     context = await get_caller_context(phone_number)
                     context["caller_phone"] = phone_number
                     print(f"   ✓ Memory retrieved: is_returning_caller={context.get('is_returning_caller')}")
+                    
+                    # Return in Vapi's expected format with toolCallId
                     return JSONResponse(content={
-                        "result": context
+                        "results": [
+                            {
+                                "toolCallId": tool_call_id,
+                                "result": json.dumps(context)
+                            }
+                        ]
                     })
                 
                 # Handle create_lead function
@@ -127,8 +138,15 @@ async def handle_vapi_webhook(request: Request):
                     print(f"   💾 Creating lead for: {phone_number}")
                     result = await create_lead(phone_number, parameters)
                     print(f"   ✓ Lead result: {result}")
+                    
+                    # Return in Vapi's expected format with toolCallId
                     return JSONResponse(content={
-                        "result": result
+                        "results": [
+                            {
+                                "toolCallId": tool_call_id,
+                                "result": json.dumps(result)
+                            }
+                        ]
                     })
                 
                 # Handle lookup_town function
@@ -136,16 +154,30 @@ async def handle_vapi_webhook(request: Request):
                     print(f"   🗺️ Looking up town for routing")
                     result = await lookup_town(parameters)
                     print(f"   ✓ Town lookup result: {result}")
+                    
+                    # Return in Vapi's expected format with toolCallId
                     return JSONResponse(content={
-                        "result": result
+                        "results": [
+                            {
+                                "toolCallId": tool_call_id,
+                                "result": json.dumps(result)
+                            }
+                        ]
                     })
                 
                 # Handle other functions here as needed
                 print(f"   ⚠️ Function not implemented: {function_name}")
-                return JSONResponse(content={"result": f"Function {function_name} not implemented"})
+                return JSONResponse(content={
+                    "results": [
+                        {
+                            "toolCallId": tool_call_id,
+                            "result": json.dumps({"error": f"Function {function_name} not implemented"})
+                        }
+                    ]
+                })
             else:
                 print(f"   ⚠️ No tool calls found in list")
-                return JSONResponse(content={"result": "No tool calls found"})
+                return JSONResponse(content={"results": []})
         
         # Handle end-of-call-report for saving conversation
         elif message_type == "end-of-call-report":
@@ -514,6 +546,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
