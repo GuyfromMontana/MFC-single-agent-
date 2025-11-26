@@ -133,6 +133,15 @@ async def handle_vapi_webhook(request: Request):
                         "result": result
                     })
                 
+                # Handle lookup_town function - NEW!
+                elif function_name == "lookup_town":
+                    print(f"   🗺️ Looking up town for routing")
+                    result = await lookup_town(parameters)
+                    print(f"   ✓ Town lookup result: {result}")
+                    return JSONResponse(content={
+                        "result": result
+                    })
+                
                 # Handle other functions here as needed
                 print(f"   ⚠️ Function not implemented: {function_name}")
                 return JSONResponse(content={"result": f"Function {function_name} not implemented"})
@@ -254,15 +263,137 @@ async def get_caller_context(phone_number: str) -> dict:
         }
 
 
+async def lookup_town(parameters: dict) -> dict:
+    """
+    Look up a town to find the assigned territory and LPS (Livestock Specialist).
+    
+    Queries:
+    1. town_distances table - find territory for the town
+    2. territories table - get territory_id
+    3. specialists table - get LPS contact info
+    
+    Returns territory and specialist info for proper lead routing.
+    """
+    try:
+        town_name = parameters.get("town_name", "")
+        state = parameters.get("state", "")
+        
+        if not town_name:
+            return {
+                "success": False,
+                "error": "No town name provided",
+                "message": "I need to know what town you're near to connect you with the right specialist."
+            }
+        
+        print(f"   🗺️ Looking up town: {town_name}")
+        
+        # Step 1: Look up town in town_distances table
+        town_query = supabase.table("town_distances")\
+            .select("town_name, state, county, assigned_territory, nearest_distance")\
+            .ilike("town_name", town_name)
+        
+        # Optionally filter by state if provided
+        if state:
+            town_query = town_query.eq("state", state.upper())
+        
+        town_result = town_query.execute()
+        
+        if not town_result.data:
+            print(f"   ⚠️ Town not found: {town_name}")
+            return {
+                "success": False,
+                "error": "Town not found",
+                "town_searched": town_name,
+                "message": f"I don't have {town_name} in my database. What's a nearby larger town, or what county are you in?"
+            }
+        
+        town_data = town_result.data[0]
+        territory_name = town_data["assigned_territory"]
+        print(f"   ✓ Found town: {town_data['town_name']} → Territory: {territory_name}")
+        
+        # Step 2: Look up territory to get territory_id
+        territory_result = supabase.table("territories")\
+            .select("id, territory_name, territory_code")\
+            .eq("territory_name", territory_name)\
+            .eq("is_active", True)\
+            .execute()
+        
+        if not territory_result.data:
+            print(f"   ⚠️ Territory not found in territories table: {territory_name}")
+            return {
+                "success": True,
+                "town": town_data["town_name"],
+                "state": town_data["state"],
+                "county": town_data["county"],
+                "territory": territory_name,
+                "distance_miles": float(town_data["nearest_distance"]) if town_data["nearest_distance"] else None,
+                "specialist": None,
+                "message": f"{town_name} is in our {territory_name} territory, about {town_data['nearest_distance']} miles from our warehouse."
+            }
+        
+        territory_id = territory_result.data[0]["id"]
+        print(f"   ✓ Found territory_id: {territory_id}")
+        
+        # Step 3: Look up specialist for this territory
+        specialist_result = supabase.table("specialists")\
+            .select("first_name, last_name, email, phone")\
+            .eq("territory_id", territory_id)\
+            .eq("is_active", True)\
+            .execute()
+        
+        specialist_info = None
+        specialist_message = ""
+        
+        if specialist_result.data:
+            spec = specialist_result.data[0]
+            specialist_info = {
+                "first_name": spec["first_name"],
+                "last_name": spec["last_name"],
+                "full_name": f"{spec['first_name']} {spec['last_name']}",
+                "email": spec["email"],
+                "phone": spec.get("phone")
+            }
+            specialist_message = f"Your local specialist is {specialist_info['full_name']}."
+            print(f"   ✓ Found specialist: {specialist_info['full_name']} ({specialist_info['email']})")
+        else:
+            print(f"   ⚠️ No active specialist found for territory: {territory_name}")
+        
+        return {
+            "success": True,
+            "town": town_data["town_name"],
+            "state": town_data["state"],
+            "county": town_data["county"],
+            "territory": territory_name,
+            "territory_id": territory_id,
+            "distance_miles": float(town_data["nearest_distance"]) if town_data["nearest_distance"] else None,
+            "specialist": specialist_info,
+            "message": f"{town_name} is in our {territory_name} territory. {specialist_message}"
+        }
+        
+    except Exception as e:
+        print(f"   ❌ Error in lookup_town: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "I had trouble looking up that location. What county are you in?"
+        }
+
+
 async def create_lead(phone_number: str, parameters: dict) -> dict:
     """
-    Create a new lead in Supabase
+    Create a new lead in Supabase.
+    Now supports territory and specialist_email from lookup_town results.
     """
     try:
         first_name = parameters.get("first_name", "")
         last_name = parameters.get("last_name", "")
         email = parameters.get("email", "")
         county = parameters.get("county", "")
+        town = parameters.get("town", "")  # NEW - from lookup_town
+        territory = parameters.get("territory", "")  # NEW - from lookup_town
+        specialist_email = parameters.get("specialist_email", "")  # NEW - for notifications
         primary_interest = parameters.get("primary_interest", "")
         herd_size = parameters.get("herd_size", "")
         livestock_type = parameters.get("livestock_type", "")
@@ -279,6 +410,10 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         notes_parts = []
         if primary_interest:
             notes_parts.append(primary_interest)
+        if town:
+            notes_parts.append(f"Town: {town}")
+        if territory:
+            notes_parts.append(f"Territory: {territory}")
         if county:
             notes_parts.append(f"County: {county}")
         if herd_size:
@@ -304,10 +439,17 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         result = supabase.table("leads").insert(lead_data).execute()
         
         print(f"   ✓ Created lead: {name}")
+        
+        # Log specialist assignment for follow-up
+        if specialist_email:
+            print(f"   📧 Lead assigned to specialist: {specialist_email}")
+        
         return {
             "success": True,
             "lead_id": result.data[0]["id"] if result.data else None,
-            "message": f"Lead created successfully for {name}"
+            "message": f"Lead created successfully for {name}",
+            "territory": territory,
+            "specialist_email": specialist_email
         }
     except Exception as e:
         print(f"   ❌ Error creating lead: {str(e)}")
