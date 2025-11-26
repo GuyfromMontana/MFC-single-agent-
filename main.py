@@ -28,17 +28,24 @@ print(f"🔑 Key starts with 'z_': {ZEP_API_KEY.startswith('z_')}")
 zep = Zep(api_key=ZEP_API_KEY)
 
 # Initialize Supabase client
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables are required")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 @app.get("/")
 async def root():
     return {
         "status": "MFC Agent Memory Service Running",
         "timestamp": datetime.now().isoformat(),
-        "zep_configured": bool(ZEP_API_KEY)
+        "zep_configured": bool(ZEP_API_KEY),
+        "supabase_configured": bool(SUPABASE_URL)
     }
+
 
 @app.get("/health")
 async def health_check():
@@ -47,6 +54,7 @@ async def health_check():
         "service": "mfc-agent-memory",
         "timestamp": datetime.now().isoformat()
     }
+
 
 @app.post("/")
 async def handle_vapi_webhook(request: Request):
@@ -91,6 +99,13 @@ async def handle_vapi_webhook(request: Request):
                 if not parameters:
                     parameters = tool_call.get("parameters", {})
                 
+                # Parse parameters if they're a string
+                if isinstance(parameters, str):
+                    try:
+                        parameters = json.loads(parameters)
+                    except json.JSONDecodeError:
+                        parameters = {}
+                
                 # Get phone number from call data
                 phone_number = message_data.get("call", {}).get("customer", {}).get("number")
                 
@@ -113,14 +128,14 @@ async def handle_vapi_webhook(request: Request):
                 elif function_name == "create_lead":
                     print(f"   💾 Creating lead for: {phone_number}")
                     result = await create_lead(phone_number, parameters)
-                    print(f"   ✓ Lead created")
+                    print(f"   ✓ Lead result: {result}")
                     return JSONResponse(content={
                         "result": result
                     })
                 
                 # Handle other functions here as needed
                 print(f"   ⚠️ Function not implemented: {function_name}")
-                return JSONResponse(content={"result": "Function not implemented"})
+                return JSONResponse(content={"result": f"Function {function_name} not implemented"})
             else:
                 print(f"   ⚠️ No tool calls found in list")
                 return JSONResponse(content={"result": "No tool calls found"})
@@ -168,7 +183,8 @@ async def handle_vapi_webhook(request: Request):
                     print(f"❌ Error in save_conversation: {str(e)}")
                     import traceback
                     traceback.print_exc()
-                    raise HTTPException(status_code=500, detail=str(e))
+                    # Don't raise - just log and continue
+                    return JSONResponse(content={"status": "error", "message": str(e)})
             else:
                 print("⚠️ Missing required data:")
                 print(f"   Phone: {phone_number}")
@@ -185,7 +201,8 @@ async def handle_vapi_webhook(request: Request):
         print(f"❌ Error processing webhook: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return 200 to prevent Vapi from retrying
+        return JSONResponse(content={"status": "error", "message": str(e)})
 
 
 async def get_caller_context(phone_number: str) -> dict:
@@ -199,11 +216,25 @@ async def get_caller_context(phone_number: str) -> dict:
             user = zep.user.get(user_id=phone_number)
             print(f"   ✓ Found existing user: {phone_number}")
             
-            # User exists, so they're a returning caller
-            return {
-                "is_returning_caller": True,
-                "summary": "Returning caller with previous conversation history."
-            }
+            # Try to get their conversation history
+            try:
+                # Get threads for this user
+                threads = zep.thread.list(user_id=phone_number)
+                thread_count = len(threads) if threads else 0
+                print(f"   ✓ Found {thread_count} conversation threads")
+                
+                # User exists and has history
+                return {
+                    "is_returning_caller": True,
+                    "conversation_count": thread_count,
+                    "summary": f"Returning caller with {thread_count} previous conversations."
+                }
+            except Exception as thread_error:
+                print(f"   ℹ Could not retrieve threads: {thread_error}")
+                return {
+                    "is_returning_caller": True,
+                    "summary": "Returning caller with previous conversation history."
+                }
             
         except Exception as e:
             # New caller - no history
@@ -230,25 +261,45 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
     try:
         first_name = parameters.get("first_name", "")
         last_name = parameters.get("last_name", "")
+        email = parameters.get("email", "")
         county = parameters.get("county", "")
         primary_interest = parameters.get("primary_interest", "")
+        herd_size = parameters.get("herd_size", "")
+        livestock_type = parameters.get("livestock_type", "")
+        
+        # Use phone from parameters if provided, otherwise use caller ID
+        lead_phone = parameters.get("phone", "") or phone_number
+        
+        # Build the name
+        name = f"{first_name} {last_name}".strip()
+        if not name:
+            name = "Unknown Caller"
         
         lead_data = {
-            "name": f"{first_name} {last_name}".strip(),
-            "phone": phone_number,
+            "name": name,
+            "phone": lead_phone,
+            "email": email,
             "county": county,
             "notes": primary_interest,
+            "herd_size": herd_size,
+            "livestock_type": livestock_type,
             "status": "new",
             "created_at": datetime.utcnow().isoformat()
         }
         
+        # Remove empty fields
+        lead_data = {k: v for k, v in lead_data.items() if v}
+        lead_data["status"] = "new"  # Always include status
+        
+        print(f"   📝 Lead data: {lead_data}")
+        
         result = supabase.table("leads").insert(lead_data).execute()
         
-        print(f"   ✓ Created lead: {lead_data['name']}")
+        print(f"   ✓ Created lead: {name}")
         return {
             "success": True,
             "lead_id": result.data[0]["id"] if result.data else None,
-            "message": "Lead created successfully"
+            "message": f"Lead created successfully for {name}"
         }
     except Exception as e:
         print(f"   ❌ Error creating lead: {str(e)}")
@@ -256,7 +307,8 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         traceback.print_exc()
         return {
             "success": False,
-            "error": str(e)
+            "error": str(e),
+            "message": "Failed to create lead - please try again or contact support"
         }
 
 
@@ -299,8 +351,12 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
             role = msg.get("role", "user")
             content = msg.get("message", "")
             
+            # Skip tool calls and system messages
+            if role in ["tool_calls", "tool_call_result", "system"]:
+                continue
+            
             # Map Vapi roles to Zep roles
-            if role == "assistant":
+            if role == "assistant" or role == "bot":
                 zep_role = "assistant"
             else:
                 zep_role = "user"
@@ -311,6 +367,7 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
                     content = content[:MAX_MESSAGE_LENGTH - 50] + "... [truncated]"
                     truncated_count += 1
                 
+                # Use 'role' not 'role_type' for newer Zep SDK
                 zep_messages.append(
                     Message(
                         role=zep_role,
@@ -329,8 +386,29 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
         print(f"   Thread: {thread_id}")
         print(f"   Messages: {len(zep_messages)}")
         
-        # Add messages to the thread using thread.add_messages
+        # First create the thread, then add messages
         try:
+            # Create thread first
+            try:
+                zep.thread.add(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    metadata={
+                        "call_id": call_id,
+                        "phone": phone_number,
+                        "source": "mfc_voice_agent",
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                )
+                print(f"   ✓ Created thread: {thread_id}")
+            except Exception as thread_error:
+                # Thread might already exist, that's okay
+                if "already exists" in str(thread_error).lower():
+                    print(f"   ℹ Thread already exists: {thread_id}")
+                else:
+                    print(f"   ⚠️ Thread creation note: {thread_error}")
+            
+            # Now add messages to the thread
             zep.thread.add_messages(
                 thread_id=thread_id,
                 messages=zep_messages
@@ -343,17 +421,16 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
             print(f"   ❌ Error saving conversation: {str(e)}")
             import traceback
             traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"Failed to save conversation: {str(e)}")
-        
+            # Don't raise - just log the error
+            
     except Exception as e:
         print(f"❌ Error in save_conversation: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise
+        # Don't raise - just log the error
 
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
