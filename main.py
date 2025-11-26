@@ -467,16 +467,11 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
         
         # Use zep.thread API (SDK v2)
         try:
-            # First, try to create the thread
+            # First, try to create the thread (no metadata parameter)
             try:
                 zep.thread.create(
                     thread_id=thread_id,
-                    user_id=user_id,
-                    metadata={
-                        "call_id": call_id,
-                        "phone": phone_number,
-                        "source": "mfc_voice_agent"
-                    }
+                    user_id=user_id
                 )
                 print(f"   ✓ Created thread: {thread_id}")
             except Exception as thread_err:
@@ -485,9 +480,9 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
                 else:
                     print(f"   ⚠️ Thread creation note: {thread_err}")
             
-            # Now add messages to the thread
+            # Now add messages to the thread - use 'role' not 'role_type'
             from zep_cloud import Message
-            msgs = [Message(role_type=m["role_type"], content=m["content"]) for m in zep_messages]
+            msgs = [Message(role=m["role_type"], content=m["content"]) for m in zep_messages]
             
             zep.thread.add_messages(
                 thread_id=thread_id,
@@ -512,6 +507,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
