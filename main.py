@@ -6,6 +6,7 @@ import json
 from zep_cloud.client import Zep
 from supabase import create_client, Client
 import logging
+import httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,8 +21,6 @@ if not ZEP_API_KEY:
     raise ValueError("ZEP_API_KEY environment variable is required")
 
 print(f"🔑 Zep API Key loaded: {ZEP_API_KEY[:5]}...{ZEP_API_KEY[-5:]}")
-print(f"🔑 Key length: {len(ZEP_API_KEY)}")
-print(f"🔑 Key starts with 'z_': {ZEP_API_KEY.startswith('z_')}")
 
 # Initialize Zep client
 zep = Zep(api_key=ZEP_API_KEY)
@@ -35,22 +34,27 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Initialize Resend for email notifications
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+if RESEND_API_KEY:
+    print(f"📧 Resend API Key loaded: {RESEND_API_KEY[:5]}...{RESEND_API_KEY[-5:]}")
+else:
+    print("⚠️ RESEND_API_KEY not set - email notifications disabled")
+
+# Email configuration
+FROM_EMAIL = os.getenv("FROM_EMAIL", "Montana Feed Company <leads@montanafeed.com>")
+
 # Words that should NEVER be extracted as names
-# Includes places, common words, and terms that come up in MFC calls
 EXCLUDED_NAME_WORDS = {
-    # Places - Montana towns and regions
     'montana', 'missoula', 'darby', 'hamilton', 'dillon', 'billings', 'bozeman',
     'butte', 'helena', 'kalispell', 'lewistown', 'miles', 'city', 'columbus',
     'glasgow', 'havre', 'great', 'falls', 'wyoming', 'riverton', 'buffalo',
-    # Common conversation words
     'in', 'at', 'from', 'near', 'looking', 'calling', 'interested', 'a', 'the',
     'here', 'there', 'just', 'really', 'very', 'good', 'fine', 'great', 'well',
     'yeah', 'yes', 'no', 'not', 'ok', 'okay', 'sure', 'right', 'hi', 'hello',
     'thanks', 'thank', 'please', 'sorry', 'um', 'uh', 'so', 'and', 'but', 'or',
-    # Business terms
     'feed', 'company', 'purina', 'specialist', 'agent', 'customer', 'caller',
     'unknown', 'rancher', 'farmer', 'producer',
-    # Livestock terms
     'cattle', 'cow', 'cows', 'bull', 'bulls', 'calf', 'calves', 'herd', 'head',
     'chicken', 'chickens', 'sheep', 'horse', 'horses',
 }
@@ -63,19 +67,15 @@ def is_valid_name(name: str) -> bool:
     
     name_lower = name.lower().strip()
     
-    # Too short or too long
     if len(name_lower) < 2 or len(name_lower) > 20:
         return False
     
-    # In exclusion list
     if name_lower in EXCLUDED_NAME_WORDS:
         return False
     
-    # Contains numbers
     if any(c.isdigit() for c in name_lower):
         return False
     
-    # All consonants or all vowels (probably not a name)
     vowels = set('aeiou')
     has_vowel = any(c in vowels for c in name_lower)
     has_consonant = any(c.isalpha() and c not in vowels for c in name_lower)
@@ -85,13 +85,143 @@ def is_valid_name(name: str) -> bool:
     return True
 
 
+async def send_lead_notification_email(
+    specialist_email: str,
+    specialist_name: str,
+    lead_name: str,
+    lead_phone: str,
+    lead_town: str,
+    lead_county: str,
+    lead_interest: str,
+    lead_herd_size: str,
+    lead_livestock_type: str
+):
+    """
+    Send email notification to specialist about new lead.
+    Uses Resend API.
+    """
+    if not RESEND_API_KEY:
+        print("   ⚠️ Email skipped - RESEND_API_KEY not configured")
+        return False
+    
+    if not specialist_email:
+        print("   ⚠️ Email skipped - no specialist email provided")
+        return False
+    
+    # Format phone for display
+    phone_display = lead_phone
+    if lead_phone and len(lead_phone) == 12 and lead_phone.startswith("+1"):
+        # Format +14065551234 as (406) 555-1234
+        phone_display = f"({lead_phone[2:5]}) {lead_phone[5:8]}-{lead_phone[8:]}"
+    
+    # Build email content
+    subject = f"🐄 New Lead: {lead_name} from {lead_town or 'Unknown Location'}"
+    
+    # Build details list
+    details = []
+    if lead_phone:
+        details.append(f"<strong>Phone:</strong> {phone_display}")
+    if lead_town:
+        details.append(f"<strong>Town:</strong> {lead_town}")
+    if lead_county:
+        details.append(f"<strong>County:</strong> {lead_county}")
+    if lead_interest:
+        details.append(f"<strong>Interested In:</strong> {lead_interest}")
+    if lead_herd_size:
+        details.append(f"<strong>Herd Size:</strong> {lead_herd_size} head")
+    if lead_livestock_type:
+        details.append(f"<strong>Operation Type:</strong> {lead_livestock_type}")
+    
+    details_html = "<br>".join(details) if details else "No additional details provided."
+    
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background-color: #1a5f2a; color: white; padding: 20px; text-align: center;">
+            <h1 style="margin: 0;">Montana Feed Company</h1>
+            <p style="margin: 5px 0 0 0;">New Lead Notification</p>
+        </div>
+        
+        <div style="padding: 20px; background-color: #f9f9f9;">
+            <h2 style="color: #1a5f2a; margin-top: 0;">Hey {specialist_name.split()[0]}!</h2>
+            
+            <p>You have a new lead from the voice agent:</p>
+            
+            <div style="background-color: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 15px 0;">
+                <h3 style="margin-top: 0; color: #333;">{lead_name}</h3>
+                {details_html}
+            </div>
+            
+            <p><strong>Please follow up within 24 hours.</strong></p>
+            
+            <div style="margin-top: 20px;">
+                <a href="tel:{lead_phone}" style="display: inline-block; background-color: #1a5f2a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                    📞 Call {lead_name.split()[0]}
+                </a>
+            </div>
+        </div>
+        
+        <div style="padding: 15px; text-align: center; color: #666; font-size: 12px;">
+            <p>This lead was captured by the Montana Feed Company Voice Agent<br>
+            "Better feed. Better beef."</p>
+        </div>
+    </div>
+    """
+    
+    text_body = f"""
+New Lead for {specialist_name}
+
+Name: {lead_name}
+Phone: {phone_display}
+Town: {lead_town or 'Not provided'}
+County: {lead_county or 'Not provided'}
+Interest: {lead_interest or 'Not specified'}
+Herd Size: {lead_herd_size or 'Not provided'}
+Operation: {lead_livestock_type or 'Not specified'}
+
+Please follow up within 24 hours.
+
+--
+Montana Feed Company Voice Agent
+"Better feed. Better beef."
+    """
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "from": FROM_EMAIL,
+                    "to": [specialist_email],
+                    "subject": subject,
+                    "html": html_body,
+                    "text": text_body
+                }
+            )
+            
+            if response.status_code in [200, 201]:
+                print(f"   ✅ Email sent to {specialist_email}")
+                return True
+            else:
+                print(f"   ❌ Email failed: {response.status_code} - {response.text}")
+                return False
+                
+    except Exception as e:
+        print(f"   ❌ Email error: {str(e)}")
+        return False
+
+
 @app.get("/")
 async def root():
     return {
         "status": "MFC Agent Memory Service Running",
         "timestamp": datetime.now().isoformat(),
         "zep_configured": bool(ZEP_API_KEY),
-        "supabase_configured": bool(SUPABASE_URL)
+        "supabase_configured": bool(SUPABASE_URL),
+        "email_configured": bool(RESEND_API_KEY)
     }
 
 
@@ -110,38 +240,31 @@ async def handle_vapi_webhook(request: Request):
     try:
         payload = await request.json()
         
-        # Get the message type
         message_type = payload.get("message", {}).get("type", "unknown")
         print(f"📨 Received webhook: {message_type}")
         
-        # Handle assistant.started - when call begins
         if message_type == "assistant.started":
             phone_number = payload.get("message", {}).get("call", {}).get("customer", {}).get("number")
             if phone_number:
                 print(f"📞 Call started for: {phone_number}")
             return JSONResponse(content={"status": "acknowledged"})
         
-        # Handle tool-calls - this is how Vapi requests memory and executes tools
         elif message_type in ["tool-calls", "function-call"]:
             print("🔍 Tool call received")
             
             message_data = payload.get("message", {})
             
-            # The function data is in toolCallList or toolCalls
             tool_call_list = message_data.get("toolCallList", [])
             if not tool_call_list:
                 tool_call_list = message_data.get("toolCalls", [])
             
             print(f"   📦 Tool call list: {json.dumps(tool_call_list, indent=2)}")
             
-            # Get the first tool call
             if tool_call_list and len(tool_call_list) > 0:
                 tool_call = tool_call_list[0]
                 
-                # IMPORTANT: Get the tool call ID for the response
                 tool_call_id = tool_call.get("id")
                 
-                # Extract function details from the tool call
                 function_name = tool_call.get("function", {}).get("name")
                 if not function_name:
                     function_name = tool_call.get("name")
@@ -150,14 +273,12 @@ async def handle_vapi_webhook(request: Request):
                 if not parameters:
                     parameters = tool_call.get("parameters", {})
                 
-                # Parse parameters if they're a string
                 if isinstance(parameters, str):
                     try:
                         parameters = json.loads(parameters)
                     except json.JSONDecodeError:
                         parameters = {}
                 
-                # Get phone number from call data
                 phone_number = message_data.get("call", {}).get("customer", {}).get("number")
                 
                 print(f"   Function: {function_name}")
@@ -165,14 +286,12 @@ async def handle_vapi_webhook(request: Request):
                 print(f"   Phone: {phone_number}")
                 print(f"   Parameters: {parameters}")
                 
-                # Handle memory retrieval function
                 if function_name == "get_caller_history":
                     print(f"   🧠 Retrieving memory for: {phone_number}")
                     context = await get_caller_context(phone_number)
                     context["caller_phone"] = phone_number
                     print(f"   ✓ Memory retrieved: is_returning_caller={context.get('is_returning_caller')}, name={context.get('caller_name')}")
                     
-                    # Return in Vapi's expected format with toolCallId
                     return JSONResponse(content={
                         "results": [
                             {
@@ -182,13 +301,11 @@ async def handle_vapi_webhook(request: Request):
                         ]
                     })
                 
-                # Handle create_lead function
                 elif function_name == "create_lead":
                     print(f"   💾 Creating lead for: {phone_number}")
                     result = await create_lead(phone_number, parameters)
                     print(f"   ✓ Lead result: {result}")
                     
-                    # Return in Vapi's expected format with toolCallId
                     return JSONResponse(content={
                         "results": [
                             {
@@ -198,13 +315,11 @@ async def handle_vapi_webhook(request: Request):
                         ]
                     })
                 
-                # Handle lookup_town function
                 elif function_name == "lookup_town":
                     print(f"   🗺️ Looking up town for routing")
                     result = await lookup_town(parameters)
                     print(f"   ✓ Town lookup result: {result}")
                     
-                    # Return in Vapi's expected format with toolCallId
                     return JSONResponse(content={
                         "results": [
                             {
@@ -214,7 +329,6 @@ async def handle_vapi_webhook(request: Request):
                         ]
                     })
                 
-                # Handle other functions here as needed
                 print(f"   ⚠️ Function not implemented: {function_name}")
                 return JSONResponse(content={
                     "results": [
@@ -228,7 +342,6 @@ async def handle_vapi_webhook(request: Request):
                 print(f"   ⚠️ No tool calls found in list")
                 return JSONResponse(content={"results": []})
         
-        # Handle end-of-call-report for saving conversation
         elif message_type == "end-of-call-report":
             print("💾 End-of-call-report received")
             
@@ -255,7 +368,6 @@ async def handle_vapi_webhook(request: Request):
             else:
                 return JSONResponse(content={"status": "ignored", "reason": "missing_data"})
         
-        # Handle other webhook types
         else:
             print(f"⚠️ Unhandled webhook type: {message_type}")
             return JSONResponse(content={"status": "ignored", "type": message_type})
@@ -270,19 +382,16 @@ async def handle_vapi_webhook(request: Request):
 async def get_caller_context(phone_number: str) -> dict:
     """
     Retrieve conversation history and context for a returning caller.
-    Returns caller name (only if valid), past topics, and whether they're a returning caller.
     """
     try:
         caller_name = None
         last_topic = None
         last_town = None
         
-        # Step 1: Check if this caller exists in Zep and get their info
         try:
             user = zep.user.get(user_id=phone_number)
             print(f"   ✓ Found existing user: {phone_number}")
             
-            # Get name from user first_name field (only if it's a valid name)
             if hasattr(user, 'first_name') and user.first_name:
                 potential_name = user.first_name
                 if potential_name != phone_number and is_valid_name(potential_name):
@@ -291,10 +400,8 @@ async def get_caller_context(phone_number: str) -> dict:
                 else:
                     print(f"   ⚠️ Stored name '{potential_name}' is not valid, ignoring")
             
-            # Check metadata
             if hasattr(user, 'metadata') and user.metadata:
                 meta = user.metadata
-                # Only use name from metadata if we don't have one yet
                 if not caller_name:
                     if meta.get('name') and is_valid_name(meta.get('name')):
                         caller_name = meta['name']
@@ -316,7 +423,6 @@ async def get_caller_context(phone_number: str) -> dict:
                 "summary": "First time caller - no previous conversation history."
             }
         
-        # Step 2: Check Supabase leads for this phone number (most reliable source of names)
         if not caller_name:
             try:
                 lead_result = supabase.table("leads")\
@@ -340,7 +446,6 @@ async def get_caller_context(phone_number: str) -> dict:
             except Exception as lead_err:
                 print(f"   ⚠️ Could not check leads: {lead_err}")
         
-        # Build the summary
         summary_parts = []
         if caller_name:
             summary_parts.append(f"Returning caller named {caller_name}")
@@ -376,14 +481,6 @@ async def get_caller_context(phone_number: str) -> dict:
 async def lookup_town(parameters: dict) -> dict:
     """
     Look up a town to find the assigned territory and LPS (Livestock Specialist).
-    
-    Queries:
-    1. town_distances table - find territory for the town
-    2. territories table - get territory_id
-    3. specialists table - get LPS contact info
-    
-    NOTE: Both town_distances and territories now use matching names 
-    (e.g., "Missoula Territory" in both tables after database fix)
     """
     try:
         town_name = parameters.get("town_name", "")
@@ -398,7 +495,6 @@ async def lookup_town(parameters: dict) -> dict:
         
         print(f"   🗺️ Looking up town: {town_name}")
         
-        # Step 1: Look up town in town_distances table
         town_query = supabase.table("town_distances")\
             .select("town_name, state, county, assigned_territory, nearest_distance")\
             .ilike("town_name", town_name)
@@ -421,8 +517,6 @@ async def lookup_town(parameters: dict) -> dict:
         territory_name = town_data["assigned_territory"]
         print(f"   ✓ Found town: {town_data['town_name']} → Territory: {territory_name}")
         
-        # Step 2: Look up territory to get territory_id
-        # Database already has matching names (e.g., "Missoula Territory" in both tables)
         territory_name_for_lookup = territory_name
         print(f"   🔍 Looking up territory: {territory_name_for_lookup}")
         
@@ -439,7 +533,6 @@ async def lookup_town(parameters: dict) -> dict:
         else:
             print(f"   ⚠️ Territory not found in territories table: {territory_name_for_lookup}")
         
-        # Step 3: Look up specialist for this territory
         specialist_info = None
         if territory_id:
             specialist_result = supabase.table("specialists")\
@@ -489,9 +582,7 @@ async def lookup_town(parameters: dict) -> dict:
 
 async def create_lead(phone_number: str, parameters: dict) -> dict:
     """
-    Create a new lead in Supabase.
-    Uses correct column names: first_name, last_name, lead_status, territory_id, city
-    Also updates Zep user with the caller's name for future calls.
+    Create a new lead in Supabase and send email notification to specialist.
     """
     try:
         first_name = parameters.get("first_name", "")
@@ -503,14 +594,13 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         territory_id = parameters.get("territory_id", None)
         specialist_id = parameters.get("specialist_id", None)
         specialist_email = parameters.get("specialist_email", "")
+        specialist_name = parameters.get("specialist_name", "")
         primary_interest = parameters.get("primary_interest", "")
         herd_size = parameters.get("herd_size", "")
         livestock_type = parameters.get("livestock_type", "")
         
-        # Use phone from parameters if provided, otherwise use caller ID
         lead_phone = parameters.get("phone", "") or phone_number
         
-        # Build notes combining relevant info
         notes_parts = []
         if county:
             notes_parts.append(f"County: {county}")
@@ -520,7 +610,6 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
             notes_parts.append(f"Livestock: {livestock_type}")
         notes = " | ".join(notes_parts) if notes_parts else None
         
-        # Build lead data with CORRECT column names
         lead_data = {
             "first_name": first_name or "Unknown",
             "last_name": last_name or "Caller",
@@ -529,11 +618,10 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
             "lead_source": "voice_agent"
         }
         
-        # Add optional fields only if they have values
         if email:
             lead_data["email"] = email
         if town:
-            lead_data["city"] = town  # Store town in city column
+            lead_data["city"] = town
         if primary_interest:
             lead_data["primary_interest"] = primary_interest
         if notes:
@@ -543,7 +631,6 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         if specialist_id:
             lead_data["assigned_specialist_id"] = specialist_id
         
-        # Parse herd_size as integer if provided
         if herd_size:
             try:
                 lead_data["herd_size"] = int(str(herd_size).replace(",", ""))
@@ -556,11 +643,22 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         
         print(f"   ✓ Created lead: {first_name} {last_name}")
         
+        # Send email notification to specialist
         if specialist_email:
-            print(f"   📧 Lead assigned to specialist: {specialist_email}")
+            print(f"   📧 Sending email notification to: {specialist_email}")
+            await send_lead_notification_email(
+                specialist_email=specialist_email,
+                specialist_name=specialist_name or "Specialist",
+                lead_name=f"{first_name} {last_name}".strip() or "Unknown Caller",
+                lead_phone=lead_phone,
+                lead_town=town,
+                lead_county=county,
+                lead_interest=primary_interest,
+                lead_herd_size=herd_size,
+                lead_livestock_type=livestock_type
+            )
         
         # Update Zep user with the caller's name for future recognition
-        # Only update if we have a VALID name (not Unknown, Caller, or excluded words)
         if first_name and is_valid_name(first_name):
             try:
                 zep.user.update(
@@ -582,7 +680,8 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
             "lead_id": result.data[0]["id"] if result.data else None,
             "message": f"Lead created successfully for {first_name} {last_name}",
             "territory": territory,
-            "specialist_email": specialist_email
+            "specialist_email": specialist_email,
+            "email_sent": bool(specialist_email and RESEND_API_KEY)
         }
     except Exception as e:
         print(f"   ❌ Error creating lead: {str(e)}")
@@ -598,8 +697,6 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
 async def save_conversation(phone_number: str, call_id: str, transcript: str, messages: list):
     """
     Save conversation to Zep using thread API.
-    Zep SDK v2 uses: zep.thread for conversation management
-    NOTE: We no longer extract names from conversation - only trust names from create_lead
     """
     try:
         print(f"\n💾 Saving conversation for: {phone_number}")
@@ -607,7 +704,6 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
         user_id = phone_number
         thread_id = f"mfc_{phone_number}_{call_id}"
         
-        # Ensure user exists in Zep
         try:
             user = zep.user.get(user_id=user_id)
             print(f"   ✓ User exists in Zep")
@@ -615,7 +711,7 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
             try:
                 zep.user.add(
                     user_id=user_id,
-                    first_name=phone_number,  # Use phone as placeholder, will be updated by create_lead
+                    first_name=phone_number,
                     metadata={
                         "phone": phone_number,
                         "source": "mfc_voice_agent"
@@ -625,7 +721,6 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
             except Exception as e:
                 print(f"   ⚠️ Could not create user: {e}")
         
-        # Format messages for Zep
         zep_messages = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -653,9 +748,7 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
             print("   ⚠️ No messages to save")
             return
         
-        # Use zep.thread API (SDK v2)
         try:
-            # First, try to create the thread (no metadata parameter)
             try:
                 zep.thread.create(
                     thread_id=thread_id,
@@ -668,7 +761,6 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
                 else:
                     print(f"   ⚠️ Thread creation note: {thread_err}")
             
-            # Now add messages to the thread - use 'role' not 'role_type'
             from zep_cloud import Message
             msgs = [Message(role=m["role_type"], content=m["content"]) for m in zep_messages]
             
@@ -680,7 +772,6 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
             
         except Exception as e:
             print(f"   ❌ Error with zep.thread: {str(e)}")
-            # Log available thread methods for debugging
             if hasattr(zep, 'thread'):
                 thread_methods = [a for a in dir(zep.thread) if not a.startswith('_')]
                 print(f"   ℹ Available thread methods: {thread_methods}")
