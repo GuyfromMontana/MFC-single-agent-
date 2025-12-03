@@ -44,6 +44,10 @@ else:
 # Email configuration
 FROM_EMAIL = os.getenv("FROM_EMAIL", "Montana Feed Company <leads@montanafeed.com>")
 
+# Call summary toggle - set SEND_CALL_SUMMARIES=false to disable
+SEND_CALL_SUMMARIES = os.getenv("SEND_CALL_SUMMARIES", "true").lower() == "true"
+print(f"📞 Call summaries: {'enabled' if SEND_CALL_SUMMARIES else 'disabled'}")
+
 # Words that should NEVER be extracted as names
 EXCLUDED_NAME_WORDS = {
     'montana', 'missoula', 'darby', 'hamilton', 'dillon', 'billings', 'bozeman',
@@ -90,6 +94,17 @@ def format_phone_display(phone: str) -> str:
     if phone and len(phone) == 12 and phone.startswith("+1"):
         return f"({phone[2:5]}) {phone[5:8]}-{phone[8:]}"
     return phone or ""
+
+
+def format_duration(seconds: float) -> str:
+    """Format seconds into human-readable duration."""
+    if not seconds:
+        return "Unknown"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 async def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
@@ -230,7 +245,6 @@ async def send_callback_notification_email(
     """Send email notification to specialist about scheduled callback."""
     phone_display = format_phone_display(caller_phone)
     
-    # Build the timing string
     timing_parts = []
     if callback_date:
         timing_parts.append(callback_date)
@@ -298,6 +312,265 @@ Montana Feed Company Voice Agent
     return await send_email(specialist_email, subject, html_body, text_body)
 
 
+async def get_specialist_for_caller(phone_number: str) -> dict:
+    """Look up which specialist should receive notifications for this caller."""
+    result = {
+        "specialist_email": None,
+        "specialist_name": None,
+        "caller_name": None,
+        "territory": None
+    }
+    
+    try:
+        # Check leads table first
+        lead_result = supabase.table("leads")\
+            .select("first_name, last_name, city, assigned_specialist_id, territory_id")\
+            .eq("phone", phone_number)\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if lead_result.data and len(lead_result.data) > 0:
+            lead = lead_result.data[0]
+            
+            first_name = lead.get("first_name", "")
+            last_name = lead.get("last_name", "")
+            if first_name and first_name not in ["Unknown"]:
+                result["caller_name"] = f"{first_name} {last_name}".strip()
+            
+            specialist_id = lead.get("assigned_specialist_id")
+            if specialist_id:
+                spec_result = supabase.table("specialists")\
+                    .select("first_name, last_name, email")\
+                    .eq("id", specialist_id)\
+                    .execute()
+                
+                if spec_result.data and len(spec_result.data) > 0:
+                    spec = spec_result.data[0]
+                    result["specialist_email"] = spec.get("email")
+                    result["specialist_name"] = f"{spec.get('first_name', '')} {spec.get('last_name', '')}".strip()
+            
+            territory_id = lead.get("territory_id")
+            if territory_id:
+                terr_result = supabase.table("territories")\
+                    .select("territory_name")\
+                    .eq("id", territory_id)\
+                    .execute()
+                
+                if terr_result.data and len(terr_result.data) > 0:
+                    result["territory"] = terr_result.data[0].get("territory_name")
+            
+            print(f"   ✓ Found specialist from leads: {result['specialist_name']} ({result['specialist_email']})")
+            return result
+        
+        # Check callbacks table
+        callback_result = supabase.table("callbacks")\
+            .select("caller_name, specialist_id, specialist_email")\
+            .eq("caller_phone", phone_number)\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if callback_result.data and len(callback_result.data) > 0:
+            callback = callback_result.data[0]
+            result["caller_name"] = callback.get("caller_name")
+            result["specialist_email"] = callback.get("specialist_email")
+            
+            specialist_id = callback.get("specialist_id")
+            if specialist_id:
+                spec_result = supabase.table("specialists")\
+                    .select("first_name, last_name")\
+                    .eq("id", specialist_id)\
+                    .execute()
+                
+                if spec_result.data and len(spec_result.data) > 0:
+                    spec = spec_result.data[0]
+                    result["specialist_name"] = f"{spec.get('first_name', '')} {spec.get('last_name', '')}".strip()
+            
+            print(f"   ✓ Found specialist from callbacks: {result['specialist_name']} ({result['specialist_email']})")
+            return result
+        
+        # Try Zep for caller name
+        try:
+            user = zep.user.get(user_id=phone_number)
+            if hasattr(user, 'first_name') and user.first_name and is_valid_name(user.first_name):
+                result["caller_name"] = user.first_name
+        except:
+            pass
+        
+        print(f"   ⚠️ No specialist found for caller: {phone_number}")
+        return result
+        
+    except Exception as e:
+        print(f"   ❌ Error looking up specialist: {str(e)}")
+        return result
+
+
+async def send_call_summary_email(
+    specialist_email: str,
+    specialist_name: str,
+    caller_name: str,
+    caller_phone: str,
+    call_duration: float,
+    messages: list,
+    actions_taken: list
+):
+    """Send call summary email to specialist after call ends."""
+    phone_display = format_phone_display(caller_phone)
+    duration_display = format_duration(call_duration)
+    caller_display = caller_name or "Unknown Caller"
+    
+    # Format conversation
+    conversation_html = ""
+    conversation_text = ""
+    
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("message", "")
+        
+        if role in ["tool_calls", "tool_call_result", "system"] or not content:
+            continue
+        
+        if role in ["assistant", "bot"]:
+            role_label = "Agent"
+            bg_color = "#e8f5e9"
+        else:
+            role_label = caller_display.split()[0] if caller_display else "Caller"
+            bg_color = "#e3f2fd"
+        
+        conversation_html += f"""
+        <div style="background-color: {bg_color}; padding: 10px; margin: 5px 0; border-radius: 5px;">
+            <strong>{role_label}:</strong> {content}
+        </div>
+        """
+        conversation_text += f"{role_label}: {content}\n\n"
+    
+    # Format actions
+    actions_html = ""
+    actions_text = ""
+    if actions_taken:
+        actions_html = "<ul>" + "".join(f"<li>{action}</li>" for action in actions_taken) + "</ul>"
+        actions_text = "\n".join(f"• {action}" for action in actions_taken)
+    else:
+        actions_html = "<p style='color: #666;'>No actions recorded</p>"
+        actions_text = "No actions recorded"
+    
+    call_time = datetime.now().strftime("%I:%M %p on %B %d, %Y")
+    
+    subject = f"📞 Call Summary: {caller_display} - {duration_display}"
+    
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
+        <div style="background-color: #374151; color: white; padding: 20px; text-align: center;">
+            <h1 style="margin: 0;">Montana Feed Company</h1>
+            <p style="margin: 5px 0 0 0;">📞 Call Summary</p>
+        </div>
+        
+        <div style="padding: 20px; background-color: #f9f9f9;">
+            <h2 style="color: #374151; margin-top: 0;">Hey {specialist_name.split()[0] if specialist_name else 'there'}!</h2>
+            
+            <p>Here's a summary of a recent call:</p>
+            
+            <div style="background-color: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 15px 0;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr>
+                        <td style="padding: 5px 10px 5px 0; color: #666;">Caller:</td>
+                        <td style="padding: 5px 0;"><strong>{caller_display}</strong></td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 5px 10px 5px 0; color: #666;">Phone:</td>
+                        <td style="padding: 5px 0;"><strong>{phone_display}</strong></td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 5px 10px 5px 0; color: #666;">Duration:</td>
+                        <td style="padding: 5px 0;">{duration_display}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 5px 10px 5px 0; color: #666;">Time:</td>
+                        <td style="padding: 5px 0;">{call_time}</td>
+                    </tr>
+                </table>
+            </div>
+            
+            <h3 style="color: #374151; margin-top: 25px;">📋 Actions Taken</h3>
+            <div style="background-color: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 10px 0;">
+                {actions_html}
+            </div>
+            
+            <h3 style="color: #374151; margin-top: 25px;">💬 Conversation</h3>
+            <div style="background-color: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 10px 0; max-height: 400px; overflow-y: auto;">
+                {conversation_html if conversation_html else '<p style="color: #666;">No conversation recorded</p>'}
+            </div>
+            
+            <div style="margin-top: 20px;">
+                <a href="tel:{caller_phone}" style="display: inline-block; background-color: #374151; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                    📞 Call Back
+                </a>
+            </div>
+        </div>
+        
+        <div style="padding: 15px; text-align: center; color: #666; font-size: 12px;">
+            <p>Montana Feed Company Voice Agent<br>
+            "Better feed. Better beef."</p>
+        </div>
+    </div>
+    """
+    
+    text_body = f"""
+Call Summary for {specialist_name}
+
+Caller: {caller_display}
+Phone: {phone_display}
+Duration: {duration_display}
+Time: {call_time}
+
+ACTIONS TAKEN:
+{actions_text}
+
+CONVERSATION:
+{conversation_text}
+
+--
+Montana Feed Company Voice Agent
+"Better feed. Better beef."
+    """
+    
+    return await send_email(specialist_email, subject, html_body, text_body)
+
+
+def extract_actions_from_messages(messages: list) -> list:
+    """Extract actions taken during the call from the messages."""
+    actions = []
+    
+    for msg in messages:
+        role = msg.get("role", "")
+        
+        if role == "tool_call_result":
+            tool_name = msg.get("name", "")
+            result_str = msg.get("result", "")
+            
+            try:
+                result = json.loads(result_str) if isinstance(result_str, str) else result_str
+                
+                if tool_name == "create_lead" and result.get("success"):
+                    actions.append("✅ Lead created for follow-up")
+                
+                elif tool_name == "schedule_callback" and result.get("success"):
+                    timing = result.get("timing_summary", "")
+                    actions.append(f"📅 Callback scheduled: {timing}")
+                
+                elif tool_name == "lookup_town" and result.get("success"):
+                    town = result.get("town", "")
+                    territory = result.get("territory", "")
+                    if town and territory:
+                        actions.append(f"🗺️ Location identified: {town} ({territory})")
+                
+            except:
+                pass
+    
+    return actions
+
+
 @app.get("/")
 async def root():
     return {
@@ -305,7 +578,8 @@ async def root():
         "timestamp": datetime.now().isoformat(),
         "zep_configured": bool(ZEP_API_KEY),
         "supabase_configured": bool(SUPABASE_URL),
-        "email_configured": bool(RESEND_API_KEY)
+        "email_configured": bool(RESEND_API_KEY),
+        "call_summaries_enabled": SEND_CALL_SUMMARIES
     }
 
 
@@ -451,18 +725,54 @@ async def handle_vapi_webhook(request: Request):
             transcript = message_data.get("transcript", "")
             messages = message_data.get("messages", [])
             
+            # Get call duration
+            call_duration = None
+            if call_data.get("startedAt") and call_data.get("endedAt"):
+                try:
+                    start = datetime.fromisoformat(call_data["startedAt"].replace("Z", "+00:00"))
+                    end = datetime.fromisoformat(call_data["endedAt"].replace("Z", "+00:00"))
+                    call_duration = (end - start).total_seconds()
+                except:
+                    pass
+            
             if phone_number and (transcript or messages):
                 print(f"\n📞 Processing call:")
                 print(f"   Phone: {phone_number}")
                 print(f"   Call ID: {call_id}")
                 print(f"   Messages: {len(messages)}")
+                print(f"   Duration: {format_duration(call_duration) if call_duration else 'Unknown'}")
                 
                 try:
+                    # Save to Zep
                     await save_conversation(phone_number, call_id, transcript, messages)
+                    
+                    # Send call summary if enabled
+                    if SEND_CALL_SUMMARIES and messages:
+                        print("   📧 Preparing call summary email...")
+                        
+                        specialist_info = await get_specialist_for_caller(phone_number)
+                        
+                        if specialist_info.get("specialist_email"):
+                            actions = extract_actions_from_messages(messages)
+                            
+                            await send_call_summary_email(
+                                specialist_email=specialist_info["specialist_email"],
+                                specialist_name=specialist_info.get("specialist_name", "Specialist"),
+                                caller_name=specialist_info.get("caller_name"),
+                                caller_phone=phone_number,
+                                call_duration=call_duration,
+                                messages=messages,
+                                actions_taken=actions
+                            )
+                        else:
+                            print("   ⚠️ No specialist email found - skipping call summary")
+                    
                     return JSONResponse(content={"status": "success", "message": "Conversation saved"})
                 except Exception as e:
-                    print(f"❌ Error in save_conversation: {str(e)}")
-                    return JSONResponse(content={"status": "partial", "message": "Call logged, memory save failed"})
+                    print(f"❌ Error in end-of-call processing: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return JSONResponse(content={"status": "partial", "message": "Call logged, some features failed"})
             else:
                 return JSONResponse(content={"status": "ignored", "reason": "missing_data"})
         
@@ -675,7 +985,7 @@ async def lookup_town(parameters: dict) -> dict:
 
 
 async def create_lead(phone_number: str, parameters: dict) -> dict:
-    """Create a new lead in Supabase and send email notification to specialist."""
+    """Create a new lead in Supabase and send email notification."""
     try:
         first_name = parameters.get("first_name", "")
         last_name = parameters.get("last_name", "")
@@ -735,7 +1045,7 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         
         print(f"   ✓ Created lead: {first_name} {last_name}")
         
-        # Send email notification to specialist
+        # Send email notification
         if specialist_email:
             print(f"   📧 Sending email notification to: {specialist_email}")
             await send_lead_notification_email(
@@ -750,7 +1060,7 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
                 lead_livestock_type=livestock_type
             )
         
-        # Update Zep user with the caller's name for future recognition
+        # Update Zep user
         if first_name and is_valid_name(first_name):
             try:
                 zep.user.update(
@@ -787,20 +1097,7 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
 
 
 async def schedule_callback(phone_number: str, parameters: dict) -> dict:
-    """
-    Schedule a callback request and notify the specialist.
-    
-    Parameters can include:
-    - caller_name: Name of the person requesting callback
-    - callback_date: Specific date (e.g., "tomorrow", "Monday", "2025-12-05")
-    - callback_time: Specific time (e.g., "2pm", "morning", "afternoon")
-    - callback_timeframe: General timeframe (e.g., "morning", "afternoon", "evening")
-    - reason: Why they want a callback
-    - specialist_id: UUID of the specialist
-    - specialist_email: Email of the specialist
-    - specialist_name: Name of the specialist
-    - territory_id: UUID of the territory
-    """
+    """Schedule a callback request and notify the specialist."""
     try:
         caller_name = parameters.get("caller_name", "Unknown Caller")
         callback_date = parameters.get("callback_date", "")
@@ -820,7 +1117,7 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
         print(f"      Timeframe: {callback_timeframe}")
         print(f"      Reason: {reason}")
         
-        # Parse the date if it's a relative term
+        # Parse date
         parsed_date = None
         today = datetime.now().date()
         
@@ -831,7 +1128,6 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
             elif date_lower == "tomorrow":
                 parsed_date = today + timedelta(days=1)
             elif date_lower in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
-                # Find the next occurrence of this day
                 days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
                 target_day = days.index(date_lower)
                 current_day = today.weekday()
@@ -840,7 +1136,6 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
                     days_ahead += 7
                 parsed_date = today + timedelta(days=days_ahead)
             else:
-                # Try to parse as a date string
                 try:
                     parsed_date = datetime.strptime(callback_date, "%Y-%m-%d").date()
                 except:
@@ -849,7 +1144,6 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
                     except:
                         parsed_date = None
         
-        # Build callback record
         callback_data = {
             "caller_phone": phone_number,
             "caller_name": caller_name,
@@ -869,19 +1163,16 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
         
         print(f"   📝 Callback data: {callback_data}")
         
-        # Save to database
         result = supabase.table("callbacks").insert(callback_data).execute()
         
         callback_id = result.data[0]["id"] if result.data else None
         print(f"   ✓ Created callback: {callback_id}")
         
-        # Build confirmation message for the caller
-        # IMPORTANT: Include explicit date to prevent AI hallucination
+        # Build timing string with explicit date
         timing_parts = []
         if parsed_date:
-            # Always include the full date to prevent AI from guessing wrong
-            day_name = parsed_date.strftime("%A")  # e.g., "Thursday"
-            month_day = parsed_date.strftime("%B %d")  # e.g., "December 4"
+            day_name = parsed_date.strftime("%A")
+            month_day = parsed_date.strftime("%B %d")
             
             if parsed_date == today:
                 timing_parts.append(f"today, {day_name}, {month_day}")
@@ -897,11 +1188,10 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
         
         timing_str = " ".join(timing_parts) if timing_parts else "as soon as possible"
         
-        # Log the current date for debugging
         print(f"   📅 Today is: {today.strftime('%A, %B %d, %Y')}")
         print(f"   📅 Callback scheduled for: {timing_str}")
         
-        # Send email notification to specialist
+        # Send email
         email_sent = False
         if specialist_email:
             print(f"   📧 Sending callback notification to: {specialist_email}")
@@ -939,7 +1229,7 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
 
 
 async def save_conversation(phone_number: str, call_id: str, transcript: str, messages: list):
-    """Save conversation to Zep using thread API."""
+    """Save conversation to Zep."""
     try:
         print(f"\n💾 Saving conversation for: {phone_number}")
         
@@ -1028,6 +1318,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
