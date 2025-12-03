@@ -876,14 +876,19 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
         print(f"   ✓ Created callback: {callback_id}")
         
         # Build confirmation message for the caller
+        # IMPORTANT: Include explicit date to prevent AI hallucination
         timing_parts = []
         if parsed_date:
+            # Always include the full date to prevent AI from guessing wrong
+            day_name = parsed_date.strftime("%A")  # e.g., "Thursday"
+            month_day = parsed_date.strftime("%B %d")  # e.g., "December 4"
+            
             if parsed_date == today:
-                timing_parts.append("today")
+                timing_parts.append(f"today, {day_name}, {month_day}")
             elif parsed_date == today + timedelta(days=1):
-                timing_parts.append("tomorrow")
+                timing_parts.append(f"tomorrow, {day_name}, {month_day}")
             else:
-                timing_parts.append(parsed_date.strftime("%A, %B %d"))
+                timing_parts.append(f"{day_name}, {month_day}")
         
         if callback_time:
             timing_parts.append(f"at {callback_time}")
@@ -891,6 +896,10 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
             timing_parts.append(f"in the {callback_timeframe}")
         
         timing_str = " ".join(timing_parts) if timing_parts else "as soon as possible"
+        
+        # Log the current date for debugging
+        print(f"   📅 Today is: {today.strftime('%A, %B %d, %Y')}")
+        print(f"   📅 Callback scheduled for: {timing_str}")
         
         # Send email notification to specialist
         email_sent = False
@@ -1019,6 +1028,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
