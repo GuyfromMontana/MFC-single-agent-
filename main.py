@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import json
 from zep_cloud.client import Zep
@@ -85,6 +85,52 @@ def is_valid_name(name: str) -> bool:
     return True
 
 
+def format_phone_display(phone: str) -> str:
+    """Format phone number for display: +14065551234 -> (406) 555-1234"""
+    if phone and len(phone) == 12 and phone.startswith("+1"):
+        return f"({phone[2:5]}) {phone[5:8]}-{phone[8:]}"
+    return phone or ""
+
+
+async def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
+    """Send email using Resend API."""
+    if not RESEND_API_KEY:
+        print("   ⚠️ Email skipped - RESEND_API_KEY not configured")
+        return False
+    
+    if not to_email:
+        print("   ⚠️ Email skipped - no recipient email provided")
+        return False
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "from": FROM_EMAIL,
+                    "to": [to_email],
+                    "subject": subject,
+                    "html": html_body,
+                    "text": text_body
+                }
+            )
+            
+            if response.status_code in [200, 201]:
+                print(f"   ✅ Email sent to {to_email}")
+                return True
+            else:
+                print(f"   ❌ Email failed: {response.status_code} - {response.text}")
+                return False
+                
+    except Exception as e:
+        print(f"   ❌ Email error: {str(e)}")
+        return False
+
+
 async def send_lead_notification_email(
     specialist_email: str,
     specialist_name: str,
@@ -96,28 +142,11 @@ async def send_lead_notification_email(
     lead_herd_size: str,
     lead_livestock_type: str
 ):
-    """
-    Send email notification to specialist about new lead.
-    Uses Resend API.
-    """
-    if not RESEND_API_KEY:
-        print("   ⚠️ Email skipped - RESEND_API_KEY not configured")
-        return False
+    """Send email notification to specialist about new lead."""
+    phone_display = format_phone_display(lead_phone)
     
-    if not specialist_email:
-        print("   ⚠️ Email skipped - no specialist email provided")
-        return False
-    
-    # Format phone for display
-    phone_display = lead_phone
-    if lead_phone and len(lead_phone) == 12 and lead_phone.startswith("+1"):
-        # Format +14065551234 as (406) 555-1234
-        phone_display = f"({lead_phone[2:5]}) {lead_phone[5:8]}-{lead_phone[8:]}"
-    
-    # Build email content
     subject = f"🐄 New Lead: {lead_name} from {lead_town or 'Unknown Location'}"
     
-    # Build details list
     details = []
     if lead_phone:
         details.append(f"<strong>Phone:</strong> {phone_display}")
@@ -142,7 +171,7 @@ async def send_lead_notification_email(
         </div>
         
         <div style="padding: 20px; background-color: #f9f9f9;">
-            <h2 style="color: #1a5f2a; margin-top: 0;">Hey {specialist_name.split()[0]}!</h2>
+            <h2 style="color: #1a5f2a; margin-top: 0;">Hey {specialist_name.split()[0] if specialist_name else 'there'}!</h2>
             
             <p>You have a new lead from the voice agent:</p>
             
@@ -155,7 +184,7 @@ async def send_lead_notification_email(
             
             <div style="margin-top: 20px;">
                 <a href="tel:{lead_phone}" style="display: inline-block; background-color: #1a5f2a; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">
-                    📞 Call {lead_name.split()[0]}
+                    📞 Call {lead_name.split()[0] if lead_name else 'Now'}
                 </a>
             </div>
         </div>
@@ -185,33 +214,88 @@ Montana Feed Company Voice Agent
 "Better feed. Better beef."
     """
     
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {RESEND_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "from": FROM_EMAIL,
-                    "to": [specialist_email],
-                    "subject": subject,
-                    "html": html_body,
-                    "text": text_body
-                }
-            )
+    return await send_email(specialist_email, subject, html_body, text_body)
+
+
+async def send_callback_notification_email(
+    specialist_email: str,
+    specialist_name: str,
+    caller_name: str,
+    caller_phone: str,
+    callback_date: str,
+    callback_time: str,
+    callback_timeframe: str,
+    reason: str
+):
+    """Send email notification to specialist about scheduled callback."""
+    phone_display = format_phone_display(caller_phone)
+    
+    # Build the timing string
+    timing_parts = []
+    if callback_date:
+        timing_parts.append(callback_date)
+    if callback_time:
+        timing_parts.append(f"at {callback_time}")
+    elif callback_timeframe:
+        timing_parts.append(f"in the {callback_timeframe}")
+    
+    timing_str = " ".join(timing_parts) if timing_parts else "at their convenience"
+    
+    subject = f"📅 Callback Requested: {caller_name} - {timing_str}"
+    
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background-color: #2563eb; color: white; padding: 20px; text-align: center;">
+            <h1 style="margin: 0;">Montana Feed Company</h1>
+            <p style="margin: 5px 0 0 0;">📅 Callback Request</p>
+        </div>
+        
+        <div style="padding: 20px; background-color: #f9f9f9;">
+            <h2 style="color: #2563eb; margin-top: 0;">Hey {specialist_name.split()[0] if specialist_name else 'there'}!</h2>
             
-            if response.status_code in [200, 201]:
-                print(f"   ✅ Email sent to {specialist_email}")
-                return True
-            else:
-                print(f"   ❌ Email failed: {response.status_code} - {response.text}")
-                return False
-                
-    except Exception as e:
-        print(f"   ❌ Email error: {str(e)}")
-        return False
+            <p>A caller has requested a callback:</p>
+            
+            <div style="background-color: white; border: 2px solid #2563eb; border-radius: 8px; padding: 15px; margin: 15px 0;">
+                <h3 style="margin-top: 0; color: #333;">{caller_name}</h3>
+                <p style="margin: 5px 0;"><strong>📞 Phone:</strong> {phone_display}</p>
+                <p style="margin: 5px 0;"><strong>🕐 When:</strong> {timing_str}</p>
+                {f'<p style="margin: 5px 0;"><strong>📝 Reason:</strong> {reason}</p>' if reason else ''}
+            </div>
+            
+            <div style="background-color: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 15px; margin: 15px 0;">
+                <p style="margin: 0; color: #92400e;"><strong>⚠️ Please add this to your calendar!</strong></p>
+            </div>
+            
+            <div style="margin-top: 20px;">
+                <a href="tel:{caller_phone}" style="display: inline-block; background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                    📞 Call {caller_name.split()[0] if caller_name else 'Now'}
+                </a>
+            </div>
+        </div>
+        
+        <div style="padding: 15px; text-align: center; color: #666; font-size: 12px;">
+            <p>This callback was scheduled by the Montana Feed Company Voice Agent<br>
+            "Better feed. Better beef."</p>
+        </div>
+    </div>
+    """
+    
+    text_body = f"""
+Callback Request for {specialist_name}
+
+Caller: {caller_name}
+Phone: {phone_display}
+When: {timing_str}
+{f'Reason: {reason}' if reason else ''}
+
+Please add this to your calendar!
+
+--
+Montana Feed Company Voice Agent
+"Better feed. Better beef."
+    """
+    
+    return await send_email(specialist_email, subject, html_body, text_body)
 
 
 @app.get("/")
@@ -329,6 +413,20 @@ async def handle_vapi_webhook(request: Request):
                         ]
                     })
                 
+                elif function_name == "schedule_callback":
+                    print(f"   📅 Scheduling callback for: {phone_number}")
+                    result = await schedule_callback(phone_number, parameters)
+                    print(f"   ✓ Callback result: {result}")
+                    
+                    return JSONResponse(content={
+                        "results": [
+                            {
+                                "toolCallId": tool_call_id,
+                                "result": json.dumps(result)
+                            }
+                        ]
+                    })
+                
                 print(f"   ⚠️ Function not implemented: {function_name}")
                 return JSONResponse(content={
                     "results": [
@@ -380,9 +478,7 @@ async def handle_vapi_webhook(request: Request):
 
 
 async def get_caller_context(phone_number: str) -> dict:
-    """
-    Retrieve conversation history and context for a returning caller.
-    """
+    """Retrieve conversation history and context for a returning caller."""
     try:
         caller_name = None
         last_topic = None
@@ -479,9 +575,7 @@ async def get_caller_context(phone_number: str) -> dict:
 
 
 async def lookup_town(parameters: dict) -> dict:
-    """
-    Look up a town to find the assigned territory and LPS (Livestock Specialist).
-    """
+    """Look up a town to find the assigned territory and LPS."""
     try:
         town_name = parameters.get("town_name", "")
         state = parameters.get("state", "")
@@ -581,9 +675,7 @@ async def lookup_town(parameters: dict) -> dict:
 
 
 async def create_lead(phone_number: str, parameters: dict) -> dict:
-    """
-    Create a new lead in Supabase and send email notification to specialist.
-    """
+    """Create a new lead in Supabase and send email notification to specialist."""
     try:
         first_name = parameters.get("first_name", "")
         last_name = parameters.get("last_name", "")
@@ -694,10 +786,151 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         }
 
 
+async def schedule_callback(phone_number: str, parameters: dict) -> dict:
+    """
+    Schedule a callback request and notify the specialist.
+    
+    Parameters can include:
+    - caller_name: Name of the person requesting callback
+    - callback_date: Specific date (e.g., "tomorrow", "Monday", "2025-12-05")
+    - callback_time: Specific time (e.g., "2pm", "morning", "afternoon")
+    - callback_timeframe: General timeframe (e.g., "morning", "afternoon", "evening")
+    - reason: Why they want a callback
+    - specialist_id: UUID of the specialist
+    - specialist_email: Email of the specialist
+    - specialist_name: Name of the specialist
+    - territory_id: UUID of the territory
+    """
+    try:
+        caller_name = parameters.get("caller_name", "Unknown Caller")
+        callback_date = parameters.get("callback_date", "")
+        callback_time = parameters.get("callback_time", "")
+        callback_timeframe = parameters.get("callback_timeframe", "")
+        reason = parameters.get("reason", "")
+        specialist_id = parameters.get("specialist_id")
+        specialist_email = parameters.get("specialist_email", "")
+        specialist_name = parameters.get("specialist_name", "")
+        territory_id = parameters.get("territory_id")
+        
+        print(f"   📅 Scheduling callback:")
+        print(f"      Caller: {caller_name}")
+        print(f"      Phone: {phone_number}")
+        print(f"      Date: {callback_date}")
+        print(f"      Time: {callback_time}")
+        print(f"      Timeframe: {callback_timeframe}")
+        print(f"      Reason: {reason}")
+        
+        # Parse the date if it's a relative term
+        parsed_date = None
+        today = datetime.now().date()
+        
+        if callback_date:
+            date_lower = callback_date.lower().strip()
+            if date_lower == "today":
+                parsed_date = today
+            elif date_lower == "tomorrow":
+                parsed_date = today + timedelta(days=1)
+            elif date_lower in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
+                # Find the next occurrence of this day
+                days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+                target_day = days.index(date_lower)
+                current_day = today.weekday()
+                days_ahead = target_day - current_day
+                if days_ahead <= 0:
+                    days_ahead += 7
+                parsed_date = today + timedelta(days=days_ahead)
+            else:
+                # Try to parse as a date string
+                try:
+                    parsed_date = datetime.strptime(callback_date, "%Y-%m-%d").date()
+                except:
+                    try:
+                        parsed_date = datetime.strptime(callback_date, "%m/%d/%Y").date()
+                    except:
+                        parsed_date = None
+        
+        # Build callback record
+        callback_data = {
+            "caller_phone": phone_number,
+            "caller_name": caller_name,
+            "requested_date": parsed_date.isoformat() if parsed_date else None,
+            "requested_time": callback_time,
+            "requested_timeframe": callback_timeframe,
+            "reason": reason,
+            "status": "pending"
+        }
+        
+        if specialist_id:
+            callback_data["specialist_id"] = specialist_id
+        if specialist_email:
+            callback_data["specialist_email"] = specialist_email
+        if territory_id:
+            callback_data["territory_id"] = territory_id
+        
+        print(f"   📝 Callback data: {callback_data}")
+        
+        # Save to database
+        result = supabase.table("callbacks").insert(callback_data).execute()
+        
+        callback_id = result.data[0]["id"] if result.data else None
+        print(f"   ✓ Created callback: {callback_id}")
+        
+        # Build confirmation message for the caller
+        timing_parts = []
+        if parsed_date:
+            if parsed_date == today:
+                timing_parts.append("today")
+            elif parsed_date == today + timedelta(days=1):
+                timing_parts.append("tomorrow")
+            else:
+                timing_parts.append(parsed_date.strftime("%A, %B %d"))
+        
+        if callback_time:
+            timing_parts.append(f"at {callback_time}")
+        elif callback_timeframe:
+            timing_parts.append(f"in the {callback_timeframe}")
+        
+        timing_str = " ".join(timing_parts) if timing_parts else "as soon as possible"
+        
+        # Send email notification to specialist
+        email_sent = False
+        if specialist_email:
+            print(f"   📧 Sending callback notification to: {specialist_email}")
+            email_sent = await send_callback_notification_email(
+                specialist_email=specialist_email,
+                specialist_name=specialist_name or "Specialist",
+                caller_name=caller_name,
+                caller_phone=phone_number,
+                callback_date=parsed_date.strftime("%A, %B %d, %Y") if parsed_date else callback_date,
+                callback_time=callback_time,
+                callback_timeframe=callback_timeframe,
+                reason=reason
+            )
+        
+        return {
+            "success": True,
+            "callback_id": callback_id,
+            "scheduled_date": parsed_date.isoformat() if parsed_date else None,
+            "scheduled_time": callback_time,
+            "scheduled_timeframe": callback_timeframe,
+            "timing_summary": timing_str,
+            "email_sent": email_sent,
+            "message": f"I've scheduled a callback for {timing_str}. {specialist_name or 'Your specialist'} will give you a call."
+        }
+        
+    except Exception as e:
+        print(f"   ❌ Error scheduling callback: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "I had trouble scheduling that callback. Let me take your information and have someone call you back."
+        }
+
+
 async def save_conversation(phone_number: str, call_id: str, transcript: str, messages: list):
-    """
-    Save conversation to Zep using thread API.
-    """
+    """Save conversation to Zep using thread API."""
     try:
         print(f"\n💾 Saving conversation for: {phone_number}")
         
@@ -786,6 +1019,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
