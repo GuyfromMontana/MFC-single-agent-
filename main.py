@@ -379,8 +379,11 @@ async def lookup_town(parameters: dict) -> dict:
     
     Queries:
     1. town_distances table - find territory for the town
-    2. territories table - get territory_id (NOTE: appends " Territory" to match naming)
+    2. territories table - get territory_id
     3. specialists table - get LPS contact info
+    
+    NOTE: Both town_distances and territories now use matching names 
+    (e.g., "Missoula Territory" in both tables after database fix)
     """
     try:
         town_name = parameters.get("town_name", "")
@@ -419,9 +422,8 @@ async def lookup_town(parameters: dict) -> dict:
         print(f"   ✓ Found town: {town_data['town_name']} → Territory: {territory_name}")
         
         # Step 2: Look up territory to get territory_id
-        # FIX: town_distances has "Missoula" but territories table has "Missoula Territory"
-        # So we append " Territory" to match the naming convention
-        territory_name_for_lookup = f"{territory_name} Territory"
+        # Database already has matching names (e.g., "Missoula Territory" in both tables)
+        territory_name_for_lookup = territory_name
         print(f"   🔍 Looking up territory: {territory_name_for_lookup}")
         
         territory_result = supabase.table("territories")\
@@ -471,7 +473,7 @@ async def lookup_town(parameters: dict) -> dict:
             "territory_id": territory_id,
             "distance_miles": float(town_data["nearest_distance"]) if town_data["nearest_distance"] else None,
             "specialist": specialist_info,
-            "message": f"{town_name} is in our {territory_name} territory. {specialist_message}"
+            "message": f"{town_name} is in our {territory_name}. {specialist_message}"
         }
         
     except Exception as e:
@@ -693,6 +695,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
