@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
 import os
 import json
+import re
 from zep_cloud.client import Zep
 from supabase import create_client, Client
 import logging
@@ -648,7 +649,7 @@ async def handle_vapi_webhook(request: Request):
                     print(f"   🧠 Retrieving memory for: {phone_number}")
                     context = await get_caller_context(phone_number)
                     context["caller_phone"] = phone_number
-                    print(f"   ✓ Memory retrieved: is_returning_caller={context.get('is_returning_caller')}, name={context.get('caller_name')}")
+                    print(f"   ✓ Memory retrieved: is_returning_caller={context.get('is_returning_caller')}, is_known_contact={context.get('is_known_contact')}, name={context.get('caller_name')}")
                     
                     return JSONResponse(content={
                         "results": [
@@ -788,48 +789,118 @@ async def handle_vapi_webhook(request: Request):
 
 
 async def get_caller_context(phone_number: str) -> dict:
-    """Retrieve conversation history and context for a returning caller."""
+    """
+    Enhanced caller recognition that checks:
+    1. Supabase caller_contacts table (Epicor customers + Wyoming prospects)
+    2. Zep conversation memory (for returning callers with history)
+    3. Leads table (for recent lead info)
+    
+    Returns combined context for the voice agent.
+    """
     try:
-        caller_name = None
-        last_topic = None
-        last_town = None
+        # Initialize context
+        context = {
+            "is_returning_caller": False,
+            "is_known_contact": False,
+            "is_existing_customer": False,
+            "is_prospect": False,
+            "caller_name": None,
+            "customer_name": None,
+            "city": None,
+            "state": None,
+            "county": None,
+            "primary_warehouse": None,
+            "territory": None,
+            "total_sales": 0,
+            "last_purchase": None,
+            "last_town": None,
+            "last_topic": None,
+            "summary": "First time caller - no previous information.",
+            "greeting_hint": "New caller. Collect their name and information."
+        }
         
+        # Normalize phone number to +1XXXXXXXXXX format
+        normalized_phone = phone_number
+        if phone_number:
+            digits = re.sub(r'\D', '', phone_number)
+            if len(digits) == 10:
+                normalized_phone = '+1' + digits
+            elif len(digits) == 11 and digits[0] == '1':
+                normalized_phone = '+' + digits
+        
+        print(f"   🔍 Looking up caller: {normalized_phone}")
+        
+        # ============================================
+        # STEP 1: Check Supabase caller_contacts table
+        # ============================================
+        try:
+            contact_result = supabase.table("caller_contacts")\
+                .select("*")\
+                .eq("phone_normalized", normalized_phone)\
+                .execute()
+            
+            if contact_result.data and len(contact_result.data) > 0:
+                contact = contact_result.data[0]
+                print(f"   ✓ Found in caller_contacts: {contact.get('customer_name')}")
+                
+                context["is_known_contact"] = True
+                context["caller_name"] = contact.get("first_name") or contact.get("customer_name")
+                context["customer_name"] = contact.get("customer_name")
+                context["city"] = contact.get("city")
+                context["state"] = contact.get("state")
+                context["primary_warehouse"] = contact.get("primary_warehouse")
+                context["territory"] = contact.get("territory")
+                context["is_existing_customer"] = contact.get("is_existing_customer", False)
+                context["is_prospect"] = contact.get("is_prospect", False)
+                context["total_sales"] = contact.get("total_sales", 0) or 0
+                context["last_purchase"] = contact.get("last_purchase")
+                context["last_town"] = contact.get("city")
+                
+                # Build summary and greeting hint
+                if context["is_existing_customer"]:
+                    sales_str = f"${context['total_sales']:,.0f} lifetime" if context['total_sales'] else "existing"
+                    context["summary"] = f"Known customer: {contact.get('customer_name')} from {contact.get('city')}, {contact.get('state')}. {sales_str} customer. Primary warehouse: {contact.get('primary_warehouse')}."
+                    context["greeting_hint"] = f"This is {context['caller_name']}, an existing customer from {contact.get('city')}. Greet them warmly by name."
+                elif context["is_prospect"]:
+                    context["summary"] = f"Wyoming prospect: {contact.get('customer_name')} from {contact.get('city')}, {contact.get('state')}. Seedstock operation - not yet a customer."
+                    context["greeting_hint"] = f"This is {context['caller_name']}, a prospect from {contact.get('city')}. They're a seedstock operation we've identified but haven't done business with yet. Greet them by name."
+            else:
+                print(f"   ℹ Not found in caller_contacts")
+                
+        except Exception as contact_err:
+            print(f"   ⚠️ Error checking caller_contacts: {contact_err}")
+        
+        # ============================================
+        # STEP 2: Check Zep for conversation history
+        # ============================================
         try:
             user = zep.user.get(user_id=phone_number)
-            print(f"   ✓ Found existing user: {phone_number}")
+            print(f"   ✓ Found in Zep: returning caller")
+            context["is_returning_caller"] = True
             
-            if hasattr(user, 'first_name') and user.first_name:
-                potential_name = user.first_name
-                if potential_name != phone_number and is_valid_name(potential_name):
-                    caller_name = potential_name
-                    print(f"   ✓ Found valid caller name: {caller_name}")
-                else:
-                    print(f"   ⚠️ Stored name '{potential_name}' is not valid, ignoring")
+            # If we didn't get a name from caller_contacts, try Zep
+            if not context["caller_name"]:
+                if hasattr(user, 'first_name') and user.first_name:
+                    potential_name = user.first_name
+                    if potential_name != phone_number and is_valid_name(potential_name):
+                        context["caller_name"] = potential_name
+                        print(f"   ✓ Found name from Zep: {context['caller_name']}")
             
+            # Get metadata from Zep
             if hasattr(user, 'metadata') and user.metadata:
                 meta = user.metadata
-                if not caller_name:
-                    if meta.get('name') and is_valid_name(meta.get('name')):
-                        caller_name = meta['name']
-                    elif meta.get('first_name') and is_valid_name(meta.get('first_name')):
-                        caller_name = meta['first_name']
-                
-                if meta.get('town'):
-                    last_town = meta['town']
+                if not context["last_town"] and meta.get('town'):
+                    context["last_town"] = meta['town']
                 if meta.get('last_interest'):
-                    last_topic = meta['last_interest']
+                    context["last_topic"] = meta['last_interest']
                     
-                print(f"   ✓ User metadata: {meta}")
-                
-        except Exception as e:
-            print(f"   ℹ New caller (no Zep user): {phone_number}")
-            return {
-                "is_returning_caller": False,
-                "caller_name": None,
-                "summary": "First time caller - no previous conversation history."
-            }
+        except Exception as zep_err:
+            print(f"   ℹ Not found in Zep (new caller to voice system)")
         
-        if not caller_name:
+        # ============================================
+        # STEP 3: Check leads table if still no name
+        # ============================================
+        if not context["caller_name"]:
             try:
                 lead_result = supabase.table("leads")\
                     .select("first_name, last_name, city, primary_interest")\
@@ -842,36 +913,48 @@ async def get_caller_context(phone_number: str) -> dict:
                     lead = lead_result.data[0]
                     potential_name = lead.get("first_name")
                     if potential_name and is_valid_name(potential_name):
-                        caller_name = potential_name
-                        print(f"   ✓ Found caller name from leads: {caller_name}")
-                    if lead.get("city"):
-                        last_town = lead["city"]
+                        context["caller_name"] = potential_name
+                        context["is_returning_caller"] = True
+                        print(f"   ✓ Found name from leads: {context['caller_name']}")
+                    if not context["last_town"] and lead.get("city"):
+                        context["last_town"] = lead["city"]
                     if lead.get("primary_interest"):
-                        last_topic = lead["primary_interest"]
+                        context["last_topic"] = lead["primary_interest"]
                         
             except Exception as lead_err:
                 print(f"   ⚠️ Could not check leads: {lead_err}")
         
-        summary_parts = []
-        if caller_name:
-            summary_parts.append(f"Returning caller named {caller_name}")
-        else:
-            summary_parts.append("Returning caller")
+        # ============================================
+        # STEP 4: Build final summary
+        # ============================================
+        if context["is_known_contact"] and context["is_returning_caller"]:
+            # Known contact who has called before
+            context["summary"] += f" Has called before."
+            context["greeting_hint"] = f"This is {context['caller_name']}, a returning caller and {'existing customer' if context['is_existing_customer'] else 'prospect'}. Greet them warmly and reference that you remember them."
         
-        if last_town:
-            summary_parts.append(f"from {last_town}")
-        if last_topic:
-            summary_parts.append(f"previously interested in {last_topic}")
+        elif context["is_known_contact"] and not context["is_returning_caller"]:
+            # Known contact, first time calling
+            context["greeting_hint"] = f"This is {context['caller_name']} calling for the first time, but they're {'already a customer' if context['is_existing_customer'] else 'a prospect we know about'}. Greet them by name."
         
-        summary = " ".join(summary_parts) + "."
+        elif not context["is_known_contact"] and context["is_returning_caller"]:
+            # Has called before but not in our contact list
+            summary_parts = ["Returning caller"]
+            if context["caller_name"]:
+                summary_parts = [f"Returning caller named {context['caller_name']}"]
+            if context["last_town"]:
+                summary_parts.append(f"from {context['last_town']}")
+            if context["last_topic"]:
+                summary_parts.append(f"previously interested in {context['last_topic']}")
+            context["summary"] = " ".join(summary_parts) + "."
+            context["greeting_hint"] = f"Returning caller ({context['caller_name'] or 'name known'}). They've called before. Greet them warmly."
         
-        return {
-            "is_returning_caller": True,
-            "caller_name": caller_name,
-            "last_town": last_town,
-            "last_topic": last_topic,
-            "summary": summary
-        }
+        # If still no summary set, use default
+        if not context["is_known_contact"] and not context["is_returning_caller"]:
+            context["summary"] = "First time caller - no previous information."
+            context["greeting_hint"] = "New caller. Collect their name and information."
+        
+        print(f"   ✓ Context ready: known_contact={context['is_known_contact']}, returning={context['is_returning_caller']}, name={context['caller_name']}")
+        return context
             
     except Exception as e:
         print(f"   ❌ Error retrieving caller context: {e}")
@@ -879,8 +962,10 @@ async def get_caller_context(phone_number: str) -> dict:
         traceback.print_exc()
         return {
             "is_returning_caller": False,
+            "is_known_contact": False,
             "caller_name": None,
-            "summary": "Unable to retrieve caller history."
+            "summary": "Unable to retrieve caller history.",
+            "greeting_hint": "New caller. Collect their name and information."
         }
 
 
