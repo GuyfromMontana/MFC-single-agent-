@@ -595,6 +595,155 @@ async def health_check():
     }
 
 
+@app.post("/api/query-knowledge")
+async def query_knowledge(request: Request):
+    """
+    Knowledge base search endpoint for Retell agent.
+    Searches the knowledge_base table for cattle nutrition information,
+    USDA program details, product recommendations, and feeding strategies.
+    """
+    try:
+        data = await request.json()
+        query = data.get('query', '')
+        
+        if not query:
+            return JSONResponse(
+                content={
+                    'error': 'Query parameter is required',
+                    'results': [],
+                    'query': ''
+                },
+                status_code=400
+            )
+        
+        logger.info(f"[Knowledge Query] Searching for: {query}")
+        
+        # Extract search terms
+        search_terms = [
+            word for word in re.sub(r'[^\w\s]', ' ', query.lower()).split()
+            if len(word) > 2 and word not in [
+                'what', 'how', 'when', 'where', 'why', 'the', 'for', 'and',
+                'you', 'should', 'can', 'will', 'are', 'our', 'your', 'they',
+                'have', 'has', 'been', 'this', 'that', 'with'
+            ]
+        ]
+        
+        logger.info(f"[Knowledge Query] Search terms: {', '.join(search_terms)}")
+        
+        results = []
+        
+        # Strategy 1: Keyword match (best accuracy)
+        if search_terms:
+            try:
+                response = supabase.table('knowledge_base') \
+                    .select('*') \
+                    .contains('keywords', search_terms[:3]) \
+                    .eq('is_active', True) \
+                    .order('priority', desc=True) \
+                    .limit(5) \
+                    .execute()
+                
+                if response.data:
+                    results = response.data
+                    logger.info(f"[Knowledge Query] Found {len(results)} results via keyword match")
+            except Exception as e:
+                logger.warning(f"[Knowledge Query] Keyword search error: {e}")
+        
+        # Strategy 2: Full text search fallback
+        if not results and search_terms:
+            try:
+                search_pattern = '%' + '%'.join(search_terms) + '%'
+                response = supabase.table('knowledge_base') \
+                    .select('*') \
+                    .or_(f"question.ilike.{search_pattern},answer.ilike.{search_pattern}") \
+                    .eq('is_active', True) \
+                    .order('priority', desc=True) \
+                    .limit(5) \
+                    .execute()
+                
+                if response.data:
+                    results = response.data
+                    logger.info(f"[Knowledge Query] Found {len(results)} results via text search")
+            except Exception as e:
+                logger.warning(f"[Knowledge Query] Text search error: {e}")
+        
+        # Strategy 3: Category match (last resort)
+        if not results:
+            category_map = {
+                'mineral': 'Minerals',
+                'protein': 'Protein',
+                'tub': 'Tubs',
+                'breeding': 'Reproduction',
+                'calving': 'Reproduction',
+                'pregnant': 'Reproduction',
+                'usda': 'USDA Programs',
+                'nrcs': 'USDA Programs',
+                'eqip': 'USDA Programs',
+                'csp': 'USDA Programs',
+                'conservation': 'USDA Programs',
+                'regenerative': 'USDA Programs',
+                'grazing': 'USDA Programs'
+            }
+            
+            detected_category = None
+            for term, category in category_map.items():
+                if term in query.lower():
+                    detected_category = category
+                    break
+            
+            if detected_category:
+                try:
+                    response = supabase.table('knowledge_base') \
+                        .select('*') \
+                        .eq('category', detected_category) \
+                        .eq('is_active', True) \
+                        .order('priority', desc=True) \
+                        .limit(3) \
+                        .execute()
+                    
+                    if response.data:
+                        results = response.data
+                        logger.info(f"[Knowledge Query] Found {len(results)} results via category: {detected_category}")
+                except Exception as e:
+                    logger.warning(f"[Knowledge Query] Category search error: {e}")
+        
+        # Format response
+        formatted_results = [
+            {
+                'question': r.get('question'),
+                'answer': r.get('answer'),
+                'category': r.get('category'),
+                'subcategory': r.get('subcategory'),
+                'related_products': r.get('related_products', []),
+                'source': r.get('source')
+            }
+            for r in results
+        ]
+        
+        response_data = {
+            'results': formatted_results,
+            'query': query,
+            'found': len(results) > 0
+        }
+        
+        logger.info(f"[Knowledge Query] Returning {len(results)} results")
+        
+        return JSONResponse(content=response_data)
+        
+    except Exception as e:
+        logger.error(f"[Knowledge Query] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            content={
+                'error': 'Internal server error',
+                'results': [],
+                'query': data.get('query', '') if 'data' in locals() else ''
+            },
+            status_code=500
+        )
+
+
 @app.post("/")
 async def handle_vapi_webhook(request: Request):
     """Handle all incoming webhooks from Vapi"""
