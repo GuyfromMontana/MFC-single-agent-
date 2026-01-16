@@ -463,16 +463,17 @@ async def retell_lookup_staff(request: Request):
         
         from main import supabase as sb
         
-        # Search specialists table (LPS)
-        # Search by first name, last name, or full name
-        search_term = f"%{name}%"
-        
+        # Search specialists table by first_name or last_name
+        # Use ilike for case-insensitive partial matching
         result = sb.table("specialists")\
             .select("*")\
-            .or_(f"first_name.ilike.{search_term},last_name.ilike.{search_term},full_name.ilike.{search_term}")\
+            .or_(f"first_name.ilike.%{name}%,last_name.ilike.%{name}%")\
             .eq("is_active", True)\
             .limit(5)\
             .execute()
+        
+        print(f"   🔍 Search query: first_name or last_name ilike '%{name}%'")
+        print(f"   📊 Found {len(result.data) if result.data else 0} matches")
         
         if result.data and len(result.data) > 0:
             # Found specialist(s)
@@ -482,25 +483,38 @@ async def retell_lookup_staff(request: Request):
                 # Single match - return it
                 specialist = matches[0]
                 
-                print(f"   ✓ Found specialist: {specialist.get('full_name')}")
+                # Build full name from first + last
+                full_name = f"{specialist.get('first_name', '')} {specialist.get('last_name', '')}".strip()
+                
+                print(f"   ✓ Found specialist: {full_name}")
+                
+                # Determine staff type based on email or role
+                email = specialist.get('email', '')
+                if 'axmen.com' in email.lower():
+                    staff_type = "Warehouse Staff"
+                elif 'landolakes.com' in email.lower():
+                    staff_type = "Livestock Production Specialist"
+                else:
+                    staff_type = "Montana Feed Company Staff"
                 
                 return JSONResponse(content={
                     "result": json.dumps({
                         "found": True,
-                        "staff_type": "Livestock Production Specialist",
-                        "name": specialist.get("full_name"),
+                        "staff_type": staff_type,
+                        "name": full_name,
                         "first_name": specialist.get("first_name"),
+                        "last_name": specialist.get("last_name"),
                         "phone": specialist.get("phone"),
                         "email": specialist.get("email"),
                         "territory": specialist.get("territory_name"),
-                        "specialist_id": specialist.get("specialist_id"),
-                        "message": f"Found {specialist.get('full_name')}, Livestock Production Specialist covering {specialist.get('territory_name')}."
+                        "specialist_id": specialist.get("specialist_id") or specialist.get("id"),
+                        "message": f"Found {full_name}, {staff_type}" + (f" covering {specialist.get('territory_name')}" if specialist.get('territory_name') else "") + "."
                     })
                 })
             
             else:
                 # Multiple matches - return list
-                names = [s.get("full_name") for s in matches]
+                names = [f"{s.get('first_name', '')} {s.get('last_name', '')}".strip() for s in matches]
                 
                 print(f"   ✓ Found {len(matches)} specialists matching '{name}'")
                 
