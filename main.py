@@ -1421,8 +1421,79 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
         
         print(f"   ✓ Created lead: {first_name} {last_name}")
         
-        # Send email notification
-        if specialist_email:
+        # Send email notifications to BOTH LPS and Manager
+        emails_sent = []
+        
+        # If we have territory_id, look up both LPS and Manager
+        if territory_id and not specialist_email:
+            print(f"   🔍 Looking up LPS and Manager for territory: {territory_id}")
+            
+            # Get LPS
+            try:
+                lps_result = supabase.table("specialists")\
+                    .select("first_name, last_name, email")\
+                    .eq("territory_id", territory_id)\
+                    .eq("role", "lps")\
+                    .eq("is_active", True)\
+                    .limit(1)\
+                    .execute()
+                
+                if lps_result.data:
+                    lps = lps_result.data[0]
+                    lps_email = lps["email"]
+                    lps_name = f"{lps['first_name']} {lps['last_name']}"
+                    
+                    print(f"   📧 Sending lead notification to LPS: {lps_name} ({lps_email})")
+                    await send_lead_notification_email(
+                        specialist_email=lps_email,
+                        specialist_name=lps_name,
+                        lead_name=f"{first_name} {last_name}".strip() or "Unknown Caller",
+                        lead_phone=lead_phone,
+                        lead_town=town,
+                        lead_county=county,
+                        lead_interest=primary_interest,
+                        lead_herd_size=herd_size,
+                        lead_livestock_type=livestock_type
+                    )
+                    emails_sent.append(lps_email)
+                    
+            except Exception as e:
+                print(f"   ⚠️ Could not send to LPS: {e}")
+            
+            # Get Manager
+            try:
+                mgr_result = supabase.table("specialists")\
+                    .select("first_name, last_name, email")\
+                    .eq("territory_id", territory_id)\
+                    .eq("role", "manager")\
+                    .eq("is_active", True)\
+                    .limit(1)\
+                    .execute()
+                
+                if mgr_result.data:
+                    mgr = mgr_result.data[0]
+                    mgr_email = mgr["email"]
+                    mgr_name = f"{mgr['first_name']} {mgr['last_name']}"
+                    
+                    print(f"   📧 Sending lead notification to Manager: {mgr_name} ({mgr_email})")
+                    await send_lead_notification_email(
+                        specialist_email=mgr_email,
+                        specialist_name=mgr_name,
+                        lead_name=f"{first_name} {last_name}".strip() or "Unknown Caller",
+                        lead_phone=lead_phone,
+                        lead_town=town,
+                        lead_county=county,
+                        lead_interest=primary_interest,
+                        lead_herd_size=herd_size,
+                        lead_livestock_type=livestock_type
+                    )
+                    emails_sent.append(mgr_email)
+                    
+            except Exception as e:
+                print(f"   ⚠️ Could not send to Manager: {e}")
+        
+        # Fallback: if specialist_email was provided directly (from lookup_town)
+        elif specialist_email:
             print(f"   📧 Sending email notification to: {specialist_email}")
             await send_lead_notification_email(
                 specialist_email=specialist_email,
@@ -1435,6 +1506,7 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
                 lead_herd_size=herd_size,
                 lead_livestock_type=livestock_type
             )
+            emails_sent.append(specialist_email)
         
         # Update Zep user (V3 API)
         if first_name and is_valid_name(first_name):
@@ -1458,8 +1530,9 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
             "lead_id": result.data[0]["id"] if result.data else None,
             "message": f"Lead created successfully for {first_name} {last_name}",
             "territory": territory,
-            "specialist_email": specialist_email,
-            "email_sent": bool(specialist_email and RESEND_API_KEY)
+            "emails_sent_to": emails_sent,
+            "email_count": len(emails_sent),
+            "email_sent": len(emails_sent) > 0 and bool(RESEND_API_KEY)
         }
     except Exception as e:
         print(f"   ❌ Error creating lead: {str(e)}")
@@ -1567,11 +1640,79 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
         print(f"   📅 Today is: {today.strftime('%A, %B %d, %Y')}")
         print(f"   📅 Callback scheduled for: {timing_str}")
         
-        # Send email
-        email_sent = False
-        if specialist_email:
+        # Send email notifications to BOTH LPS and Manager
+        emails_sent = []
+        
+        # If we have territory_id, look up both LPS and Manager
+        if territory_id and not specialist_email:
+            print(f"   🔍 Looking up LPS and Manager for territory: {territory_id}")
+            
+            # Get LPS
+            try:
+                lps_result = supabase.table("specialists")\
+                    .select("first_name, last_name, email")\
+                    .eq("territory_id", territory_id)\
+                    .eq("role", "lps")\
+                    .eq("is_active", True)\
+                    .limit(1)\
+                    .execute()
+                
+                if lps_result.data:
+                    lps = lps_result.data[0]
+                    lps_email = lps["email"]
+                    lps_name = f"{lps['first_name']} {lps['last_name']}"
+                    
+                    print(f"   📧 Sending callback notification to LPS: {lps_name} ({lps_email})")
+                    await send_callback_notification_email(
+                        specialist_email=lps_email,
+                        specialist_name=lps_name,
+                        caller_name=caller_name,
+                        caller_phone=phone_number,
+                        callback_date=parsed_date.strftime("%A, %B %d, %Y") if parsed_date else callback_date,
+                        callback_time=callback_time,
+                        callback_timeframe=callback_timeframe,
+                        reason=reason
+                    )
+                    emails_sent.append(lps_email)
+                    
+            except Exception as e:
+                print(f"   ⚠️ Could not send to LPS: {e}")
+            
+            # Get Manager
+            try:
+                mgr_result = supabase.table("specialists")\
+                    .select("first_name, last_name, email")\
+                    .eq("territory_id", territory_id)\
+                    .eq("role", "manager")\
+                    .eq("is_active", True)\
+                    .limit(1)\
+                    .execute()
+                
+                if mgr_result.data:
+                    mgr = mgr_result.data[0]
+                    mgr_email = mgr["email"]
+                    mgr_name = f"{mgr['first_name']} {mgr['last_name']}"
+                    
+                    print(f"   📧 Sending callback notification to Manager: {mgr_name} ({mgr_email})")
+                    await send_callback_notification_email(
+                        specialist_email=mgr_email,
+                        specialist_name=mgr_name,
+                        caller_name=caller_name,
+                        caller_phone=phone_number,
+                        callback_date=parsed_date.strftime("%A, %B %d, %Y") if parsed_date else callback_date,
+                        callback_time=callback_time,
+                        callback_timeframe=callback_timeframe,
+                        reason=reason
+                    )
+                    emails_sent.append(mgr_email)
+                    
+            except Exception as e:
+                print(f"   ⚠️ Could not send to Manager: {e}")
+        
+        # Fallback: if specialist_email was provided directly
+        elif specialist_email:
             print(f"   📧 Sending callback notification to: {specialist_email}")
-            email_sent = await send_callback_notification_email(
+            await send_callback_notification_email(
                 specialist_email=specialist_email,
                 specialist_name=specialist_name or "Specialist",
                 caller_name=caller_name,
@@ -1581,6 +1722,7 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
                 callback_timeframe=callback_timeframe,
                 reason=reason
             )
+            emails_sent.append(specialist_email)
         
         return {
             "success": True,
@@ -1589,7 +1731,9 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
             "scheduled_time": callback_time,
             "scheduled_timeframe": callback_timeframe,
             "timing_summary": timing_str,
-            "email_sent": email_sent,
+            "emails_sent_to": emails_sent,
+            "email_count": len(emails_sent),
+            "email_sent": len(emails_sent) > 0 and bool(RESEND_API_KEY),
             "message": f"I've scheduled a callback for {timing_str}. {specialist_name or 'Your specialist'} will give you a call."
         }
         
@@ -1709,6 +1853,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
