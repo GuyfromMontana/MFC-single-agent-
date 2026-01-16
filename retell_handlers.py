@@ -427,6 +427,121 @@ async def retell_query_knowledge(request: Request):
 
 
 # ============================================================================
+# FUNCTION: lookup_staff
+# Search for staff by name (LPS, warehouse managers, admin)
+# ============================================================================
+
+@router.post("/functions/lookup_staff")
+async def retell_lookup_staff(request: Request):
+    """
+    Look up Montana Feed Company staff by name.
+    Searches specialists (LPS), warehouse managers, and other staff.
+    """
+    try:
+        body = await request.body()
+        signature = request.headers.get("x-retell-signature", "")
+        
+        if not verify_retell_signature(body, signature):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+        
+        payload = json.loads(body)
+        args = payload.get("args", {})
+        
+        # Get search parameters
+        name = args.get("name", "") or args.get("staff_name", "")
+        role = args.get("role", "")  # Optional: "lps", "warehouse manager", "admin"
+        
+        print(f"\n👤 Retell lookup_staff: name={name}, role={role}")
+        
+        if not name:
+            return JSONResponse(content={
+                "result": json.dumps({
+                    "found": False,
+                    "message": "I need a name to search for. Who are you looking for?"
+                })
+            })
+        
+        from main import supabase as sb
+        
+        # Search specialists table (LPS)
+        # Search by first name, last name, or full name
+        search_term = f"%{name}%"
+        
+        result = sb.table("specialists")\
+            .select("*")\
+            .or_(f"first_name.ilike.{search_term},last_name.ilike.{search_term},full_name.ilike.{search_term}")\
+            .eq("is_active", True)\
+            .limit(5)\
+            .execute()
+        
+        if result.data and len(result.data) > 0:
+            # Found specialist(s)
+            matches = result.data
+            
+            if len(matches) == 1:
+                # Single match - return it
+                specialist = matches[0]
+                
+                print(f"   ✓ Found specialist: {specialist.get('full_name')}")
+                
+                return JSONResponse(content={
+                    "result": json.dumps({
+                        "found": True,
+                        "staff_type": "Livestock Production Specialist",
+                        "name": specialist.get("full_name"),
+                        "first_name": specialist.get("first_name"),
+                        "phone": specialist.get("phone"),
+                        "email": specialist.get("email"),
+                        "territory": specialist.get("territory_name"),
+                        "specialist_id": specialist.get("specialist_id"),
+                        "message": f"Found {specialist.get('full_name')}, Livestock Production Specialist covering {specialist.get('territory_name')}."
+                    })
+                })
+            
+            else:
+                # Multiple matches - return list
+                names = [s.get("full_name") for s in matches]
+                
+                print(f"   ✓ Found {len(matches)} specialists matching '{name}'")
+                
+                return JSONResponse(content={
+                    "result": json.dumps({
+                        "found": True,
+                        "multiple_matches": True,
+                        "count": len(matches),
+                        "names": names,
+                        "message": f"I found {len(matches)} specialists: {', '.join(names)}. Which one do you need?"
+                    })
+                })
+        
+        else:
+            # Not found in specialists - could be warehouse manager or admin
+            print(f"   ℹ No specialist found matching '{name}'")
+            
+            return JSONResponse(content={
+                "result": json.dumps({
+                    "found": False,
+                    "searched_name": name,
+                    "message": f"I don't have contact information for {name}. They might be at one of our warehouses. Which location are you calling about - Dillon, Miles City, Lewistown, Columbus, or Buffalo?"
+                })
+            })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in lookup_staff: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(content={
+            "result": json.dumps({
+                "found": False,
+                "error": str(e),
+                "message": "I had trouble looking up that person."
+            })
+        })
+
+
+# ============================================================================
 # FUNCTION: lookup_town
 # Territory routing based on town name
 # ============================================================================
