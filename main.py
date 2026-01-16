@@ -1131,11 +1131,103 @@ async def get_caller_context(phone_number: str) -> dict:
 
 
 async def lookup_town(parameters: dict) -> dict:
-    """Look up a town to find the assigned territory and LPS."""
-    try:
-        town_name = parameters.get("town_name", "")
-        state = parameters.get("state", "")
+    """
+    Look up a town to find the assigned territory and LPS.
+    Now uses county_coverage table for accurate routing.
+    """
+    town_name = parameters.get("town_name", "")
+    state = parameters.get("state", "MT")
+    
+    # Montana town to county mapping
+    TOWN_TO_COUNTY = {
+        # Missoula Territory
+        "missoula": "Missoula County",
+        "kalispell": "Flathead County",
+        "whitefish": "Flathead County",
+        "columbia falls": "Flathead County",
+        "polson": "Lake County",
+        "ronan": "Lake County",
+        "libby": "Lincoln County",
+        "troy": "Lincoln County",
+        "eureka": "Lincoln County",
+        "superior": "Mineral County",
+        "hamilton": "Ravalli County",
+        "stevensville": "Ravalli County",
+        "thompson falls": "Sanders County",
+        "plains": "Sanders County",
+        "hot springs": "Sanders County",
         
+        # Dillon Territory
+        "dillon": "Beaverhead County",
+        "helena": "Lewis and Clark County",
+        "east helena": "Lewis and Clark County",
+        "townsend": "Broadwater County",
+        "anaconda": "Deer Lodge County",
+        "bozeman": "Gallatin County",
+        "belgrade": "Gallatin County",
+        "philipsburg": "Granite County",
+        "boulder": "Jefferson County",
+        "virginia city": "Madison County",
+        "ennis": "Madison County",
+        "deer lodge": "Powell County",
+        "butte": "Silver Bow County",
+        
+        # Columbus Territory
+        "red lodge": "Carbon County",
+        "livingston": "Park County",
+        "gardiner": "Park County",
+        "columbus": "Stillwater County",
+        "big timber": "Sweet Grass County",
+        "billings": "Yellowstone County",
+        "laurel": "Yellowstone County",
+        "harlowton": "Wheatland County",
+        
+        # Lewistown Territory
+        "chinook": "Blaine County",
+        "harlem": "Blaine County",
+        "great falls": "Cascade County",
+        "fort benton": "Chouteau County",
+        "big sandy": "Chouteau County",
+        "lewistown": "Fergus County",
+        "browning": "Glacier County",
+        "cut bank": "Glacier County",
+        "havre": "Hill County",
+        "stanford": "Judith Basin County",
+        "chester": "Liberty County",
+        "white sulphur springs": "Meagher County",
+        "roundup": "Musselshell County",
+        "winnett": "Petroleum County",
+        "malta": "Phillips County",
+        "conrad": "Pondera County",
+        "valier": "Pondera County",
+        "choteau": "Teton County",
+        "shelby": "Toole County",
+        "glasgow": "Valley County",
+        
+        # Miles City Territory
+        "hardin": "Big Horn County",
+        "ekalaka": "Carter County",
+        "miles city": "Custer County",
+        "scobey": "Daniels County",
+        "glendive": "Dawson County",
+        "baker": "Fallon County",
+        "jordan": "Garfield County",
+        "circle": "McCone County",
+        "broadus": "Powder River County",
+        "terry": "Prairie County",
+        "sidney": "Richland County",
+        "wolf point": "Roosevelt County",
+        "forsyth": "Rosebud County",
+        "plentywood": "Sheridan County",
+        "hysham": "Treasure County",
+        "wibaux": "Wibaux County",
+        
+        # Golden Valley (special case)
+        "ryegate": "Golden Valley County",
+        "lavina": "Golden Valley County",
+    }
+    
+    try:
         if not town_name:
             return {
                 "success": False,
@@ -1145,78 +1237,116 @@ async def lookup_town(parameters: dict) -> dict:
         
         print(f"   🗺️ Looking up town: {town_name}")
         
-        town_query = supabase.table("town_distances")\
-            .select("town_name, state, county, assigned_territory, nearest_distance")\
-            .ilike("town_name", town_name)
+        # Normalize town name
+        town_lower = town_name.lower().strip()
         
-        if state:
-            town_query = town_query.eq("state", state.upper())
+        # Step 1: Map town to county
+        county = TOWN_TO_COUNTY.get(town_lower)
         
-        town_result = town_query.execute()
+        if not county:
+            # Try partial match for multi-word towns
+            for town_key, town_county in TOWN_TO_COUNTY.items():
+                if town_key in town_lower or town_lower in town_key:
+                    county = town_county
+                    break
         
-        if not town_result.data:
-            print(f"   ⚠️ Town not found: {town_name}")
-            return {
-                "success": False,
-                "error": "Town not found",
-                "town_searched": town_name,
-                "message": f"I don't have {town_name} in my database. What's a nearby larger town, or what county are you in?"
-            }
+        if not county:
+            # Fallback to town_distances table
+            print(f"   ℹ️ County not in mapping, trying town_distances table")
+            town_query = supabase.table("town_distances")\
+                .select("town_name, state, county, assigned_territory, nearest_distance")\
+                .ilike("town_name", town_name)
+            
+            if state:
+                town_query = town_query.eq("state", state.upper())
+            
+            town_result = town_query.execute()
+            
+            if not town_result.data:
+                return {
+                    "success": False,
+                    "error": "Town not found",
+                    "town_searched": town_name,
+                    "message": f"I don't have {town_name} in my database. What's a nearby larger town, or what county are you in?"
+                }
+            
+            town_data = town_result.data[0]
+            county = town_data.get("county")
+            territory_name = town_data["assigned_territory"]
+            
+            if not county:
+                return {
+                    "success": False,
+                    "error": "No county information available",
+                    "message": "What county are you in?"
+                }
         
-        town_data = town_result.data[0]
-        territory_name = town_data["assigned_territory"]
-        print(f"   ✓ Found town: {town_data['town_name']} → Territory: {territory_name}")
+        print(f"   ✓ Mapped to county: {county}")
         
-        territory_name_for_lookup = territory_name
-        print(f"   🔍 Looking up territory: {territory_name_for_lookup}")
-        
-        territory_result = supabase.table("territories")\
-            .select("id, territory_name, territory_code")\
-            .eq("territory_name", territory_name_for_lookup)\
-            .eq("is_active", True)\
-            .execute()
-        
-        territory_id = None
-        if territory_result.data:
-            territory_id = territory_result.data[0]["id"]
-            print(f"   ✓ Found territory_id: {territory_id}")
-        else:
-            print(f"   ⚠️ Territory not found in territories table: {territory_name_for_lookup}")
-        
-        specialist_info = None
-        if territory_id:
-            specialist_result = supabase.table("specialists")\
-                .select("id, first_name, last_name, email, phone")\
-                .eq("territory_id", territory_id)\
-                .eq("is_active", True)\
+        # Step 2: Look up LPS in county_coverage table
+        try:
+            result = supabase.table("county_coverage")\
+                .select("*")\
+                .eq("county_name", county)\
+                .eq("state", state.upper())\
                 .execute()
             
-            if specialist_result.data:
-                spec = specialist_result.data[0]
-                specialist_info = {
-                    "id": spec["id"],
-                    "first_name": spec["first_name"],
-                    "last_name": spec["last_name"],
-                    "full_name": f"{spec['first_name']} {spec['last_name']}",
-                    "email": spec["email"],
-                    "phone": spec.get("phone")
-                }
-                print(f"   ✓ Found specialist: {specialist_info['full_name']} ({specialist_info['email']})")
-            else:
-                print(f"   ⚠️ No active specialist found for territory_id: {territory_id}")
+            if result.data and len(result.data) > 0:
+                coverage = result.data[0]
+                primary_lps_name = coverage["primary_lps"]
+                territory = coverage["territory"]
+                
+                print(f"   ✓ Found in county_coverage: {primary_lps_name} covers {county}")
+                
+                # Step 3: Get full specialist details
+                name_parts = primary_lps_name.strip().split()
+                if len(name_parts) >= 2:
+                    first_name = name_parts[0]
+                    last_name = " ".join(name_parts[1:])
+                    
+                    specialist_result = supabase.table("specialists")\
+                        .select("*")\
+                        .eq("first_name", first_name)\
+                        .eq("last_name", last_name)\
+                        .eq("role", "lps")\
+                        .eq("is_active", True)\
+                        .execute()
+                    
+                    if specialist_result.data and len(specialist_result.data) > 0:
+                        spec = specialist_result.data[0]
+                        
+                        specialist_info = {
+                            "id": spec["id"],
+                            "first_name": spec["first_name"],
+                            "last_name": spec["last_name"],
+                            "full_name": f"{spec['first_name']} {spec['last_name']}",
+                            "email": spec["email"],
+                            "phone": spec.get("phone")
+                        }
+                        
+                        print(f"   ✓ Found specialist: {specialist_info['full_name']} ({specialist_info['email']})")
+                        
+                        return {
+                            "success": True,
+                            "town": town_name,
+                            "state": state,
+                            "county": county,
+                            "territory": territory,
+                            "territory_id": spec.get("territory_id"),
+                            "specialist": specialist_info,
+                            "message": f"{town_name} is in {county}, which is part of our {territory} territory. Your local specialist is {specialist_info['full_name']}."
+                        }
         
-        specialist_message = f"Your local specialist is {specialist_info['full_name']}." if specialist_info else ""
+        except Exception as e:
+            print(f"   ⚠️ Error checking county_coverage: {e}")
         
+        # Fallback: If county_coverage lookup failed, return basic info
         return {
-            "success": True,
-            "town": town_data["town_name"],
-            "state": town_data["state"],
-            "county": town_data["county"],
-            "territory": territory_name,
-            "territory_id": territory_id,
-            "distance_miles": float(town_data["nearest_distance"]) if town_data["nearest_distance"] else None,
-            "specialist": specialist_info,
-            "message": f"{town_name} is in our {territory_name}. {specialist_message}"
+            "success": False,
+            "error": "Specialist lookup failed",
+            "town": town_name,
+            "county": county,
+            "message": f"I found {town_name} in {county}, but I'm having trouble finding the specialist information. Let me connect you with our main office."
         }
         
     except Exception as e:
@@ -1579,6 +1709,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
