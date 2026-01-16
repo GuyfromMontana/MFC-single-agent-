@@ -1022,12 +1022,17 @@ async def get_caller_context(phone_number: str) -> dict:
             print(f"   ⚠️ Error checking caller_contacts: {contact_err}")
         
         # ============================================
-        # STEP 2: Check Zep for conversation history
+        # STEP 2: Check Zep for conversation history (V3 API)
         # ============================================
         try:
+            # Try to get user sessions to check if they've called before
+            sessions = zep.user.get_sessions(user_id=phone_number)
+            if sessions and len(sessions) > 0:
+                print(f"   ✓ Found {len(sessions)} sessions in Zep: returning caller")
+                context["is_returning_caller"] = True
+            
+            # Get user details for name
             user = zep.user.get(user_id=phone_number)
-            print(f"   ✓ Found in Zep: returning caller")
-            context["is_returning_caller"] = True
             
             # If we didn't get a name from caller_contacts, try Zep
             if not context["caller_name"]:
@@ -1046,7 +1051,7 @@ async def get_caller_context(phone_number: str) -> dict:
                     context["last_topic"] = meta['last_interest']
                     
         except Exception as zep_err:
-            print(f"   ℹ Not found in Zep (new caller to voice system)")
+            print(f"   ℹ Not found in Zep (new caller to voice system): {zep_err}")
         
         # ============================================
         # STEP 3: Check leads table if still no name
@@ -1296,7 +1301,7 @@ async def create_lead(phone_number: str, parameters: dict) -> dict:
                 lead_livestock_type=livestock_type
             )
         
-        # Update Zep user
+        # Update Zep user (V3 API)
         if first_name and is_valid_name(first_name):
             try:
                 zep.user.update(
@@ -1465,13 +1470,17 @@ async def schedule_callback(phone_number: str, parameters: dict) -> dict:
 
 
 async def save_conversation(phone_number: str, call_id: str, transcript: str, messages: list):
-    """Save conversation to Zep."""
+    """
+    Save conversation to Zep using V3 API.
+    UPDATED: Uses zep.memory.add() instead of deprecated thread methods.
+    """
     try:
         print(f"\n💾 Saving conversation for: {phone_number}")
         
         user_id = phone_number
-        thread_id = f"mfc_{phone_number}_{call_id}"
+        session_id = f"mfc_{phone_number}_{call_id}"
         
+        # Ensure user exists
         try:
             user = zep.user.get(user_id=user_id)
             print(f"   ✓ User exists in Zep")
@@ -1489,22 +1498,27 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
             except Exception as e:
                 print(f"   ⚠️ Could not create user: {e}")
         
+        # Format messages for Zep V3
         zep_messages = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("message", "")
             
+            # Skip tool calls and system messages
             if role in ["tool_calls", "tool_call_result", "system"]:
                 continue
             
+            # Map roles
             if role in ["assistant", "bot"]:
                 zep_role = "assistant"
             else:
                 zep_role = "user"
             
             if content:
+                # Truncate if needed
                 if len(content) > 2500:
                     content = content[:2450] + "... [truncated]"
+                
                 zep_messages.append({
                     "role_type": zep_role,
                     "content": content
@@ -1516,33 +1530,25 @@ async def save_conversation(phone_number: str, call_id: str, transcript: str, me
             print("   ⚠️ No messages to save")
             return
         
+        # Save using V3 API: zep.memory.add()
         try:
-            try:
-                zep.thread.create(
-                    thread_id=thread_id,
-                    user_id=user_id
-                )
-                print(f"   ✓ Created thread: {thread_id}")
-            except Exception as thread_err:
-                if "already exists" in str(thread_err).lower():
-                    print(f"   ℹ Thread already exists: {thread_id}")
-                else:
-                    print(f"   ⚠️ Thread creation note: {thread_err}")
-            
             from zep_cloud import Message
+            
             msgs = [Message(role=m["role_type"], content=m["content"]) for m in zep_messages]
             
-            zep.thread.add_messages(
-                thread_id=thread_id,
+            # V3 API: Use memory.add() with session_id
+            zep.memory.add(
+                session_id=session_id,
                 messages=msgs
             )
-            print(f"   ✓ Saved {len(msgs)} messages to thread: {thread_id}")
+            
+            print(f"   ✓ Saved {len(msgs)} messages to session: {session_id}")
+            print(f"   ✅ Zep V3 API migration successful!")
             
         except Exception as e:
-            print(f"   ❌ Error with zep.thread: {str(e)}")
-            if hasattr(zep, 'thread'):
-                thread_methods = [a for a in dir(zep.thread) if not a.startswith('_')]
-                print(f"   ℹ Available thread methods: {thread_methods}")
+            print(f"   ❌ Error saving to Zep: {str(e)}")
+            import traceback
+            traceback.print_exc()
             
     except Exception as e:
         print(f"❌ Error in save_conversation: {str(e)}")
@@ -1554,6 +1560,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 
