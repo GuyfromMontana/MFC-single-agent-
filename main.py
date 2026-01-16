@@ -1560,6 +1560,23 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3001))
     uvicorn.run(app, host="0.0.0.0", port=port)
+@app.get("/debug/zep-info")
+async def debug_zep():
+    """See what Zep methods exist"""
+    return {
+        "has_memory": hasattr(zep, 'memory'),
+        "zep_attrs": [x for x in dir(zep) if not x.startswith('_')],
+        "memory_attrs": [x for x in dir(zep.memory) if not x.startswith('_')] if hasattr(zep, 'memory') else "NO MEMORY ATTR"
+        @app.get("/debug/zep-info")
+async def debug_zep():
+    """See what Zep methods exist"""
+    return {
+        "has_memory": hasattr(zep, 'memory'),
+        "zep_attrs": [x for x in dir(zep) if not x.startswith('_')],
+        "memory_attrs": [x for x in dir(zep.memory) if not x.startswith('_')] if hasattr(zep, 'memory') else "NO MEMORY ATTR"
+    }
+    }
+```
 
 
 
