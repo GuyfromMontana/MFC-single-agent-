@@ -232,13 +232,13 @@ async def lookup_town(data: dict):
             print("[LOOKUP_TOWN] No town provided")
             return {"result": "No town provided"}
         
-        # Search counties table for matching town
-        # Note: Search by county name, not town name (e.g., "Missoula" town is in "Missoula County")
+        # Search county_coverage table for matching town
+        # Note: Search by county name (e.g., "Missoula" → "Missoula County")
         county_search = f'{town} County' if not town.lower().endswith('county') else town
         
-        result = supabase.table('counties') \
-            .select('name, specialist_id') \
-            .ilike('name', f'%{county_search}%') \
+        result = supabase.table('county_coverage') \
+            .select('county_name, primary_lps, state') \
+            .ilike('county_name', f'%{county_search}%') \
             .limit(1) \
             .execute()
         
@@ -246,20 +246,8 @@ async def lookup_town(data: dict):
         
         if result.data and len(result.data) > 0:
             county_data = result.data[0]
-            county_name = county_data['name']
-            specialist_id = county_data.get('specialist_id')
-            
-            # Now get the specialist info
-            if specialist_id:
-                specialist_result = supabase.table('specialists') \
-                    .select('name') \
-                    .eq('id', specialist_id) \
-                    .single() \
-                    .execute()
-                
-                specialist_name = specialist_result.data.get('name', 'Unknown') if specialist_result.data else 'Unknown'
-            else:
-                specialist_name = 'Unknown'
+            county_name = county_data['county_name']
+            specialist_name = county_data.get('primary_lps', 'Unknown')
             
             result_text = f"County: {county_name}, Specialist: {specialist_name}"
             print(f"[LOOKUP_TOWN] Returning: {result_text}")
@@ -489,5 +477,3 @@ async def save_session(data: dict):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-    
-
