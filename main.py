@@ -7,6 +7,7 @@ import os
 from supabase import create_client
 import openai
 from datetime import datetime
+from zep_cloud import Zep
 
 app = FastAPI()
 
@@ -38,6 +39,7 @@ print("=" * 50)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai.api_key = OPENAI_API_KEY
+zep_client = Zep(api_key=ZEP_API_KEY)
 
 CACHED_ANSWERS = {}
 
@@ -187,72 +189,45 @@ async def get_caller_history(data: dict):
             print("[CALLER_HISTORY] No phone number in request")
             return {"result": "No phone number provided"}
         
-        # Format phone number consistently (remove +1 if present, search both ways)
+        # Format phone number consistently
         phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
+        user_id = f"+1{phone_clean}"
         
-        print(f"[CALLER_HISTORY] Looking up caller history for: {phone_clean}")
+        print(f"[CALLER_HISTORY] Looking up caller history for user_id: {user_id}")
         
-        # Try to get Zep user
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            headers = {
-                "Authorization": f"Bearer {ZEP_API_KEY}",
-                "Content-Type": "application/json"
-            }
+        # Try to get user from Zep using SDK
+        try:
+            user = await asyncio.to_thread(zep_client.user.get, user_id=user_id)
             
-            # Try with +1 prefix
-            user_id = f"+1{phone_clean}"
+            print(f"[CALLER_HISTORY] Found user in Zep!")
             
-            print(f"[CALLER_HISTORY] Checking Zep for user_id: {user_id}")
+            user_name = user.metadata.get("name", "Unknown") if user.metadata else "Unknown"
             
-            response = await client.get(
-                f"{ZEP_API_URL}/v2/users/{user_id}",
-                headers=headers
-            )
-            
-            print(f"[CALLER_HISTORY] Zep user lookup response: {response.status_code}")
-            
-            if response.status_code == 200:
-                user_data = response.json()
-                print(f"[CALLER_HISTORY] Found user: {user_data.get('user_id')}")
-                
-                # Get recent sessions
-                sessions_response = await client.get(
-                    f"{ZEP_API_URL}/v2/users/{user_id}/sessions",
-                    headers=headers
+            # Try to get user's sessions
+            try:
+                sessions_result = await asyncio.to_thread(
+                    zep_client.user.get_sessions,
+                    user_id=user_id
                 )
                 
-                print(f"[CALLER_HISTORY] Sessions lookup response: {sessions_response.status_code}")
+                # Handle the response - might be a list or an object with sessions
+                sessions = sessions_result if isinstance(sessions_result, list) else getattr(sessions_result, 'sessions', [])
                 
-                if sessions_response.status_code == 200:
-                    sessions = sessions_response.json().get("sessions", [])
-                    
-                    print(f"[CALLER_HISTORY] Found {len(sessions)} sessions")
-                    
-                    if sessions:
-                        # Get the most recent session memory
-                        latest_session_id = sessions[0].get("session_id")
-                        
-                        print(f"[CALLER_HISTORY] Getting memory for session: {latest_session_id}")
-                        
-                        memory_response = await client.get(
-                            f"{ZEP_API_URL}/v2/sessions/{latest_session_id}/memory",
-                            headers=headers
-                        )
-                        
-                        if memory_response.status_code == 200:
-                            memory = memory_response.json()
-                            context = memory.get("context", "")
-                            
-                            result_text = f"Returning caller: {user_data.get('metadata', {}).get('name', 'Unknown')}. Previous context: {context[:200]}"
-                            print(f"[CALLER_HISTORY] Returning: {result_text}")
-                            
-                            return {"result": result_text}
+                print(f"[CALLER_HISTORY] Found {len(sessions)} sessions")
                 
-                return_text = f"Returning caller: {user_data.get('metadata', {}).get('name', 'Unknown')}"
-                print(f"[CALLER_HISTORY] Returning: {return_text}")
-                return {"result": return_text}
+                if sessions and len(sessions) > 0:
+                    result_text = f"Returning caller: {user_name}. They have called {len(sessions)} times before."
+                    print(f"[CALLER_HISTORY] Returning: {result_text}")
+                    return {"result": result_text}
+            except Exception as session_error:
+                print(f"[CALLER_HISTORY] Error getting sessions: {session_error}")
             
-            print(f"[CALLER_HISTORY] User not found in Zep, returning 'New caller'")
+            result_text = f"Returning caller: {user_name}"
+            print(f"[CALLER_HISTORY] Returning: {result_text}")
+            return {"result": result_text}
+            
+        except Exception as user_error:
+            print(f"[CALLER_HISTORY] User not found: {user_error}")
             return {"result": "New caller"}
             
     except Exception as e:
