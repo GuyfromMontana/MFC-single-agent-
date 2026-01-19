@@ -6,6 +6,7 @@ import time
 import os
 from supabase import create_client
 import openai
+from datetime import datetime
 
 app = FastAPI()
 
@@ -17,14 +18,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 RAILWAY_URL = os.getenv("RAILWAY_PUBLIC_URL", "https://your-app.up.railway.app")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-RAILWAY_URL = os.getenv("RAILWAY_PUBLIC_URL", "https://your-app.up.railway.app")
+ZEP_API_KEY = os.getenv("ZEP_API_KEY")
+ZEP_API_URL = "https://api.getzep.com"
 
 # DEBUG: Print what we're getting from environment
 print("=" * 50)
@@ -32,10 +32,10 @@ print("ENVIRONMENT VARIABLE CHECK:")
 print(f"SUPABASE_URL: {SUPABASE_URL}")
 print(f"SUPABASE_KEY: {SUPABASE_KEY[:20] if SUPABASE_KEY else 'NONE/EMPTY'}")
 print(f"OPENAI_API_KEY: {OPENAI_API_KEY[:20] if OPENAI_API_KEY else 'NONE/EMPTY'}")
+print(f"ZEP_API_KEY: {ZEP_API_KEY[:20] if ZEP_API_KEY else 'NONE/EMPTY'}")
 print(f"RAILWAY_URL: {RAILWAY_URL}")
 print("=" * 50)
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai.api_key = OPENAI_API_KEY
 
@@ -172,19 +172,223 @@ async def search_knowledge(data: dict):
             "result": "Let me have your specialist give you a call back to help with that."
         }
 
-@app.post("/retell/lookup_town")
+@app.post("/retell/functions/get_caller_history")
+async def get_caller_history(data: dict):
+    """Retrieve caller history from Zep"""
+    try:
+        phone = data.get("parameters", {}).get("phone_number", "")
+        
+        if not phone:
+            return {"result": "No phone number provided"}
+        
+        # Format phone number consistently (remove +1 if present, search both ways)
+        phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
+        
+        print(f"Looking up caller history for: {phone_clean}")
+        
+        # Try to get Zep user
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            headers = {
+                "Authorization": f"Bearer {ZEP_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            # Try with +1 prefix
+            user_id = f"+1{phone_clean}"
+            
+            response = await client.get(
+                f"{ZEP_API_URL}/v2/users/{user_id}",
+                headers=headers
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                
+                # Get recent sessions
+                sessions_response = await client.get(
+                    f"{ZEP_API_URL}/v2/users/{user_id}/sessions",
+                    headers=headers
+                )
+                
+                if sessions_response.status_code == 200:
+                    sessions = sessions_response.json().get("sessions", [])
+                    
+                    if sessions:
+                        # Get the most recent session memory
+                        latest_session_id = sessions[0].get("session_id")
+                        
+                        memory_response = await client.get(
+                            f"{ZEP_API_URL}/v2/sessions/{latest_session_id}/memory",
+                            headers=headers
+                        )
+                        
+                        if memory_response.status_code == 200:
+                            memory = memory_response.json()
+                            context = memory.get("context", "")
+                            
+                            return {
+                                "result": f"Returning caller: {user_data.get('metadata', {}).get('name', 'Unknown')}. Previous context: {context[:200]}"
+                            }
+                
+                return {
+                    "result": f"Returning caller: {user_data.get('metadata', {}).get('name', 'Unknown')}"
+                }
+            
+            return {"result": "New caller"}
+            
+    except Exception as e:
+        print(f"Error getting caller history: {e}")
+        return {"result": "New caller"}
+
+@app.post("/retell/functions/lookup_town")
 async def lookup_town(data: dict):
-    pass
+    """Look up county and specialist based on town"""
+    try:
+        town = data.get("parameters", {}).get("town", "").strip()
+        
+        if not town:
+            return {"result": "No town provided"}
+        
+        print(f"Looking up town: {town}")
+        
+        # Search counties table for matching town
+        result = supabase.table('counties') \
+            .select('name, specialist_id, specialists(name)') \
+            .ilike('name', f'%{town}%') \
+            .limit(1) \
+            .execute()
+        
+        if result.data and len(result.data) > 0:
+            county_data = result.data[0]
+            county_name = county_data['name']
+            specialist_name = county_data.get('specialists', {}).get('name', 'Unknown')
+            
+            return {
+                "result": f"County: {county_name}, Specialist: {specialist_name}"
+            }
+        
+        return {"result": f"County not found for {town}"}
+        
+    except Exception as e:
+        print(f"Error looking up town: {e}")
+        return {"result": "Unable to determine county"}
 
-@app.post("/retell/schedule_callback")
+@app.post("/retell/functions/schedule_callback")
 async def schedule_callback(data: dict):
-    pass
+    """Schedule a callback and save to database"""
+    try:
+        params = data.get("parameters", {})
+        phone = params.get("phone_number", "")
+        name = params.get("name", "")
+        reason = params.get("reason", "")
+        specialist = params.get("specialist", "")
+        
+        print(f"Scheduling callback for {name} ({phone})")
+        
+        # Insert into callbacks table
+        callback_data = {
+            "phone_number": phone,
+            "caller_name": name,
+            "reason": reason,
+            "specialist_assigned": specialist,
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        result = supabase.table('callbacks').insert(callback_data).execute()
+        
+        if result.data:
+            return {
+                "result": f"Callback scheduled for {specialist} to call {name} at {phone}"
+            }
+        
+        return {"result": "Callback request saved"}
+        
+    except Exception as e:
+        print(f"Error scheduling callback: {e}")
+        return {"result": "Callback request noted"}
 
-@app.get("/retell/get_caller_history")
-async def get_caller_history(phone: str):
-    pass
+@app.post("/save-session")
+async def save_session(data: dict):
+    """Save conversation session to Zep"""
+    try:
+        call_id = data.get("call_id")
+        transcript = data.get("transcript", "")
+        phone = data.get("from_number", "")
+        metadata = data.get("metadata", {})
+        
+        if not phone or not call_id:
+            return {"status": "error", "message": "Missing required fields"}
+        
+        # Format phone number consistently
+        phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
+        user_id = f"+1{phone_clean}"
+        
+        print(f"Saving session for {user_id}, call_id: {call_id}")
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = {
+                "Authorization": f"Bearer {ZEP_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            # Create or update user
+            user_data = {
+                "user_id": user_id,
+                "metadata": {
+                    "name": metadata.get("caller_name", ""),
+                    "phone": phone,
+                    "last_call": datetime.utcnow().isoformat()
+                }
+            }
+            
+            await client.put(
+                f"{ZEP_API_URL}/v2/users/{user_id}",
+                headers=headers,
+                json=user_data
+            )
+            
+            # Add session with messages
+            session_data = {
+                "session_id": call_id,
+                "user_id": user_id,
+                "metadata": {
+                    "call_duration": metadata.get("duration", 0),
+                    "specialist": metadata.get("specialist", "")
+                }
+            }
+            
+            await client.post(
+                f"{ZEP_API_URL}/v2/sessions",
+                headers=headers,
+                json=session_data
+            )
+            
+            # Add the conversation transcript as memory
+            if transcript:
+                memory_data = {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": transcript,
+                            "role_type": "user"
+                        }
+                    ]
+                }
+                
+                await client.post(
+                    f"{ZEP_API_URL}/v2/sessions/{call_id}/memory",
+                    headers=headers,
+                    json=memory_data
+                )
+            
+            print(f"Session saved successfully: {call_id}")
+            return {"status": "success", "session_id": call_id}
+            
+    except Exception as e:
+        print(f"Error saving session: {e}")
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
