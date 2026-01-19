@@ -176,9 +176,10 @@ async def search_knowledge(data: dict):
 async def get_caller_history(data: dict):
     """Retrieve caller history from Zep"""
     try:
-        print(f"[CALLER_HISTORY] Received data: {data}")
+        print(f"[CALLER_HISTORY] Received data keys: {data.keys()}")
         
-        phone = data.get("parameters", {}).get("phone_number", "")
+        # Get phone from call metadata
+        phone = data.get("call", {}).get("from_number", "")
         
         print(f"[CALLER_HISTORY] Extracted phone: {phone}")
         
@@ -264,12 +265,14 @@ async def get_caller_history(data: dict):
 async def lookup_town(data: dict):
     """Look up county and specialist based on town"""
     try:
-        town = data.get("parameters", {}).get("town", "").strip()
+        # Get town from tool arguments
+        town = data.get("args", {}).get("town", "").strip()
+        
+        print(f"[LOOKUP_TOWN] Looking up town: {town}")
         
         if not town:
+            print("[LOOKUP_TOWN] No town provided")
             return {"result": "No town provided"}
-        
-        print(f"Looking up town: {town}")
         
         # Search counties table for matching town
         result = supabase.table('counties') \
@@ -278,32 +281,39 @@ async def lookup_town(data: dict):
             .limit(1) \
             .execute()
         
+        print(f"[LOOKUP_TOWN] Database result: {len(result.data) if result.data else 0} matches")
+        
         if result.data and len(result.data) > 0:
             county_data = result.data[0]
             county_name = county_data['name']
             specialist_name = county_data.get('specialists', {}).get('name', 'Unknown')
             
-            return {
-                "result": f"County: {county_name}, Specialist: {specialist_name}"
-            }
+            result_text = f"County: {county_name}, Specialist: {specialist_name}"
+            print(f"[LOOKUP_TOWN] Returning: {result_text}")
+            
+            return {"result": result_text}
         
+        print(f"[LOOKUP_TOWN] No match found for: {town}")
         return {"result": f"County not found for {town}"}
         
     except Exception as e:
-        print(f"Error looking up town: {e}")
+        print(f"[LOOKUP_TOWN] ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        print(f"[LOOKUP_TOWN] Traceback: {traceback.format_exc()}")
         return {"result": "Unable to determine county"}
 
 @app.post("/retell/functions/schedule_callback")
 async def schedule_callback(data: dict):
     """Schedule a callback and save to database"""
     try:
-        params = data.get("parameters", {})
-        phone = params.get("phone_number", "")
-        name = params.get("name", "")
-        reason = params.get("reason", "")
-        specialist = params.get("specialist", "")
+        # Get parameters from tool arguments
+        args = data.get("args", {})
+        phone = data.get("call", {}).get("from_number", "")
+        name = args.get("name", "")
+        reason = args.get("reason", "")
+        specialist = args.get("specialist", "")
         
-        print(f"Scheduling callback for {name} ({phone})")
+        print(f"[SCHEDULE_CALLBACK] Scheduling callback for {name} ({phone})")
         
         # Insert into callbacks table
         callback_data = {
