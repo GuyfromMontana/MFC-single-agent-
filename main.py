@@ -203,25 +203,6 @@ async def get_caller_history(data: dict):
             
             user_name = user.metadata.get("name", "Unknown") if user.metadata else "Unknown"
             
-            # Try to get user's sessions
-            try:
-                sessions_result = await asyncio.to_thread(
-                    zep_client.user.get_sessions,
-                    user_id=user_id
-                )
-                
-                # Handle the response - might be a list or an object with sessions
-                sessions = sessions_result if isinstance(sessions_result, list) else getattr(sessions_result, 'sessions', [])
-                
-                print(f"[CALLER_HISTORY] Found {len(sessions)} sessions")
-                
-                if sessions and len(sessions) > 0:
-                    result_text = f"Returning caller: {user_name}. They have called {len(sessions)} times before."
-                    print(f"[CALLER_HISTORY] Returning: {result_text}")
-                    return {"result": result_text}
-            except Exception as session_error:
-                print(f"[CALLER_HISTORY] Error getting sessions: {session_error}")
-            
             result_text = f"Returning caller: {user_name}"
             print(f"[CALLER_HISTORY] Returning: {result_text}")
             return {"result": result_text}
@@ -252,9 +233,12 @@ async def lookup_town(data: dict):
             return {"result": "No town provided"}
         
         # Search counties table for matching town
+        # Note: Search by county name, not town name (e.g., "Missoula" town is in "Missoula County")
+        county_search = f'{town} County' if not town.lower().endswith('county') else town
+        
         result = supabase.table('counties') \
-            .select('name, specialist_id, specialists(name)') \
-            .ilike('name', f'%{town}%') \
+            .select('name, specialist_id') \
+            .ilike('name', f'%{county_search}%') \
             .limit(1) \
             .execute()
         
@@ -263,7 +247,19 @@ async def lookup_town(data: dict):
         if result.data and len(result.data) > 0:
             county_data = result.data[0]
             county_name = county_data['name']
-            specialist_name = county_data.get('specialists', {}).get('name', 'Unknown')
+            specialist_id = county_data.get('specialist_id')
+            
+            # Now get the specialist info
+            if specialist_id:
+                specialist_result = supabase.table('specialists') \
+                    .select('name') \
+                    .eq('id', specialist_id) \
+                    .single() \
+                    .execute()
+                
+                specialist_name = specialist_result.data.get('name', 'Unknown') if specialist_result.data else 'Unknown'
+            else:
+                specialist_name = 'Unknown'
             
             result_text = f"County: {county_name}, Specialist: {specialist_name}"
             print(f"[LOOKUP_TOWN] Returning: {result_text}")
@@ -330,7 +326,7 @@ async def lookup_staff(data: dict):
         
         # Search specialists table for matching name
         result = supabase.table('specialists') \
-            .select('name, email, phone, counties(name)') \
+            .select('id, name, email, phone') \
             .ilike('name', f'%{name}%') \
             .limit(1) \
             .execute()
@@ -340,8 +336,15 @@ async def lookup_staff(data: dict):
         if result.data and len(result.data) > 0:
             staff = result.data[0]
             staff_name = staff['name']
-            counties = staff.get('counties', [])
-            county_names = ', '.join([c['name'] for c in counties]) if counties else 'Unknown'
+            staff_id = staff['id']
+            
+            # Get counties for this specialist
+            counties_result = supabase.table('counties') \
+                .select('name') \
+                .eq('specialist_id', staff_id) \
+                .execute()
+            
+            county_names = ', '.join([c['name'] for c in counties_result.data]) if counties_result.data else 'Unknown'
             
             result_text = f"Found {staff_name}. They cover: {county_names}"
             print(f"[LOOKUP_STAFF] Returning: {result_text}")
