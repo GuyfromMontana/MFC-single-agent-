@@ -176,15 +176,20 @@ async def search_knowledge(data: dict):
 async def get_caller_history(data: dict):
     """Retrieve caller history from Zep"""
     try:
+        print(f"[CALLER_HISTORY] Received data: {data}")
+        
         phone = data.get("parameters", {}).get("phone_number", "")
         
+        print(f"[CALLER_HISTORY] Extracted phone: {phone}")
+        
         if not phone:
+            print("[CALLER_HISTORY] No phone number in request")
             return {"result": "No phone number provided"}
         
         # Format phone number consistently (remove +1 if present, search both ways)
         phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
         
-        print(f"Looking up caller history for: {phone_clean}")
+        print(f"[CALLER_HISTORY] Looking up caller history for: {phone_clean}")
         
         # Try to get Zep user
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -196,13 +201,18 @@ async def get_caller_history(data: dict):
             # Try with +1 prefix
             user_id = f"+1{phone_clean}"
             
+            print(f"[CALLER_HISTORY] Checking Zep for user_id: {user_id}")
+            
             response = await client.get(
                 f"{ZEP_API_URL}/v2/users/{user_id}",
                 headers=headers
             )
             
+            print(f"[CALLER_HISTORY] Zep user lookup response: {response.status_code}")
+            
             if response.status_code == 200:
                 user_data = response.json()
+                print(f"[CALLER_HISTORY] Found user: {user_data.get('user_id')}")
                 
                 # Get recent sessions
                 sessions_response = await client.get(
@@ -210,12 +220,18 @@ async def get_caller_history(data: dict):
                     headers=headers
                 )
                 
+                print(f"[CALLER_HISTORY] Sessions lookup response: {sessions_response.status_code}")
+                
                 if sessions_response.status_code == 200:
                     sessions = sessions_response.json().get("sessions", [])
+                    
+                    print(f"[CALLER_HISTORY] Found {len(sessions)} sessions")
                     
                     if sessions:
                         # Get the most recent session memory
                         latest_session_id = sessions[0].get("session_id")
+                        
+                        print(f"[CALLER_HISTORY] Getting memory for session: {latest_session_id}")
                         
                         memory_response = await client.get(
                             f"{ZEP_API_URL}/v2/sessions/{latest_session_id}/memory",
@@ -226,18 +242,22 @@ async def get_caller_history(data: dict):
                             memory = memory_response.json()
                             context = memory.get("context", "")
                             
-                            return {
-                                "result": f"Returning caller: {user_data.get('metadata', {}).get('name', 'Unknown')}. Previous context: {context[:200]}"
-                            }
+                            result_text = f"Returning caller: {user_data.get('metadata', {}).get('name', 'Unknown')}. Previous context: {context[:200]}"
+                            print(f"[CALLER_HISTORY] Returning: {result_text}")
+                            
+                            return {"result": result_text}
                 
-                return {
-                    "result": f"Returning caller: {user_data.get('metadata', {}).get('name', 'Unknown')}"
-                }
+                return_text = f"Returning caller: {user_data.get('metadata', {}).get('name', 'Unknown')}"
+                print(f"[CALLER_HISTORY] Returning: {return_text}")
+                return {"result": return_text}
             
+            print(f"[CALLER_HISTORY] User not found in Zep, returning 'New caller'")
             return {"result": "New caller"}
             
     except Exception as e:
-        print(f"Error getting caller history: {e}")
+        print(f"[CALLER_HISTORY] ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        print(f"[CALLER_HISTORY] Traceback: {traceback.format_exc()}")
         return {"result": "New caller"}
 
 @app.post("/retell/functions/lookup_town")
