@@ -1,5 +1,6 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-zep-cloud>=2.0.0
-python-dotenv==1.0.0
-supabase==2.0.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+supabase>=2.0.0
+openai>=1.0.0
+python-multipart
