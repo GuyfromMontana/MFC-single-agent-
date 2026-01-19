@@ -240,9 +240,11 @@ async def get_caller_history(data: dict):
 async def lookup_town(data: dict):
     """Look up county and specialist based on town"""
     try:
-        # Get town from tool arguments
-        town = data.get("args", {}).get("town", "").strip()
+        # Get town from tool arguments - Retell sends "town_name"
+        args = data.get("args", {})
+        town = args.get("town_name", args.get("town", "")).strip()
         
+        print(f"[LOOKUP_TOWN] Args received: {args}")
         print(f"[LOOKUP_TOWN] Looking up town: {town}")
         
         if not town:
@@ -312,6 +314,93 @@ async def schedule_callback(data: dict):
     except Exception as e:
         print(f"Error scheduling callback: {e}")
         return {"result": "Callback request noted"}
+
+@app.post("/retell/functions/lookup_staff")
+async def lookup_staff(data: dict):
+    """Look up staff member by name"""
+    try:
+        args = data.get("args", {})
+        name = args.get("name", "").strip()
+        
+        print(f"[LOOKUP_STAFF] Looking up staff: {name}")
+        
+        if not name:
+            print("[LOOKUP_STAFF] No name provided")
+            return {"result": "No staff name provided"}
+        
+        # Search specialists table for matching name
+        result = supabase.table('specialists') \
+            .select('name, email, phone, counties(name)') \
+            .ilike('name', f'%{name}%') \
+            .limit(1) \
+            .execute()
+        
+        print(f"[LOOKUP_STAFF] Database result: {len(result.data) if result.data else 0} matches")
+        
+        if result.data and len(result.data) > 0:
+            staff = result.data[0]
+            staff_name = staff['name']
+            counties = staff.get('counties', [])
+            county_names = ', '.join([c['name'] for c in counties]) if counties else 'Unknown'
+            
+            result_text = f"Found {staff_name}. They cover: {county_names}"
+            print(f"[LOOKUP_STAFF] Returning: {result_text}")
+            
+            return {"result": result_text}
+        
+        print(f"[LOOKUP_STAFF] No match found for: {name}")
+        return {"result": f"Staff member {name} not found"}
+        
+    except Exception as e:
+        print(f"[LOOKUP_STAFF] ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        print(f"[LOOKUP_STAFF] Traceback: {traceback.format_exc()}")
+        return {"result": "Unable to look up staff"}
+
+@app.post("/retell/webhook")
+async def retell_webhook(data: dict):
+    """Handle Retell webhooks for call events"""
+    try:
+        event = data.get("event", "")
+        call = data.get("call", {})
+        call_id = call.get("call_id", "")
+        
+        print(f"[WEBHOOK] Received event: {event} for call: {call_id}")
+        
+        if event == "call_ended":
+            # Save the call session to Zep
+            phone = call.get("from_number", "")
+            transcript = call.get("transcript", "")
+            
+            if phone and call_id:
+                await save_call_to_zep(call_id, phone, transcript, call)
+        
+        return {"status": "ok"}
+        
+    except Exception as e:
+        print(f"[WEBHOOK] ERROR: {type(e).__name__}: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+async def save_call_to_zep(call_id: str, phone: str, transcript: str, call_data: dict):
+    """Save call session to Zep"""
+    try:
+        phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
+        user_id = f"+1{phone_clean}"
+        
+        print(f"[ZEP_SAVE] Saving session for {user_id}, call_id: {call_id}")
+        
+        # Get or create user metadata
+        caller_name = call_data.get("metadata", {}).get("caller_name", "Unknown")
+        
+        # Note: Using Zep SDK for saving will be added in next iteration
+        # For now, just log it
+        print(f"[ZEP_SAVE] Would save: user={user_id}, session={call_id}, transcript_length={len(transcript)}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"[ZEP_SAVE] ERROR: {e}")
+        return False
 
 @app.post("/save-session")
 async def save_session(data: dict):
