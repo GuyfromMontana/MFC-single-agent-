@@ -203,9 +203,9 @@ async def get_caller_history(data: dict):
             
             user_name = user.metadata.get("name", "Unknown") if user.metadata else "Unknown"
             
-            result_text = f"Returning caller: {user_name}"
-            print(f"[CALLER_HISTORY] Returning: {result_text}")
-            return {"result": result_text}
+            # FIXED: Just return the name, not "Returning caller: {name}"
+            print(f"[CALLER_HISTORY] Returning: {user_name}")
+            return {"result": user_name}
             
         except Exception as user_error:
             print(f"[CALLER_HISTORY] User not found: {user_error}")
