@@ -17,7 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize clients
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -34,18 +33,13 @@ async def keep_alive_ping():
             await asyncio.sleep(300)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.get(f"{RAILWAY_URL}/health")
-            print("✅ Keep-alive ping successful")
+            print("Keep-alive ping successful")
         except Exception as e:
-            print(f"❌ Keep-alive ping failed: {e}")
+            print(f"Keep-alive ping failed: {e}")
 
 async def load_cached_questions():
     try:
-        result = supabase.table('knowledge_base')\
-            .select('question, answer, keywords')\
-            .eq('is_active', True)\
-            .order('priority', desc=True)\
-            .limit(100)\
-            .execute()
+        result = supabase.table('knowledge_base').select('question, answer, keywords').eq('is_active', True).order('priority', desc=True).limit(100).execute()
         
         global CACHED_ANSWERS
         
@@ -62,25 +56,25 @@ async def load_cached_questions():
             phrase = ' '.join(words)
             CACHED_ANSWERS[phrase] = row['answer']
         
-        print(f"✅ Cached {len(CACHED_ANSWERS)} common answer lookups")
+        print(f"Cached {len(CACHED_ANSWERS)} common answer lookups")
         
     except Exception as e:
-        print(f"❌ Failed to load cache: {e}")
+        print(f"Failed to load cache: {e}")
 
 @app.on_event("startup")
 async def startup():
     await load_cached_questions()
     asyncio.create_task(keep_alive_ping())
-    print("🚀 MFC Agent started with caching and keep-alive")
+    print("MFC Agent started with caching and keep-alive")
 
 @app.middleware("http")
 async def log_request_time(request: Request, call_next):
     start = time.time()
     response = await call_next(request)
     duration = (time.time() - start) * 1000
-    print(f"⏱️  {request.method} {request.url.path}: {duration:.0f}ms")
+    print(f"{request.method} {request.url.path}: {duration:.0f}ms")
     if duration > 1000:
-        print(f"⚠️  SLOW: {request.url.path} took {duration:.0f}ms")
+        print(f"SLOW: {request.url.path} took {duration:.0f}ms")
     return response
 
 @app.get("/health")
@@ -123,15 +117,15 @@ async def search_knowledge(data: dict):
         query = data.get("parameters", {}).get("question", "")
         query_lower = query.lower()
         
-        print(f"\n🔍 Query: {query}")
+        print(f"Query: {query}")
         
         for cached_key, answer in CACHED_ANSWERS.items():
             if cached_key in query_lower:
                 duration = (time.time() - start_total) * 1000
-                print(f"✅ CACHE HIT: '{cached_key}' ({duration:.0f}ms)")
+                print(f"CACHE HIT: {cached_key} ({duration:.0f}ms)")
                 return {"result": answer}
         
-        print(f"❌ Cache miss - doing semantic search")
+        print(f"Cache miss - doing semantic search")
         
         try:
             embedding = await asyncio.wait_for(
@@ -153,49 +147,29 @@ async def search_knowledge(data: dict):
                 return {"result": "Let me have your specialist follow up with specific details for your situation."}
                 
         except asyncio.TimeoutError:
-            print(f"⚠️  Search timed out!")
+            print(f"Search timed out")
             return {
                 "result": "Great question! Let me have your specialist call you back to discuss that - they'll have the most current information for your operation."
             }
     
     except Exception as e:
-        print(f"❌ Error in search: {e}")
+        print(f"Error in search: {e}")
         return {
             "result": "Let me have your specialist give you a call back to help with that."
         }
 
 @app.post("/retell/lookup_town")
 async def lookup_town(data: dict):
-    # Your existing code here
     pass
 
 @app.post("/retell/schedule_callback")
 async def schedule_callback(data: dict):
-    # Your existing code here
     pass
 
 @app.get("/retell/get_caller_history")
 async def get_caller_history(phone: str):
-    # Your existing code here
     pass
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-```
-
-## Steps to Fix
-
-1. **Open main.py in Notepad++**
-2. **Select all** (Ctrl+A)
-3. **Delete everything**
-4. **Paste the clean code above**
-5. **Save** (Ctrl+S)
-6. **In GitHub Desktop**: Commit with message "Fix syntax error in main.py"
-7. **Push to GitHub**
-8. **Wait 2 minutes** for Railway to redeploy
-
-Then check the logs again - you should see:
-```
-✅ Cached XXX common answer lookups
-🚀 MFC Agent started with caching and keep-alive
