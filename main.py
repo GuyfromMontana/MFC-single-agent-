@@ -1,303 +1,486 @@
-# MFC Voice Agent - Complete Fix Guide
-## Solving the Darby Hallucination, Long Pauses, and Missing Nutrition
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+import asyncio
+import time
+import os
+from supabase import create_client
+import openai
+from datetime import datetime
+from zep_cloud import Zep
 
----
+app = FastAPI()
 
-## What Was Wrong (Based on Your Jan 21 Call Log)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-### 1. ❌ Nutrition Function Not Working
-**Problem:** Agent couldn't provide cattle nutrition advice (the main purpose!)
-**Root Cause:** Backend endpoint at wrong path
-- Your code: `/retell/search_knowledge_base`
-- Retell calls: `/retell/functions/search_knowledge_base`
-- Missing `/functions/` in the path = 404 error
+# Environment variables
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+RAILWAY_URL = os.getenv("RAILWAY_PUBLIC_URL", "https://your-app.up.railway.app")
+ZEP_API_KEY = os.getenv("ZEP_API_KEY")
+ZEP_API_URL = "https://api.getzep.com"
 
-### 2. ❌ Darby Location Hallucination
-**Problem:** Agent assumed you were in Darby without asking, never corrected when lookup failed
-**Root Causes:**
-- Darby not in database (returned "TOWN_NOT_FOUND")
-- Prompt had no instructions on what to do when town lookup fails
-- Agent hallucinated/assumed instead of asking for clarification
+# DEBUG: Print what we're getting from environment
+print("=" * 50)
+print("ENVIRONMENT VARIABLE CHECK:")
+print(f"SUPABASE_URL: {SUPABASE_URL}")
+print(f"SUPABASE_KEY: {SUPABASE_KEY[:20] if SUPABASE_KEY else 'NONE/EMPTY'}")
+print(f"OPENAI_API_KEY: {OPENAI_API_KEY[:20] if OPENAI_API_KEY else 'NONE/EMPTY'}")
+print(f"ZEP_API_KEY: {ZEP_API_KEY[:20] if ZEP_API_KEY else 'NONE/EMPTY'}")
+print(f"RAILWAY_URL: {RAILWAY_URL}")
+print("=" * 50)
 
-### 3. ❌ Long Awkward Pauses (18+ seconds)
-**Problem:** Dead air during searches
-**Root Cause:** Prompt doesn't tell agent to say "Let me check that..." before calling search_knowledge_base
-- Search can take 3-5 seconds (embedding + database query)
-- No conversational buffer = awkward silence
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+openai.api_key = OPENAI_API_KEY
+zep_client = Zep(api_key=ZEP_API_KEY)
 
-### 4. ❌ Callback Function Failing
-**Problem:** Database schema error
-**Root Cause:** `callbacks` table missing `phone_number` column
+CACHED_ANSWERS = {}
 
----
+async def keep_alive_ping():
+    while True:
+        try:
+            await asyncio.sleep(300)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.get(f"{RAILWAY_URL}/health")
+            print("Keep-alive ping successful")
+        except Exception as e:
+            print(f"Keep-alive ping failed: {e}")
 
-## The Three Files You Need
+async def load_cached_questions():
+    try:
+        result = supabase.table('knowledge_base').select('question, answer, keywords').eq('is_active', True).order('priority', desc=True).limit(100).execute()
+        
+        global CACHED_ANSWERS
+        
+        for row in result.data:
+            if row.get('keywords'):
+                for keyword in row['keywords']:
+                    key = keyword.lower().strip()
+                    CACHED_ANSWERS[key] = row['answer']
+            
+            question = row['question'].lower()
+            CACHED_ANSWERS[question] = row['answer']
+            
+            words = question.split()[:5]
+            phrase = ' '.join(words)
+            CACHED_ANSWERS[phrase] = row['answer']
+        
+        print(f"Cached {len(CACHED_ANSWERS)} common answer lookups")
+        
+    except Exception as e:
+        print(f"Failed to load cache: {e}")
 
-I've created three fixed files for you:
+@app.on_event("startup")
+async def startup():
+    await load_cached_questions()
+    asyncio.create_task(keep_alive_ping())
+    print("MFC Agent started with caching and keep-alive")
 
-### 1. **main_FIXED.py** (Your Railway Backend)
-**What changed:**
-- ✅ Fixed endpoint path: `/retell/search_knowledge_base` → `/retell/functions/search_knowledge_base`
-- ✅ Improved town lookup to return "TOWN_NOT_FOUND:" when no match
-- ✅ Better error handling and logging
-- ✅ Handles both parameter structures from Retell
+@app.middleware("http")
+async def log_request_time(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = (time.time() - start) * 1000
+    print(f"{request.method} {request.url.path}: {duration:.0f}ms")
+    if duration > 1000:
+        print(f"SLOW: {request.url.path} took {duration:.0f}ms")
+    return response
 
-**To deploy:**
-1. Download `main_FIXED.py`
-2. Rename your current `main.py` to `main_OLD.py` (backup)
-3. Rename `main_FIXED.py` to `main.py`
-4. Commit to GitHub (via GitHub Desktop)
-5. Railway will auto-deploy
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "mfc-agent",
+        "cached_items": len(CACHED_ANSWERS)
+    }
 
-### 2. **retell_prompt_v3.2_FIXED.txt** (Your Retell Agent Prompt)
-**What changed:**
-- ✅ Added instructions for handling TOWN_NOT_FOUND
-- ✅ Added conversational buffers ("Let me check that...") before searches
-- ✅ Clear examples of correct vs incorrect town lookup handling
-- ✅ Never assume locations - always ask for clarification
+async def generate_embedding(text: str):
+    start = time.time()
+    response = await asyncio.to_thread(
+        openai.Embedding.create,
+        model="text-embedding-ada-002",
+        input=text
+    )
+    duration = (time.time() - start) * 1000
+    print(f"  OpenAI embedding: {duration:.0f}ms")
+    return response['data'][0]['embedding']
 
-**To deploy:**
-1. Log into Retell dashboard
-2. Go to your MFC agent
-3. Copy the entire contents of `retell_prompt_v3.2_FIXED.txt`
-4. Paste into agent's system prompt (replace current prompt)
-5. Save
+async def search_database(embedding):
+    start = time.time()
+    result = await asyncio.to_thread(
+        lambda: supabase.rpc('match_knowledge', {
+            'query_embedding': embedding,
+            'match_threshold': 0.7,
+            'match_count': 3
+        }).execute()
+    )
+    duration = (time.time() - start) * 1000
+    print(f"  Database search: {duration:.0f}ms")
+    return result
 
-### 3. **database_fixes.sql** (Supabase Database Updates)
-**What it does:**
-- ✅ Adds `phone_number` column to `callbacks` table
-- ✅ Adds Ravalli County (Darby's county) to routing
-- ✅ Adds other missing Western Montana counties
-- ✅ Optional: Creates `montana_towns` table for better lookups
-
-**To deploy:**
-1. Log into Supabase
-2. Go to SQL Editor
-3. Paste the SQL script
-4. Run it
-5. Verify with the verification queries at the bottom
-
----
-
-## Step-by-Step Deployment
-
-### Phase 1: Database (Do This First)
-**Time: 5 minutes**
-
-1. Log into Supabase at https://supabase.com
-2. Select your MFC project
-3. Click "SQL Editor" in left sidebar
-4. Click "New Query"
-5. Copy/paste contents of `database_fixes.sql`
-6. Click "Run"
-7. Check for errors
-8. Run the verification queries to confirm:
-   - `callbacks` table has `phone_number` column
-   - Ravalli County exists in `county_coverage`
-
-### Phase 2: Backend Code (Railway)
-**Time: 10 minutes**
-
-1. Open your MFC project folder on your computer
-2. Find `main.py`
-3. Rename it to `main_OLD_backup.py`
-4. Save `main_FIXED.py` as `main.py` in the same folder
-5. Open GitHub Desktop
-6. You should see changes to `main.py`
-7. Write commit message: "Fix search_knowledge_base endpoint and town lookup"
-8. Click "Commit to main"
-9. Click "Push origin"
-10. Go to Railway dashboard
-11. Watch the deployment logs
-12. Wait for "Deployment successful"
-13. Check health endpoint: https://your-railway-url/health
-
-### Phase 3: Retell Prompt Update
-**Time: 5 minutes**
-
-1. Log into Retell dashboard
-2. Find your Montana Feed Company agent
-3. Click to edit
-4. Find the "System Prompt" or "General Prompt" section
-5. Select all current text (Ctrl+A or Cmd+A)
-6. Delete it
-7. Copy the entire contents of `retell_prompt_v3.2_FIXED.txt`
-8. Paste into the prompt field
-9. Scroll through to make sure it all copied correctly
-10. Click "Save" or "Update Agent"
-
----
-
-## Testing After Deployment
-
-### Test 1: Nutrition Search (The Big One)
-**Call the agent and say:**
-"What mineral should I feed my pregnant cows?"
-
-**Expected behavior:**
-- Agent says "Let me check that for you..." (fills the pause)
-- Brief pause (3-5 seconds)
-- Agent provides specific product recommendation with reasoning
-- No error, no "I can't help with that"
-
-**If it fails:**
-- Check Railway logs for errors on `/retell/functions/search_knowledge_base`
-- Verify endpoint is responding at the new path
-
-### Test 2: Darby Town Lookup
-**Call the agent and say:**
-"I'm in Darby."
-
-**Expected behavior:**
-- Agent says "Hmm, I'm not finding Darby in my system. What county are you in?"
-- You say "Ravalli"
-- Agent says "Perfect! You're in Ravalli County. Taylor Staudenmeyer is your specialist there."
-
-**If it fails:**
-- Check Supabase - does Ravalli County exist in county_coverage?
-- Check Railway logs - is lookup_town being called?
-
-### Test 3: Callback Scheduling
-**Call the agent and say:**
-"Have Brady call me back tomorrow morning about minerals."
-
-**Expected behavior:**
-- Agent confirms: "All set! I've scheduled a callback for tomorrow morning..."
-- No database error in Railway logs
-
-**If it fails:**
-- Check Supabase callbacks table - does phone_number column exist?
-- Check Railway logs for PostgreSQL errors
-
-### Test 4: End-to-End Nutrition Consultation
-**Call and say:**
-"My cows are thin going into winter. What should I feed them?"
-
-**Expected behavior:**
-1. Agent says "Let me check that for you..."
-2. Short pause
-3. Agent provides specific advice about high-energy tubs (38-20 E)
-4. Explains WHY (energy needs, body condition recovery)
-5. Mentions product by name
-6. Offers specialist follow-up
-
----
-
-## Common Issues & Solutions
-
-### Issue: Search still not working
-**Check:**
-- Railway deployment completed successfully?
-- Endpoint path in code is `/retell/functions/search_knowledge_base`?
-- Retell tool definition calls the same path?
-- Railway logs show the endpoint being hit?
-
-**Fix:**
-- Redeploy to Railway
-- Verify Retell tool configuration matches new path
-
-### Issue: Still hallucinating locations
-**Check:**
-- Did you update the Retell prompt?
-- Check Retell dashboard - is the new prompt actually saved?
-
-**Fix:**
-- Copy prompt again, make sure you got ALL of it
-- Save/update in Retell
-
-### Issue: Still getting callback database errors
-**Check:**
-- Did you run the SQL in Supabase?
-- Does the callbacks table have phone_number column?
-
-**Fix:**
-- Run: `ALTER TABLE callbacks ADD COLUMN IF NOT EXISTS phone_number TEXT;`
-- Verify: `SELECT * FROM information_schema.columns WHERE table_name = 'callbacks';`
-
----
-
-## What Each Fix Does
-
-### Backend Fix (main_FIXED.py)
-```python
-# OLD (broken):
-@app.post("/retell/search_knowledge_base")
-
-# NEW (working):
+# FIXED: Changed path from /retell/search_knowledge_base to /retell/functions/search_knowledge_base
 @app.post("/retell/functions/search_knowledge_base")
-```
+async def search_knowledge(data: dict):
+    start_total = time.time()
+    
+    try:
+        # FIXED: Handle both parameter structures from Retell
+        query = data.get("args", {}).get("question", data.get("parameters", {}).get("question", ""))
+        query_lower = query.lower()
+        
+        print(f"[SEARCH_KB] Query: {query}")
+        
+        # Fast cache lookup
+        for cached_key, answer in CACHED_ANSWERS.items():
+            if cached_key in query_lower:
+                duration = (time.time() - start_total) * 1000
+                print(f"[SEARCH_KB] CACHE HIT: {cached_key} ({duration:.0f}ms)")
+                return {"result": answer}
+        
+        print(f"[SEARCH_KB] Cache miss - doing semantic search")
+        
+        try:
+            embedding = await asyncio.wait_for(
+                generate_embedding(query),
+                timeout=3.0
+            )
+            
+            result = await asyncio.wait_for(
+                search_database(embedding),
+                timeout=2.0
+            )
+            
+            duration = (time.time() - start_total) * 1000
+            print(f"[SEARCH_KB] Total search time: {duration:.0f}ms")
+            
+            if result.data and len(result.data) > 0:
+                return {"result": result.data[0]['answer']}
+            else:
+                return {"result": "Let me have your specialist follow up with specific details for your situation."}
+                
+        except asyncio.TimeoutError:
+            print(f"[SEARCH_KB] Search timed out")
+            return {
+                "result": "Great question! Let me have your specialist call you back to discuss that - they'll have the most current information for your operation."
+            }
+    
+    except Exception as e:
+        print(f"[SEARCH_KB] Error in search: {e}")
+        return {
+            "result": "Let me have your specialist give you a call back to help with that."
+        }
 
-Also improved the response format for TOWN_NOT_FOUND so the prompt can detect it.
+@app.post("/retell/functions/get_caller_history")
+async def get_caller_history(data: dict):
+    """Retrieve caller history from Zep"""
+    try:
+        print(f"[CALLER_HISTORY] Received data keys: {data.keys()}")
+        
+        # Get phone from call metadata
+        phone = data.get("call", {}).get("from_number", "")
+        
+        print(f"[CALLER_HISTORY] Extracted phone: {phone}")
+        
+        if not phone:
+            print("[CALLER_HISTORY] No phone number in request")
+            return {"result": "No phone number provided"}
+        
+        # Format phone number consistently
+        phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
+        user_id = f"+1{phone_clean}"
+        
+        print(f"[CALLER_HISTORY] Looking up caller history for user_id: {user_id}")
+        
+        # Try to get user from Zep using SDK
+        try:
+            user = await asyncio.to_thread(zep_client.user.get, user_id=user_id)
+            
+            print(f"[CALLER_HISTORY] Found user in Zep!")
+            
+            user_name = user.metadata.get("name", "Unknown") if user.metadata else "Unknown"
+            
+            # FIXED: Just return the name, not "Returning caller: {name}"
+            print(f"[CALLER_HISTORY] Returning: {user_name}")
+            return {"result": user_name}
+            
+        except Exception as user_error:
+            print(f"[CALLER_HISTORY] User not found: {user_error}")
+            return {"result": "New caller"}
+            
+    except Exception as e:
+        print(f"[CALLER_HISTORY] ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        print(f"[CALLER_HISTORY] Traceback: {traceback.format_exc()}")
+        return {"result": "New caller"}
 
-### Prompt Fix (v3.2)
-Added two critical sections:
+@app.post("/retell/functions/lookup_town")
+async def lookup_town(data: dict):
+    """Look up county and specialist based on town"""
+    try:
+        # Get town from tool arguments - Retell sends "town_name"
+        args = data.get("args", {})
+        town = args.get("town_name", args.get("town", "")).strip()
+        
+        print(f"[LOOKUP_TOWN] Args received: {args}")
+        print(f"[LOOKUP_TOWN] Looking up town: {town}")
+        
+        if not town:
+            print("[LOOKUP_TOWN] No town provided")
+            return {"result": "No town provided"}
+        
+        # IMPROVED: Try exact town match first, then county match
+        # First try to find town in a towns table (if you have one)
+        # For now, search county_coverage by county name
+        county_search = f'{town} County' if not town.lower().endswith('county') else town
+        
+        result = supabase.table('county_coverage') \
+            .select('county_name, primary_lps, state') \
+            .ilike('county_name', f'%{county_search}%') \
+            .limit(1) \
+            .execute()
+        
+        print(f"[LOOKUP_TOWN] Database result: {len(result.data) if result.data else 0} matches")
+        
+        if result.data and len(result.data) > 0:
+            county_data = result.data[0]
+            county_name = county_data['county_name']
+            specialist_name = county_data.get('primary_lps', 'Unknown')
+            
+            result_text = f"County: {county_name}, Specialist: {specialist_name}"
+            print(f"[LOOKUP_TOWN] Returning: {result_text}")
+            
+            return {"result": result_text}
+        
+        # IMPROVED: Return a helpful message when not found
+        print(f"[LOOKUP_TOWN] No match found for: {town}")
+        return {"result": f"TOWN_NOT_FOUND: {town}"}
+        
+    except Exception as e:
+        print(f"[LOOKUP_TOWN] ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        print(f"[LOOKUP_TOWN] Traceback: {traceback.format_exc()}")
+        return {"result": "Unable to determine county"}
 
-**1. Conversational buffer:**
-```
-Agent: "Let me check that for you..."
-[calls search_knowledge_base]
-```
+@app.post("/retell/functions/schedule_callback")
+async def schedule_callback(data: dict):
+    """Schedule a callback and save to database"""
+    try:
+        # Get parameters from tool arguments
+        args = data.get("args", {})
+        phone = data.get("call", {}).get("from_number", "")
+        name = args.get("name", args.get("caller_name", ""))
+        reason = args.get("reason", "")
+        specialist = args.get("specialist", args.get("specialist_name", ""))
+        
+        print(f"[SCHEDULE_CALLBACK] Scheduling callback for {name} ({phone})")
+        
+        # Insert into callbacks table
+        callback_data = {
+            "phone_number": phone,  # This column should exist now
+            "caller_name": name,
+            "reason": reason,
+            "specialist_assigned": specialist,
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        result = supabase.table('callbacks').insert(callback_data).execute()
+        
+        if result.data:
+            return {
+                "result": f"Callback scheduled for {specialist} to call {name} at {phone}"
+            }
+        
+        return {"result": "Callback request saved"}
+        
+    except Exception as e:
+        print(f"[SCHEDULE_CALLBACK] Error scheduling callback: {e}")
+        import traceback
+        print(f"[SCHEDULE_CALLBACK] Traceback: {traceback.format_exc()}")
+        return {"result": "Callback request noted"}
 
-**2. Town not found handling:**
-```
-[lookup returns "TOWN_NOT_FOUND: Darby"]
-Agent: "Hmm, I'm not finding Darby in my system. What county are you in?"
-```
+@app.post("/retell/functions/lookup_staff")
+async def lookup_staff(data: dict):
+    """Look up staff member by name"""
+    try:
+        args = data.get("args", {})
+        name = args.get("name", "").strip()
+        
+        print(f"[LOOKUP_STAFF] Looking up staff: {name}")
+        
+        if not name:
+            print("[LOOKUP_STAFF] No name provided")
+            return {"result": "No staff name provided"}
+        
+        # Search specialists table for matching name
+        result = supabase.table('specialists') \
+            .select('id, name, email, phone') \
+            .ilike('name', f'%{name}%') \
+            .limit(1) \
+            .execute()
+        
+        print(f"[LOOKUP_STAFF] Database result: {len(result.data) if result.data else 0} matches")
+        
+        if result.data and len(result.data) > 0:
+            staff = result.data[0]
+            staff_name = staff['name']
+            staff_id = staff['id']
+            
+            # Get counties for this specialist
+            counties_result = supabase.table('county_coverage') \
+                .select('county_name') \
+                .eq('primary_lps', staff_name) \
+                .execute()
+            
+            county_names = ', '.join([c['county_name'] for c in counties_result.data]) if counties_result.data else 'Unknown'
+            
+            result_text = f"Found {staff_name}. They cover: {county_names}"
+            print(f"[LOOKUP_STAFF] Returning: {result_text}")
+            
+            return {"result": result_text}
+        
+        print(f"[LOOKUP_STAFF] No match found for: {name}")
+        return {"result": f"Staff member {name} not found"}
+        
+    except Exception as e:
+        print(f"[LOOKUP_STAFF] ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        print(f"[LOOKUP_STAFF] Traceback: {traceback.format_exc()}")
+        return {"result": "Unable to look up staff"}
 
-### Database Fix (SQL)
-```sql
--- Fix callbacks schema
-ALTER TABLE callbacks ADD COLUMN IF NOT EXISTS phone_number TEXT;
+@app.post("/retell/webhook")
+async def retell_webhook(data: dict):
+    """Handle Retell webhooks for call events"""
+    try:
+        event = data.get("event", "")
+        call = data.get("call", {})
+        call_id = call.get("call_id", "")
+        
+        print(f"[WEBHOOK] Received event: {event} for call: {call_id}")
+        
+        if event == "call_ended":
+            # Save the call session to Zep
+            phone = call.get("from_number", "")
+            transcript = call.get("transcript", "")
+            
+            if phone and call_id:
+                await save_call_to_zep(call_id, phone, transcript, call)
+        
+        return {"status": "ok"}
+        
+    except Exception as e:
+        print(f"[WEBHOOK] ERROR: {type(e).__name__}: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
--- Add missing counties
-INSERT INTO county_coverage (county_name, primary_lps, state)
-VALUES ('Ravalli County', 'Taylor Staudenmeyer', 'MT');
-```
+async def save_call_to_zep(call_id: str, phone: str, transcript: str, call_data: dict):
+    """Save call session to Zep"""
+    try:
+        phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
+        user_id = f"+1{phone_clean}"
+        
+        print(f"[ZEP_SAVE] Saving session for {user_id}, call_id: {call_id}")
+        
+        # Get or create user metadata
+        caller_name = call_data.get("metadata", {}).get("caller_name", "Unknown")
+        
+        # Note: Using Zep SDK for saving will be added in next iteration
+        # For now, just log it
+        print(f"[ZEP_SAVE] Would save: user={user_id}, session={call_id}, transcript_length={len(transcript)}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"[ZEP_SAVE] ERROR: {e}")
+        return False
 
----
+@app.post("/save-session")
+async def save_session(data: dict):
+    """Save conversation session to Zep"""
+    try:
+        call_id = data.get("call_id")
+        transcript = data.get("transcript", "")
+        phone = data.get("from_number", "")
+        metadata = data.get("metadata", {})
+        
+        if not phone or not call_id:
+            return {"status": "error", "message": "Missing required fields"}
+        
+        # Format phone number consistently
+        phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
+        user_id = f"+1{phone_clean}"
+        
+        print(f"Saving session for {user_id}, call_id: {call_id}")
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = {
+                "Authorization": f"Bearer {ZEP_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            # Create or update user
+            user_data = {
+                "user_id": user_id,
+                "metadata": {
+                    "name": metadata.get("caller_name", ""),
+                    "phone": phone,
+                    "last_call": datetime.utcnow().isoformat()
+                }
+            }
+            
+            await client.put(
+                f"{ZEP_API_URL}/v2/users/{user_id}",
+                headers=headers,
+                json=user_data
+            )
+            
+            # Add session with messages
+            session_data = {
+                "session_id": call_id,
+                "user_id": user_id,
+                "metadata": {
+                    "call_duration": metadata.get("duration", 0),
+                    "specialist": metadata.get("specialist", "")
+                }
+            }
+            
+            await client.post(
+                f"{ZEP_API_URL}/v2/sessions",
+                headers=headers,
+                json=session_data
+            )
+            
+            # Add the conversation transcript as memory
+            if transcript:
+                memory_data = {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": transcript,
+                            "role_type": "user"
+                        }
+                    ]
+                }
+                
+                await client.post(
+                    f"{ZEP_API_URL}/v2/sessions/{call_id}/memory",
+                    headers=headers,
+                    json=memory_data
+                )
+            
+            print(f"Session saved successfully: {call_id}")
+            return {"status": "success", "session_id": call_id}
+            
+    except Exception as e:
+        print(f"Error saving session: {e}")
+        return {"status": "error", "message": str(e)}
 
-## Expected Results After All Fixes
-
-✅ Nutrition questions work perfectly
-✅ No more Darby hallucinations (asks for county)
-✅ No awkward long pauses (conversational buffers)
-✅ Callback scheduling works without errors
-✅ Agent can actually do its job (cattle consultation)
-
----
-
-## Next Steps After Testing
-
-1. **Monitor real calls** - Check Railway logs for any errors
-2. **Gather missing towns** - When agent says "town not found", add that town to database
-3. **Optimize search speed** - If searches are still slow, we can add more caching
-4. **Update ranch consultation skill** - Make sure all Montana counties are documented
-
----
-
-## Questions to Ask Yourself After Testing
-
-- Did nutrition search work on first try?
-- Did agent handle unknown towns gracefully?
-- Were there any awkward pauses?
-- Did callback scheduling succeed without errors?
-- Can you actually use this agent now for real ranch consultations?
-
-If you answered YES to all five, **you're good to go!**
-
-If any are NO, let me know which test failed and I'll help you debug it.
-
----
-
-## File Summary
-
-You now have:
-1. ✅ `main_FIXED.py` - Deploy to Railway
-2. ✅ `retell_prompt_v3.2_FIXED.txt` - Update in Retell dashboard
-3. ✅ `database_fixes.sql` - Run in Supabase SQL editor
-4. ✅ This implementation guide
-
-**Total deployment time: ~20 minutes**
-**Total testing time: ~10 minutes**
-
-**You should have a fully working MFC voice agent after this.**
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
