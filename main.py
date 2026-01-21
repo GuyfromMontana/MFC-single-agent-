@@ -10,6 +10,8 @@ import openai
 from datetime import datetime
 from zep_cloud import Zep
 import logging
+from typing import Optional, List, Dict
+import json
 
 app = FastAPI()
 
@@ -87,7 +89,7 @@ async def load_cached_questions():
 async def startup():
     await load_cached_questions()
     asyncio.create_task(keep_alive_ping())
-    print("MFC Agent started with caching and keep-alive")
+    print("MFC Agent started with caching, keep-alive, and memory integration")
 
 @app.middleware("http")
 async def log_request_time(request: Request, call_next):
@@ -104,11 +106,12 @@ async def health():
     return {
         "status": "ok",
         "service": "mfc-agent",
-        "cached_items": len(CACHED_ANSWERS)
+        "cached_items": len(CACHED_ANSWERS),
+        "memory_enabled": True
     }
 
 # ============================================================================
-# NEW: INBOUND WEBHOOK FOR CALLER RECOGNITION
+# MEMORY-ENHANCED CALLER RECOGNITION
 # ============================================================================
 
 def format_phone_for_zep(phone: str) -> str:
@@ -121,43 +124,80 @@ def format_phone_for_zep(phone: str) -> str:
     return phone
 
 async def lookup_caller_in_zep(from_number: str) -> dict:
-    """Look up caller in Zep and return their info"""
+    """Look up caller in Zep and return their info WITH conversation history"""
     try:
         user_id = format_phone_for_zep(from_number)
-        logger.info(f"Looking up caller: {user_id}")
+        logger.info(f"Looking up caller with memory: {user_id}")
         
-        # Get user from Zep using the existing zep_client
-        user = await asyncio.to_thread(zep_client.user.get, user_id=user_id)
+        # Get user profile
+        try:
+            user = await asyncio.to_thread(zep_client.user.get, user_id=user_id)
+            user_exists = True
+            user_name = user.first_name if user and user.first_name else "New caller"
+            logger.info(f"Found user: {user_name}")
+        except Exception as e:
+            logger.info(f"User not found in Zep: {e}")
+            user_exists = False
+            user_name = "New caller"
         
-        if user and user.first_name:
-            logger.info(f"Found returning caller: {user.first_name}")
-            return {
-                "caller_name": user.first_name,
-                "is_returning": True,
-                "user_id": user_id
-            }
-        else:
-            logger.info(f"New caller: {user_id}")
-            return {
-                "caller_name": "New caller",
-                "is_returning": False,
-                "user_id": user_id
-            }
+        # If returning caller, get conversation history
+        conversation_context = ""
+        if user_exists and user_name != "New caller":
+            try:
+                logger.info(f"Loading conversation history for {user_id}...")
+                
+                # Get recent sessions (last 5 conversations)
+                sessions_result = await asyncio.to_thread(
+                    zep_client.memory.search_sessions,
+                    user_id=user_id,
+                    limit=5
+                )
+                
+                if sessions_result and hasattr(sessions_result, 'sessions') and sessions_result.sessions:
+                    logger.info(f"Found {len(sessions_result.sessions)} past sessions")
+                    
+                    # Build conversation summary
+                    past_topics = []
+                    for idx, session in enumerate(sessions_result.sessions):
+                        if hasattr(session, 'summary') and session.summary:
+                            past_topics.append(f"{idx+1}. {session.summary}")
+                            logger.info(f"Session summary: {session.summary[:100]}...")
+                    
+                    if past_topics:
+                        # Combine into natural context
+                        conversation_context = "Past conversations with this caller:\n" + "\n".join(past_topics)
+                        logger.info(f"Built conversation context with {len(past_topics)} summaries")
+                else:
+                    logger.info("No past sessions found")
+                
+            except Exception as mem_error:
+                logger.warning(f"Could not load conversation history: {mem_error}")
+                import traceback
+                logger.warning(f"Memory error traceback: {traceback.format_exc()}")
+        
+        return {
+            "caller_name": user_name,
+            "is_returning": user_exists and user_name != "New caller",
+            "user_id": user_id,
+            "conversation_context": conversation_context
+        }
             
     except Exception as e:
         logger.error(f"Zep lookup error: {str(e)}")
-        # Default to new caller on error
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return {
             "caller_name": "New caller",
             "is_returning": False,
-            "user_id": from_number
+            "user_id": from_number,
+            "conversation_context": ""
         }
 
 @app.post("/retell/webhook/inbound")
 async def retell_inbound_webhook(request: Request):
     """
     Retell inbound call webhook - fires at call start
-    Returns dynamic variables for caller personalization
+    Returns dynamic variables including conversation history
     """
     try:
         body = await request.json()
@@ -172,15 +212,16 @@ async def retell_inbound_webhook(request: Request):
             logger.warning("No from_number in webhook")
             from_number = "unknown"
         
-        # Look up caller in Zep
+        # Look up caller in Zep WITH memory
         caller_info = await lookup_caller_in_zep(from_number)
         
-        # Build response in Retell's expected format
+        # Build response with conversation context
         response = {
             "response_id": 1,
             "dynamic_variables": {
                 "caller_name": caller_info["caller_name"],
                 "is_returning": str(caller_info["is_returning"]).lower(),
+                "conversation_history": caller_info["conversation_context"]
             },
             "metadata": {
                 "caller_name": caller_info["caller_name"],
@@ -188,14 +229,18 @@ async def retell_inbound_webhook(request: Request):
                 "from_number": from_number,
                 "user_id": caller_info["user_id"],
                 "call_id": call_id,
+                "has_history": len(caller_info["conversation_context"]) > 0
             }
         }
         
-        logger.info(f"Returning webhook response: {response}")
+        logger.info(f"Returning webhook response with memory (history length: {len(caller_info['conversation_context'])} chars)")
         return JSONResponse(content=response)
         
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
         # Return safe defaults on error
         return JSONResponse(
             content={
@@ -203,6 +248,7 @@ async def retell_inbound_webhook(request: Request):
                 "dynamic_variables": {
                     "caller_name": "New caller",
                     "is_returning": "false",
+                    "conversation_history": ""
                 },
                 "metadata": {
                     "error": str(e)
@@ -289,7 +335,6 @@ async def search_knowledge(data: dict):
         }
 
 # DEPRECATED: This function is no longer needed - webhook handles caller recognition
-# Keeping it for backwards compatibility in case it's still configured in Retell
 @app.post("/retell/functions/get_caller_history")
 async def get_caller_history(data: dict):
     """DEPRECATED: Use webhook instead. Keeping for backwards compatibility."""
@@ -422,50 +467,130 @@ async def lookup_staff(data: dict):
         print(f"[LOOKUP_STAFF] Traceback: {traceback.format_exc()}")
         return {"result": "Unable to look up staff"}
 
+# ============================================================================
+# MEMORY-ENHANCED WEBHOOKS
+# ============================================================================
+
 @app.post("/retell/webhook")
 async def retell_webhook(data: dict):
-    """Handle Retell webhooks for call events"""
+    """Handle Retell webhooks for call events - enhanced for memory"""
     try:
         event = data.get("event", "")
         call = data.get("call", {})
         call_id = call.get("call_id", "")
         
-        print(f"[WEBHOOK] Received event: {event} for call: {call_id}")
+        logger.info(f"[WEBHOOK] Received event: {event} for call: {call_id}")
         
         if event == "call_ended":
             phone = call.get("from_number", "")
             transcript = call.get("transcript", "")
             
             if phone and call_id:
-                await save_call_to_zep(call_id, phone, transcript, call)
+                # Extract metadata for better memory
+                call_analysis = call.get("call_analysis", {})
+                metadata = {
+                    "duration_ms": call.get("duration_ms", 0),
+                    "call_successful": call_analysis.get("call_successful", True),
+                    "user_sentiment": call_analysis.get("user_sentiment", "Neutral"),
+                    "call_summary": call_analysis.get("call_summary", ""),
+                }
+                
+                await save_call_to_zep_enhanced(call_id, phone, transcript, metadata)
         
         return {"status": "ok"}
         
     except Exception as e:
-        print(f"[WEBHOOK] ERROR: {type(e).__name__}: {str(e)}")
+        logger.error(f"[WEBHOOK] ERROR: {type(e).__name__}: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-async def save_call_to_zep(call_id: str, phone: str, transcript: str, call_data: dict):
-    """Save call session to Zep"""
+async def save_call_to_zep_enhanced(call_id: str, phone: str, transcript: str, metadata: dict):
+    """Save call session to Zep with rich context"""
     try:
-        phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
-        user_id = f"+1{phone_clean}"
+        user_id = format_phone_for_zep(phone)
         
-        print(f"[ZEP_SAVE] Saving session for {user_id}, call_id: {call_id}")
+        logger.info(f"[ZEP_SAVE] Saving session with memory for {user_id}, call_id: {call_id}")
         
-        caller_name = call_data.get("metadata", {}).get("caller_name", "Unknown")
+        # Ensure user exists in Zep
+        try:
+            user = await asyncio.to_thread(zep_client.user.get, user_id=user_id)
+            logger.info(f"[ZEP_SAVE] User exists: {user.first_name}")
+        except Exception:
+            logger.info(f"[ZEP_SAVE] User doesn't exist yet - will create on next interaction")
+            return False
         
-        print(f"[ZEP_SAVE] Would save: user={user_id}, session={call_id}, transcript_length={len(transcript)}")
+        # Create session with messages
+        if transcript and len(transcript) > 10:
+            try:
+                session_id = call_id
+                
+                # Parse transcript into messages (Retell format: "Agent: ... User: ...")
+                messages = []
+                
+                # Split on newlines and parse
+                parts = transcript.split("\n")
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                        
+                    if part.startswith("Agent:"):
+                        content = part.replace("Agent:", "").strip()
+                        if content:
+                            messages.append({
+                                "role": "assistant",
+                                "content": content,
+                                "role_type": "assistant"
+                            })
+                    elif part.startswith("User:") or part.startswith("Caller:"):
+                        content = part.replace("User:", "").replace("Caller:", "").strip()
+                        if content:
+                            messages.append({
+                                "role": "user", 
+                                "content": content,
+                                "role_type": "user"
+                            })
+                
+                # Add to Zep memory
+                if messages:
+                    logger.info(f"[ZEP_SAVE] Adding {len(messages)} messages to Zep")
+                    
+                    await asyncio.to_thread(
+                        zep_client.memory.add,
+                        session_id=session_id,
+                        messages=messages,
+                        metadata={
+                            "call_duration_ms": metadata.get("duration_ms", 0),
+                            "call_successful": metadata.get("call_successful", True),
+                            "user_sentiment": metadata.get("user_sentiment", "Neutral"),
+                            "call_summary": metadata.get("call_summary", ""),
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                    )
+                    
+                    logger.info(f"[ZEP_SAVE] Successfully saved {len(messages)} messages to Zep for session {session_id}")
+                    return True
+                else:
+                    logger.warning(f"[ZEP_SAVE] No messages parsed from transcript")
+                
+            except Exception as save_error:
+                logger.error(f"[ZEP_SAVE] Error saving to Zep: {save_error}")
+                import traceback
+                logger.error(f"[ZEP_SAVE] Traceback: {traceback.format_exc()}")
+                return False
+        else:
+            logger.warning(f"[ZEP_SAVE] Transcript too short or empty: {len(transcript) if transcript else 0} chars")
         
         return True
         
     except Exception as e:
-        print(f"[ZEP_SAVE] ERROR: {e}")
+        logger.error(f"[ZEP_SAVE] ERROR: {e}")
+        import traceback
+        logger.error(f"[ZEP_SAVE] Traceback: {traceback.format_exc()}")
         return False
 
 @app.post("/save-session")
 async def save_session(data: dict):
-    """Save conversation session to Zep"""
+    """Save conversation session to Zep (legacy endpoint)"""
     try:
         call_id = data.get("call_id")
         transcript = data.get("transcript", "")
