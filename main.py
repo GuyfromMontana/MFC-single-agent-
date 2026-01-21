@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import httpx
 import asyncio
 import time
@@ -8,8 +9,13 @@ from supabase import create_client
 import openai
 from datetime import datetime
 from zep_cloud import Zep
+import logging
 
 app = FastAPI()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,6 +107,113 @@ async def health():
         "cached_items": len(CACHED_ANSWERS)
     }
 
+# ============================================================================
+# NEW: INBOUND WEBHOOK FOR CALLER RECOGNITION
+# ============================================================================
+
+def format_phone_for_zep(phone: str) -> str:
+    """Convert phone to Zep user_id format: +1XXXXXXXXXX"""
+    clean = ''.join(filter(str.isdigit, phone))
+    if len(clean) == 10:
+        return f"+1{clean}"
+    elif len(clean) == 11 and clean.startswith('1'):
+        return f"+{clean}"
+    return phone
+
+async def lookup_caller_in_zep(from_number: str) -> dict:
+    """Look up caller in Zep and return their info"""
+    try:
+        user_id = format_phone_for_zep(from_number)
+        logger.info(f"Looking up caller: {user_id}")
+        
+        # Get user from Zep using the existing zep_client
+        user = await asyncio.to_thread(zep_client.user.get, user_id=user_id)
+        
+        if user and user.first_name:
+            logger.info(f"Found returning caller: {user.first_name}")
+            return {
+                "caller_name": user.first_name,
+                "is_returning": True,
+                "user_id": user_id
+            }
+        else:
+            logger.info(f"New caller: {user_id}")
+            return {
+                "caller_name": "New caller",
+                "is_returning": False,
+                "user_id": user_id
+            }
+            
+    except Exception as e:
+        logger.error(f"Zep lookup error: {str(e)}")
+        # Default to new caller on error
+        return {
+            "caller_name": "New caller",
+            "is_returning": False,
+            "user_id": from_number
+        }
+
+@app.post("/retell/webhook/inbound")
+async def retell_inbound_webhook(request: Request):
+    """
+    Retell inbound call webhook - fires at call start
+    Returns dynamic variables for caller personalization
+    """
+    try:
+        body = await request.json()
+        logger.info(f"Inbound webhook received: {body}")
+        
+        # Extract call details
+        call = body.get("call", {})
+        from_number = call.get("from_number", "")
+        call_id = call.get("call_id", "")
+        
+        if not from_number:
+            logger.warning("No from_number in webhook")
+            from_number = "unknown"
+        
+        # Look up caller in Zep
+        caller_info = await lookup_caller_in_zep(from_number)
+        
+        # Build response in Retell's expected format
+        response = {
+            "response_id": 1,
+            "dynamic_variables": {
+                "caller_name": caller_info["caller_name"],
+                "is_returning": str(caller_info["is_returning"]).lower(),
+            },
+            "metadata": {
+                "caller_name": caller_info["caller_name"],
+                "is_returning": caller_info["is_returning"],
+                "from_number": from_number,
+                "user_id": caller_info["user_id"],
+                "call_id": call_id,
+            }
+        }
+        
+        logger.info(f"Returning webhook response: {response}")
+        return JSONResponse(content=response)
+        
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        # Return safe defaults on error
+        return JSONResponse(
+            content={
+                "response_id": 1,
+                "dynamic_variables": {
+                    "caller_name": "New caller",
+                    "is_returning": "false",
+                },
+                "metadata": {
+                    "error": str(e)
+                }
+            }
+        )
+
+# ============================================================================
+# EXISTING CUSTOM FUNCTIONS (Keep these as-is)
+# ============================================================================
+
 async def generate_embedding(text: str):
     start = time.time()
     response = await asyncio.to_thread(
@@ -125,13 +238,11 @@ async def search_database(embedding):
     print(f"  Database search: {duration:.0f}ms")
     return result
 
-# FIXED: Changed path from /retell/search_knowledge_base to /retell/functions/search_knowledge_base
 @app.post("/retell/functions/search_knowledge_base")
 async def search_knowledge(data: dict):
     start_total = time.time()
     
     try:
-        # FIXED: Handle both parameter structures from Retell
         query = data.get("args", {}).get("question", data.get("parameters", {}).get("question", ""))
         query_lower = query.lower()
         
@@ -177,54 +288,18 @@ async def search_knowledge(data: dict):
             "result": "Let me have your specialist give you a call back to help with that."
         }
 
+# DEPRECATED: This function is no longer needed - webhook handles caller recognition
+# Keeping it for backwards compatibility in case it's still configured in Retell
 @app.post("/retell/functions/get_caller_history")
 async def get_caller_history(data: dict):
-    """Retrieve caller history from Zep"""
-    try:
-        print(f"[CALLER_HISTORY] Received data keys: {data.keys()}")
-        
-        # Get phone from call metadata
-        phone = data.get("call", {}).get("from_number", "")
-        
-        print(f"[CALLER_HISTORY] Extracted phone: {phone}")
-        
-        if not phone:
-            print("[CALLER_HISTORY] No phone number in request")
-            return {"result": "No phone number provided"}
-        
-        # Format phone number consistently
-        phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
-        user_id = f"+1{phone_clean}"
-        
-        print(f"[CALLER_HISTORY] Looking up caller history for user_id: {user_id}")
-        
-        # Try to get user from Zep using SDK
-        try:
-            user = await asyncio.to_thread(zep_client.user.get, user_id=user_id)
-            
-            print(f"[CALLER_HISTORY] Found user in Zep!")
-            
-            user_name = user.metadata.get("name", "Unknown") if user.metadata else "Unknown"
-            
-            # FIXED: Just return the name, not "Returning caller: {name}"
-            print(f"[CALLER_HISTORY] Returning: {user_name}")
-            return {"result": user_name}
-            
-        except Exception as user_error:
-            print(f"[CALLER_HISTORY] User not found: {user_error}")
-            return {"result": "New caller"}
-            
-    except Exception as e:
-        print(f"[CALLER_HISTORY] ERROR: {type(e).__name__}: {str(e)}")
-        import traceback
-        print(f"[CALLER_HISTORY] Traceback: {traceback.format_exc()}")
-        return {"result": "New caller"}
+    """DEPRECATED: Use webhook instead. Keeping for backwards compatibility."""
+    logger.warning("[CALLER_HISTORY] DEPRECATED FUNCTION CALLED - Use webhook instead")
+    return {"result": "New caller"}
 
 @app.post("/retell/functions/lookup_town")
 async def lookup_town(data: dict):
     """Look up county and specialist based on town"""
     try:
-        # Get town from tool arguments - Retell sends "town_name"
         args = data.get("args", {})
         town = args.get("town_name", args.get("town", "")).strip()
         
@@ -235,9 +310,6 @@ async def lookup_town(data: dict):
             print("[LOOKUP_TOWN] No town provided")
             return {"result": "No town provided"}
         
-        # IMPROVED: Try exact town match first, then county match
-        # First try to find town in a towns table (if you have one)
-        # For now, search county_coverage by county name
         county_search = f'{town} County' if not town.lower().endswith('county') else town
         
         result = supabase.table('county_coverage') \
@@ -258,7 +330,6 @@ async def lookup_town(data: dict):
             
             return {"result": result_text}
         
-        # IMPROVED: Return a helpful message when not found
         print(f"[LOOKUP_TOWN] No match found for: {town}")
         return {"result": f"TOWN_NOT_FOUND: {town}"}
         
@@ -272,7 +343,6 @@ async def lookup_town(data: dict):
 async def schedule_callback(data: dict):
     """Schedule a callback and save to database"""
     try:
-        # Get parameters from tool arguments
         args = data.get("args", {})
         phone = data.get("call", {}).get("from_number", "")
         name = args.get("name", args.get("caller_name", ""))
@@ -281,9 +351,8 @@ async def schedule_callback(data: dict):
         
         print(f"[SCHEDULE_CALLBACK] Scheduling callback for {name} ({phone})")
         
-        # Insert into callbacks table
         callback_data = {
-            "phone_number": phone,  # This column should exist now
+            "phone_number": phone,
             "caller_name": name,
             "reason": reason,
             "specialist_assigned": specialist,
@@ -319,7 +388,6 @@ async def lookup_staff(data: dict):
             print("[LOOKUP_STAFF] No name provided")
             return {"result": "No staff name provided"}
         
-        # Search specialists table for matching name
         result = supabase.table('specialists') \
             .select('id, name, email, phone') \
             .ilike('name', f'%{name}%') \
@@ -333,7 +401,6 @@ async def lookup_staff(data: dict):
             staff_name = staff['name']
             staff_id = staff['id']
             
-            # Get counties for this specialist
             counties_result = supabase.table('county_coverage') \
                 .select('county_name') \
                 .eq('primary_lps', staff_name) \
@@ -366,7 +433,6 @@ async def retell_webhook(data: dict):
         print(f"[WEBHOOK] Received event: {event} for call: {call_id}")
         
         if event == "call_ended":
-            # Save the call session to Zep
             phone = call.get("from_number", "")
             transcript = call.get("transcript", "")
             
@@ -387,11 +453,8 @@ async def save_call_to_zep(call_id: str, phone: str, transcript: str, call_data:
         
         print(f"[ZEP_SAVE] Saving session for {user_id}, call_id: {call_id}")
         
-        # Get or create user metadata
         caller_name = call_data.get("metadata", {}).get("caller_name", "Unknown")
         
-        # Note: Using Zep SDK for saving will be added in next iteration
-        # For now, just log it
         print(f"[ZEP_SAVE] Would save: user={user_id}, session={call_id}, transcript_length={len(transcript)}")
         
         return True
@@ -412,7 +475,6 @@ async def save_session(data: dict):
         if not phone or not call_id:
             return {"status": "error", "message": "Missing required fields"}
         
-        # Format phone number consistently
         phone_clean = phone.replace("+1", "").replace("-", "").replace(" ", "")
         user_id = f"+1{phone_clean}"
         
@@ -424,7 +486,6 @@ async def save_session(data: dict):
                 "Content-Type": "application/json"
             }
             
-            # Create or update user
             user_data = {
                 "user_id": user_id,
                 "metadata": {
@@ -440,7 +501,6 @@ async def save_session(data: dict):
                 json=user_data
             )
             
-            # Add session with messages
             session_data = {
                 "session_id": call_id,
                 "user_id": user_id,
@@ -456,7 +516,6 @@ async def save_session(data: dict):
                 json=session_data
             )
             
-            # Add the conversation transcript as memory
             if transcript:
                 memory_data = {
                     "messages": [
