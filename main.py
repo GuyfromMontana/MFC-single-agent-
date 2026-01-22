@@ -2,6 +2,7 @@
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
 Updated: Direct HTTP API calls to Zep Cloud (no SDK dependency issues)
 Added: Individual function endpoints for Retell AI
+Fixed: Transcript extraction from correct location and save on call_ended
 """
 
 import os
@@ -324,6 +325,7 @@ async def save_call_to_zep_enhanced(
             result = await zep_add_messages(thread_id, zep_messages)
             
             if result:
+                logger.info(f"Successfully saved {len(zep_messages)} messages to Zep for call {call_id}")
                 return {
                     "success": True,
                     "thread_id": thread_id,
@@ -455,16 +457,22 @@ async def retell_webhook(request: Request):
     """
     try:
         body = await request.json()
-        logger.info(f"Webhook received: {body.get('event', 'unknown')}")
-        logger.info(f"Full body: {json.dumps(body, indent=2)}")
+        event_type = body.get("event", "unknown")
+        logger.info(f"Webhook received: {event_type}")
         
         # Extract key data
-        call_id = body.get("call", {}).get("call_id", "unknown")
-        phone = body.get("call", {}).get("from_number", "")
-        transcript = body.get("transcript", [])
+        call_data = body.get("call", {})
+        call_id = call_data.get("call_id", "unknown")
+        phone = call_data.get("from_number", "")
         
-        # MEMORY LOOKUP - Check if caller has conversation history
-        memory_data = await lookup_caller_in_zep(phone)
+        # Extract transcript from correct location (only present in call_ended event)
+        transcript = call_data.get("transcript_object", [])
+        
+        # MEMORY LOOKUP - Check if caller has conversation history (only on call_started)
+        memory_data = {"caller_name": "Caller", "conversation_history": ""}
+        if event_type == "call_started":
+            memory_data = await lookup_caller_in_zep(phone)
+        
         caller_name = memory_data.get("caller_name", "Caller")
         conversation_history = memory_data.get("conversation_history", "")
         
@@ -504,8 +512,9 @@ async def retell_webhook(request: Request):
                 success = capture_lead(name, phone, location, interests)
                 response_data["lead_captured"] = success
         
-        # SAVE TO MEMORY - Save this call transcript to Zep
-        if transcript and len(transcript) > 0:
+        # SAVE TO MEMORY - Only on call_ended event when transcript is available
+        if event_type == "call_ended" and transcript and len(transcript) > 0:
+            logger.info(f"Saving transcript with {len(transcript)} messages to Zep for call {call_id}")
             save_result = await save_call_to_zep_enhanced(
                 phone=phone,
                 transcript=transcript,
@@ -513,6 +522,10 @@ async def retell_webhook(request: Request):
                 caller_name=caller_name
             )
             response_data["memory_saved"] = save_result.get("success", False)
+            if save_result.get("success"):
+                logger.info(f"Memory saved successfully for call {call_id}")
+            else:
+                logger.warning(f"Memory save failed for call {call_id}: {save_result.get('message')}")
         
         return JSONResponse(content=response_data)
         
