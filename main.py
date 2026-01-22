@@ -1,7 +1,7 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
 Updated: Direct HTTP API calls to Zep Cloud (no SDK dependency issues)
-Fixed: Specialist lookup, Zep message batching, enhanced logging
+Fixed: Name extraction from leads table, message batching, specialist lookup
 """
 
 import os
@@ -190,12 +190,47 @@ async def zep_get_user_context(thread_id: str) -> Optional[Dict]:
 
 
 # ============================================================================
+# CALLER NAME LOOKUP
+# ============================================================================
+
+def get_caller_name_from_leads(phone: str) -> Optional[str]:
+    """
+    Look up caller name from leads table by phone number.
+    Returns the full name if found, None otherwise.
+    """
+    try:
+        result = supabase.table("leads") \
+            .select("first_name, last_name") \
+            .eq("phone", phone) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        if result.data and len(result.data) > 0:
+            lead = result.data[0]
+            first_name = lead.get("first_name", "").strip()
+            last_name = lead.get("last_name", "").strip()
+            
+            if first_name:
+                full_name = f"{first_name} {last_name}".strip() if last_name else first_name
+                logger.info(f"Found caller name in leads: {full_name}")
+                return full_name
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error looking up name in leads: {e}")
+        return None
+
+
+# ============================================================================
 # MEMORY FUNCTIONS (Using HTTP API)
 # ============================================================================
 
 async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
     """
     Look up caller's past conversations in Zep Cloud using direct HTTP API.
+    Also checks leads table for caller name.
     
     Returns:
         {
@@ -210,10 +245,14 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
         # 1. Create user_id from phone number
         user_id = f"caller_{phone.replace('+', '').replace(' ', '')}"
         
-        # 2. Ensure user exists in Zep
-        await zep_create_user(user_id, phone)
+        # 2. Check leads table for caller name FIRST
+        caller_name = get_caller_name_from_leads(phone) or "Caller"
+        logger.info(f"Initial caller_name from leads: {caller_name}")
         
-        # 3. Get recent threads for this user
+        # 3. Ensure user exists in Zep
+        await zep_create_user(user_id, phone, first_name=caller_name)
+        
+        # 4. Get recent threads for this user
         threads = await zep_get_user_threads(user_id, limit=5)
         
         if not threads:
@@ -221,30 +260,23 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
             return {
                 "found": False,
                 "user_id": user_id,
-                "caller_name": "Caller",
+                "caller_name": caller_name,
                 "conversation_history": "",
                 "message": "New caller - no conversation history"
             }
         
-        # 4. Get messages from most recent thread
+        # 5. Get messages from most recent thread
         latest_thread = threads[0]
         thread_id = latest_thread.get("thread_id")
         
         messages = await zep_get_thread_messages(thread_id, limit=10)
         
-        # 5. Format conversation history
+        # 6. Format conversation history
         conversation_lines = []
-        caller_name = "Caller"
         
         for msg in messages:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
-            name = msg.get("name", "")
-            
-            # Extract caller's name if present
-            if role == "user" and name and name != "Caller":
-                caller_name = name
-                logger.info(f"Extracted caller name: {caller_name}")
             
             # Format message
             speaker = "Customer" if role == "user" else "Agent"
@@ -265,10 +297,11 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Error in lookup_caller_in_zep: {e}", exc_info=True)
+        caller_name = get_caller_name_from_leads(phone) or "Caller"
         return {
             "found": False,
             "user_id": f"caller_{phone}",
-            "caller_name": "Caller",
+            "caller_name": caller_name,
             "conversation_history": "",
             "message": f"Error: {str(e)}"
         }
@@ -388,41 +421,42 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         
         town_name = town_name.strip()
         
-        # Use PostgreSQL array overlap operator via raw SQL
-        # This searches if the counties array contains the town name (case-insensitive)
-        result = supabase.rpc(
-            'find_specialist_by_county',
-            {'county_name': town_name}
-        ).execute()
-        
-        # Fallback: try direct query with contains operator
-        if not result.data or len(result.data) == 0:
-            logger.info(f"Trying direct query for: {town_name}")
-            result = supabase.table("specialists") \
-                .select("first_name, last_name, phone, counties") \
-                .eq("is_active", True) \
-                .execute()
+        # Try RPC function first
+        try:
+            result = supabase.rpc(
+                'find_specialist_by_county',
+                {'county_name': town_name}
+            ).execute()
             
-            # Filter in Python (case-insensitive search in counties array)
-            if result.data:
-                for specialist in result.data:
-                    counties = specialist.get("counties", []) or []
-                    if any(town_name.lower() in county.lower() for county in counties):
-                        full_name = f"{specialist.get('first_name', '')} {specialist.get('last_name', '')}".strip()
-                        logger.info(f"Found specialist: {full_name} for {town_name}")
-                        return {
-                            "specialist_name": full_name,
-                            "specialist_phone": specialist.get("phone", "")
-                        }
+            if result.data and len(result.data) > 0:
+                specialist = result.data[0]
+                full_name = f"{specialist.get('first_name', '')} {specialist.get('last_name', '')}".strip()
+                logger.info(f"Found specialist via RPC: {full_name} for {town_name}")
+                return {
+                    "specialist_name": full_name,
+                    "specialist_phone": specialist.get("phone", "")
+                }
+        except Exception as rpc_error:
+            logger.warning(f"RPC function not available, using fallback: {rpc_error}")
         
-        elif result.data and len(result.data) > 0:
-            specialist = result.data[0]
-            full_name = f"{specialist.get('first_name', '')} {specialist.get('last_name', '')}".strip()
-            logger.info(f"Found specialist via RPC: {full_name} for {town_name}")
-            return {
-                "specialist_name": full_name,
-                "specialist_phone": specialist.get("phone", "")
-            }
+        # Fallback: try direct query
+        logger.info(f"Trying direct query for: {town_name}")
+        result = supabase.table("specialists") \
+            .select("first_name, last_name, phone, counties") \
+            .eq("is_active", True) \
+            .execute()
+        
+        # Filter in Python (case-insensitive search in counties array)
+        if result.data:
+            for specialist in result.data:
+                counties = specialist.get("counties", []) or []
+                if any(town_name.lower() in county.lower() for county in counties):
+                    full_name = f"{specialist.get('first_name', '')} {specialist.get('last_name', '')}".strip()
+                    logger.info(f"Found specialist: {full_name} for {town_name}")
+                    return {
+                        "specialist_name": full_name,
+                        "specialist_phone": specialist.get("phone", "")
+                    }
         
         logger.info(f"No specialist found for: {town_name}")
         return None
@@ -497,6 +531,7 @@ def capture_lead(name: str, phone: str, location: str, interests: str) -> bool:
         }
         
         result = supabase.table("leads").insert(data).execute()
+        logger.info(f"Lead captured: {first_name} {last_name} - {phone}")
         return bool(result.data)
         
     except Exception as e:
@@ -905,3 +940,15 @@ async def get_caller_history(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+**Key changes:**
+1. ✅ **Line 200-225**: New `get_caller_name_from_leads()` function
+2. ✅ **Line 233-287**: Updated `lookup_caller_in_zep()` to check leads first for name
+3. ✅ **Line 568**: Added logging for lead capture
+
+Now **save, push, and make one more test call**. The logs should show:
+```
+INFO:main:Found caller name in leads: [Your Name]
+INFO:main:Initial caller_name from leads: [Your Name]
+INFO:main:Returning caller_name to Retell: [Your Name]
