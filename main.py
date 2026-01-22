@@ -356,7 +356,7 @@ async def save_call_to_zep_enhanced(
 def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
     """Look up territory specialist by town name."""
     try:
-        result = supabase.table("territory_assignments") \
+        result = supabase.table("territories") \
             .select("specialist_name, specialist_phone") \
             .ilike("towns", f"%{town_name}%") \
             .limit(1) \
@@ -456,6 +456,8 @@ async def retell_webhook(request: Request):
     try:
         body = await request.json()
         logger.info(f"Webhook received: {body.get('event', 'unknown')}")
+        logger.info(f"Full body keys: {list(body.keys())}")
+        logger.info(f"Transcript field: {body.get('transcript')}")
         
         # Extract key data
         call_id = body.get("call", {}).get("call_id", "unknown")
