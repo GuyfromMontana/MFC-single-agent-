@@ -941,14 +941,5 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
 ```
-
-**Key changes:**
-1. ✅ **Line 200-225**: New `get_caller_name_from_leads()` function
-2. ✅ **Line 233-287**: Updated `lookup_caller_in_zep()` to check leads first for name
-3. ✅ **Line 568**: Added logging for lead capture
-
-Now **save, push, and make one more test call**. The logs should show:
-```
-INFO:main:Found caller name in leads: [Your Name]
-INFO:main:Initial caller_name from leads: [Your Name]
 INFO:main:Returning caller_name to Retell: [Your Name]
+
