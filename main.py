@@ -933,13 +933,6 @@ async def get_caller_history(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to retrieve caller history"})
 
 
-# ============================================================================
-# APPLICATION STARTUP
-# ============================================================================
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-INFO:main:Returning caller_name to Retell: [Your Name]
-
