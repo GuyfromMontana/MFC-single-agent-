@@ -456,8 +456,7 @@ async def retell_webhook(request: Request):
     try:
         body = await request.json()
         logger.info(f"Webhook received: {body.get('event', 'unknown')}")
-        logger.info(f"Full body keys: {list(body.keys())}")
-        logger.info(f"Transcript field: {body.get('transcript')}")
+        logger.info(f"Full body: {json.dumps(body, indent=2)}")
         
         # Extract key data
         call_id = body.get("call", {}).get("call_id", "unknown")
