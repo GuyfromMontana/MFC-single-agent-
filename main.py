@@ -1,12 +1,13 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
 Updated: Direct HTTP API calls to Zep Cloud (no SDK dependency issues)
-Fixed: Name extraction from leads table, message batching, specialist lookup
+Fixed: Automatic name extraction from transcripts, Zep user updates
 """
 
 import os
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 
@@ -51,7 +52,7 @@ ZEP_HEADERS = {
 # ============================================================================
 
 async def zep_create_user(user_id: str, phone: str, first_name: str = "Caller") -> Optional[Dict]:
-    """Create or update a Zep user via direct HTTP call."""
+    """Create a Zep user via direct HTTP call."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
@@ -65,13 +66,63 @@ async def zep_create_user(user_id: str, phone: str, first_name: str = "Caller") 
             )
             
             if response.status_code in [200, 201]:
+                logger.info(f"Created Zep user: {user_id} with name: {first_name}")
                 return response.json()
+            elif response.status_code == 400 and "already exists" in response.text:
+                # User exists - this is fine
+                logger.info(f"Zep user already exists: {user_id}")
+                return {"user_id": user_id, "exists": True}
             else:
                 logger.warning(f"Zep user creation returned {response.status_code}: {response.text}")
                 return None
                 
     except Exception as e:
         logger.error(f"Error creating Zep user: {e}")
+        return None
+
+
+async def zep_update_user(user_id: str, first_name: str, metadata: Dict = None) -> Optional[Dict]:
+    """Update an existing Zep user via direct HTTP PATCH call."""
+    try:
+        update_data = {"first_name": first_name}
+        if metadata:
+            update_data["metadata"] = metadata
+            
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.patch(
+                f"{ZEP_BASE_URL}/users/{user_id}",
+                headers=ZEP_HEADERS,
+                json=update_data
+            )
+            
+            if response.status_code in [200, 201]:
+                logger.info(f"Updated Zep user {user_id} with name: {first_name}")
+                return response.json()
+            else:
+                logger.warning(f"Zep user update returned {response.status_code}: {response.text}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error updating Zep user: {e}")
+        return None
+
+
+async def zep_get_user(user_id: str) -> Optional[Dict]:
+    """Get a Zep user's details via direct HTTP call."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{ZEP_BASE_URL}/users/{user_id}",
+                headers=ZEP_HEADERS
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error getting Zep user: {e}")
         return None
 
 
@@ -190,6 +241,57 @@ async def zep_get_user_context(thread_id: str) -> Optional[Dict]:
 
 
 # ============================================================================
+# NAME EXTRACTION FROM TRANSCRIPT
+# ============================================================================
+
+def extract_name_from_transcript(transcript: List[Dict]) -> Optional[str]:
+    """
+    Extract caller's name from conversation transcript.
+    Looks for common patterns like "My name is...", "I'm...", "This is..."
+    
+    Returns the extracted name or None if not found.
+    """
+    if not transcript:
+        return None
+    
+    # Common name introduction patterns
+    name_patterns = [
+        # "My name is John Smith"
+        r"(?:my name is|my name's)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+        # "I'm John Smith" or "I am John Smith"
+        r"(?:I'm|I am)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+        # "This is John Smith calling"
+        r"(?:this is|it's)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*(?:calling|here)?",
+        # "Call me John"
+        r"(?:call me|just call me)\s+([A-Z][a-z]+)",
+        # "John Smith here"
+        r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+here",
+        # "It's John" or "Hey, it's John"
+        r"(?:hey,?\s+)?it'?s\s+([A-Z][a-z]+)",
+    ]
+    
+    # Only look at user messages (first few messages are most likely to have intro)
+    user_messages = [
+        msg.get("content", "") 
+        for msg in transcript[:10]  # Check first 10 messages
+        if msg.get("role") == "user" and msg.get("content")
+    ]
+    
+    for message in user_messages:
+        for pattern in name_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Validate it looks like a name (not common words)
+                skip_words = ["good", "fine", "great", "well", "here", "calling", "looking", "interested", "wondering"]
+                if name.lower() not in skip_words and len(name) >= 2:
+                    logger.info(f"Extracted name from transcript: {name}")
+                    return name.title()  # Capitalize properly
+    
+    return None
+
+
+# ============================================================================
 # CALLER NAME LOOKUP
 # ============================================================================
 
@@ -211,7 +313,8 @@ def get_caller_name_from_leads(phone: str) -> Optional[str]:
             first_name = lead.get("first_name", "").strip()
             last_name = lead.get("last_name", "").strip()
             
-            if first_name:
+            # Skip if it's just "Unknown" or empty
+            if first_name and first_name.lower() != "unknown":
                 full_name = f"{first_name} {last_name}".strip() if last_name else first_name
                 logger.info(f"Found caller name in leads: {full_name}")
                 return full_name
@@ -221,6 +324,53 @@ def get_caller_name_from_leads(phone: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Error looking up name in leads: {e}")
         return None
+
+
+def update_lead_with_name(phone: str, first_name: str, last_name: str = "") -> bool:
+    """
+    Update or create a lead record with the caller's name.
+    """
+    try:
+        # Check if lead exists
+        existing = supabase.table("leads") \
+            .select("id, first_name") \
+            .eq("phone", phone) \
+            .limit(1) \
+            .execute()
+        
+        if existing.data and len(existing.data) > 0:
+            # Update existing lead if name was unknown
+            lead = existing.data[0]
+            if not lead.get("first_name") or lead.get("first_name", "").lower() == "unknown":
+                supabase.table("leads") \
+                    .update({
+                        "first_name": first_name,
+                        "last_name": last_name,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }) \
+                    .eq("id", lead["id"]) \
+                    .execute()
+                logger.info(f"Updated lead {phone} with name: {first_name} {last_name}")
+                return True
+        else:
+            # Create new lead
+            supabase.table("leads").insert({
+                "first_name": first_name,
+                "last_name": last_name,
+                "phone": phone,
+                "lead_source": "retell_call",
+                "lead_status": "new",
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }).execute()
+            logger.info(f"Created new lead for {phone}: {first_name} {last_name}")
+            return True
+            
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error updating lead with name: {e}")
+        return False
 
 
 # ============================================================================
@@ -246,13 +396,27 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
         user_id = f"caller_{phone.replace('+', '').replace(' ', '')}"
         
         # 2. Check leads table for caller name FIRST
-        caller_name = get_caller_name_from_leads(phone) or "Caller"
-        logger.info(f"Initial caller_name from leads: {caller_name}")
+        caller_name = get_caller_name_from_leads(phone)
         
-        # 3. Ensure user exists in Zep
-        await zep_create_user(user_id, phone, first_name=caller_name)
+        # 3. If not in leads, check Zep user record
+        if not caller_name:
+            zep_user = await zep_get_user(user_id)
+            if zep_user and zep_user.get("first_name"):
+                zep_name = zep_user.get("first_name", "")
+                if zep_name and zep_name.lower() not in ["caller", "unknown", ""]:
+                    caller_name = zep_name
+                    logger.info(f"Found caller name in Zep: {caller_name}")
         
-        # 4. Get recent threads for this user
+        # 4. Default to None if still no name (will show as new caller)
+        if not caller_name:
+            caller_name = None
+            
+        logger.info(f"Initial caller_name: {caller_name or 'Not found'}")
+        
+        # 5. Ensure user exists in Zep
+        await zep_create_user(user_id, phone, first_name=caller_name or "Caller")
+        
+        # 6. Get recent threads for this user
         threads = await zep_get_user_threads(user_id, limit=5)
         
         if not threads:
@@ -265,13 +429,13 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
                 "message": "New caller - no conversation history"
             }
         
-        # 5. Get messages from most recent thread
+        # 7. Get messages from most recent thread
         latest_thread = threads[0]
         thread_id = latest_thread.get("thread_id")
         
         messages = await zep_get_thread_messages(thread_id, limit=10)
         
-        # 6. Format conversation history
+        # 8. Format conversation history
         conversation_lines = []
         
         for msg in messages:
@@ -297,7 +461,7 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Error in lookup_caller_in_zep: {e}", exc_info=True)
-        caller_name = get_caller_name_from_leads(phone) or "Caller"
+        caller_name = get_caller_name_from_leads(phone)
         return {
             "found": False,
             "user_id": f"caller_{phone}",
@@ -311,17 +475,18 @@ async def save_call_to_zep_enhanced(
     phone: str,
     transcript: List[Dict],
     call_id: str,
-    caller_name: str = "Caller"
+    caller_name: str = None
 ) -> Dict[str, Any]:
     """
     Save call transcript to Zep Cloud using direct HTTP API.
     Handles Zep's 30-message limit by batching.
+    Also extracts and saves caller name if found in transcript.
     
     Args:
         phone: Caller's phone number
         transcript: List of transcript entries with role and content
         call_id: Unique call identifier
-        caller_name: Name of the caller
+        caller_name: Name of the caller (if already known)
     
     Returns:
         Status dict with success/failure info
@@ -330,14 +495,33 @@ async def save_call_to_zep_enhanced(
         # 1. Create user_id
         user_id = f"caller_{phone.replace('+', '').replace(' ', '')}"
         
-        # 2. Ensure user exists
-        await zep_create_user(user_id, phone, first_name=caller_name)
+        # 2. Try to extract name from transcript if not already known
+        extracted_name = None
+        if not caller_name or caller_name.lower() in ["caller", "unknown"]:
+            extracted_name = extract_name_from_transcript(transcript)
+            if extracted_name:
+                logger.info(f"Extracted name from conversation: {extracted_name}")
+                caller_name = extracted_name
         
-        # 3. Create thread for this call
+        # 3. If we found a name, update both Zep and leads table
+        if caller_name and caller_name.lower() not in ["caller", "unknown"]:
+            # Update Zep user
+            await zep_update_user(user_id, first_name=caller_name)
+            
+            # Update leads table
+            name_parts = caller_name.split(None, 1)
+            first_name = name_parts[0] if name_parts else caller_name
+            last_name = name_parts[1] if len(name_parts) > 1 else ""
+            update_lead_with_name(phone, first_name, last_name)
+        else:
+            # Ensure user exists even without name
+            await zep_create_user(user_id, phone, first_name="Caller")
+        
+        # 4. Create thread for this call
         thread_id = f"call_{call_id}"
         await zep_create_thread(thread_id, user_id)
         
-        # 4. Format messages for Zep
+        # 5. Format messages for Zep
         zep_messages = []
         for entry in transcript:
             role = entry.get("role", "user")
@@ -348,7 +532,7 @@ async def save_call_to_zep_enhanced(
             
             # Map Retell roles to Zep roles
             zep_role = "user" if role == "user" else "assistant"
-            message_name = caller_name if role == "user" else "Montana Feed Agent"
+            message_name = caller_name if role == "user" and caller_name else ("Caller" if role == "user" else "Montana Feed Agent")
             
             zep_messages.append({
                 "role": zep_role,
@@ -361,7 +545,7 @@ async def save_call_to_zep_enhanced(
                 }
             })
         
-        # 5. Add messages to thread in batches of 30 (Zep's limit)
+        # 6. Add messages to thread in batches of 30 (Zep's limit)
         if zep_messages:
             batch_size = 30
             total_saved = 0
@@ -382,6 +566,7 @@ async def save_call_to_zep_enhanced(
                     "success": True,
                     "thread_id": thread_id,
                     "message_count": total_saved,
+                    "extracted_name": extracted_name,
                     "message": f"Saved {total_saved} messages to Zep"
                 }
             else:
@@ -551,6 +736,8 @@ async def health_check():
         "service": "montana-feed-retell-webhook",
         "memory_enabled": bool(ZEP_API_KEY),
         "knowledge_base_enabled": bool(OPENAI_API_KEY),
+        "version": "2.1.0",
+        "features": ["auto_name_extraction", "zep_user_update"],
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -575,18 +762,22 @@ async def retell_webhook(request: Request):
         transcript = call_data.get("transcript_object", [])
         
         # MEMORY LOOKUP - Check if caller has conversation history (only on call_started)
-        memory_data = {"caller_name": "Caller", "conversation_history": ""}
+        memory_data = {"caller_name": None, "conversation_history": ""}
         if event_type == "call_started":
             memory_data = await lookup_caller_in_zep(phone)
-            logger.info(f"Returning caller_name to Retell: {memory_data.get('caller_name')}")
+            caller_name = memory_data.get("caller_name")
+            if caller_name:
+                logger.info(f"Returning caller_name to Retell: {caller_name}")
+            else:
+                logger.info("No caller name found - new caller")
         
-        caller_name = memory_data.get("caller_name", "Caller")
+        caller_name = memory_data.get("caller_name")
         conversation_history = memory_data.get("conversation_history", "")
         
         # Build response data
         response_data = {
             "call_id": call_id,
-            "caller_name": caller_name,
+            "caller_name": caller_name,  # Will be None if not found
             "conversation_history": conversation_history,
             "response_id": 1
         }
@@ -629,6 +820,9 @@ async def retell_webhook(request: Request):
                 caller_name=caller_name
             )
             response_data["memory_saved"] = save_result.get("success", False)
+            if save_result.get("extracted_name"):
+                response_data["extracted_name"] = save_result.get("extracted_name")
+                logger.info(f"Name extracted and saved: {save_result.get('extracted_name')}")
             if save_result.get("success"):
                 logger.info(f"Memory saved successfully for call {call_id}")
             else:
@@ -653,21 +847,24 @@ async def test_memory(request: Request):
         
         lookup_result = await lookup_caller_in_zep(phone)
         
+        # Test transcript with name introduction
         test_transcript = [
-            {"role": "user", "content": "Hello, I need feed for my cattle."},
-            {"role": "agent", "content": "I'd be happy to help. What type of cattle?"}
+            {"role": "user", "content": "Hello, my name is John Smith. I need feed for my cattle."},
+            {"role": "agent", "content": "Hi John! I'd be happy to help. What type of cattle do you have?"},
+            {"role": "user", "content": "I have about 200 head of Angus."}
         ]
         
         save_result = await save_call_to_zep_enhanced(
             phone=phone,
             transcript=test_transcript,
             call_id="test_" + datetime.utcnow().strftime("%Y%m%d%H%M%S"),
-            caller_name="Test Caller"
+            caller_name=None  # Force extraction
         )
         
         return {
             "lookup_test": lookup_result,
             "save_test": save_result,
+            "name_extraction_test": save_result.get("extracted_name"),
             "status": "Memory integration working"
         }
         
@@ -925,7 +1122,7 @@ async def get_caller_history(request: Request):
         
         return JSONResponse(content={
             "result": result,
-            "caller_name": memory_data.get("caller_name", "Caller"),
+            "caller_name": memory_data.get("caller_name"),
             "success": True
         })
     except Exception as e:
