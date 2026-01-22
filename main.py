@@ -1,8 +1,7 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
 Updated: Direct HTTP API calls to Zep Cloud (no SDK dependency issues)
-Added: Individual function endpoints for Retell AI
-Fixed: Correct Supabase schema mappings
+Fixed: Specialist lookup, Zep message batching, enhanced logging
 """
 
 import os
@@ -29,15 +28,15 @@ app = FastAPI(title="Montana Feed Retell Webhook")
 # Environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-ZEP_API_KEY = os.getenv("ZEP_API_KEY", "").strip()  # Strip whitespace/newlines
+ZEP_API_KEY = os.getenv("ZEP_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Initialize clients with timeout settings
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client = OpenAI(
     api_key=OPENAI_API_KEY,
-    timeout=5.0,  # 5 second timeout for all OpenAI requests
-    max_retries=1  # Only retry once
+    timeout=5.0,
+    max_retries=1
 )
 
 # Zep Cloud REST API configuration
@@ -218,6 +217,7 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
         threads = await zep_get_user_threads(user_id, limit=5)
         
         if not threads:
+            logger.info(f"No past threads found for {user_id}")
             return {
                 "found": False,
                 "user_id": user_id,
@@ -242,8 +242,9 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
             name = msg.get("name", "")
             
             # Extract caller's name if present
-            if role == "user" and name:
+            if role == "user" and name and name != "Caller":
                 caller_name = name
+                logger.info(f"Extracted caller name: {caller_name}")
             
             # Format message
             speaker = "Customer" if role == "user" else "Agent"
@@ -251,6 +252,8 @@ async def lookup_caller_in_zep(phone: str) -> Dict[str, Any]:
                 conversation_lines.append(f"{speaker}: {content}")
         
         conversation_text = "\n".join(conversation_lines[-5:])  # Last 5 exchanges
+        
+        logger.info(f"Memory lookup complete: caller_name={caller_name}, found {len(messages)} messages")
         
         return {
             "found": True,
@@ -279,6 +282,7 @@ async def save_call_to_zep_enhanced(
 ) -> Dict[str, Any]:
     """
     Save call transcript to Zep Cloud using direct HTTP API.
+    Handles Zep's 30-message limit by batching.
     
     Args:
         phone: Caller's phone number
@@ -324,17 +328,28 @@ async def save_call_to_zep_enhanced(
                 }
             })
         
-        # 5. Add messages to thread
+        # 5. Add messages to thread in batches of 30 (Zep's limit)
         if zep_messages:
-            result = await zep_add_messages(thread_id, zep_messages)
+            batch_size = 30
+            total_saved = 0
             
-            if result:
-                logger.info(f"Successfully saved {len(zep_messages)} messages to Zep for call {call_id}")
+            for i in range(0, len(zep_messages), batch_size):
+                batch = zep_messages[i:i + batch_size]
+                logger.info(f"Saving batch {i//batch_size + 1}: {len(batch)} messages")
+                result = await zep_add_messages(thread_id, batch)
+                
+                if result:
+                    total_saved += len(batch)
+                else:
+                    logger.error(f"Failed to save batch {i//batch_size + 1}")
+            
+            if total_saved > 0:
+                logger.info(f"Successfully saved {total_saved} messages to Zep for call {call_id}")
                 return {
                     "success": True,
                     "thread_id": thread_id,
-                    "message_count": len(zep_messages),
-                    "message": f"Saved {len(zep_messages)} messages to Zep"
+                    "message_count": total_saved,
+                    "message": f"Saved {total_saved} messages to Zep"
                 }
             else:
                 return {
@@ -356,7 +371,7 @@ async def save_call_to_zep_enhanced(
 
 
 # ============================================================================
-# SPECIALIST LOOKUP (FIXED FOR ACTUAL SCHEMA)
+# SPECIALIST LOOKUP (FIXED FOR ARRAY SEARCH)
 # ============================================================================
 
 def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
@@ -365,23 +380,53 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
     Searches the specialists table's counties array.
     """
     try:
-        # Search specialists where counties array contains the town name
-        result = supabase.table("specialists") \
-            .select("first_name, last_name, phone") \
-            .filter("counties", "cs", f'{{{town_name}}}') \
-            .eq("is_active", True) \
-            .limit(1) \
-            .execute()
+        logger.info(f"Looking up specialist for town: '{town_name}'")
         
-        if result.data and len(result.data) > 0:
+        if not town_name or town_name.strip() == "":
+            logger.warning("Empty town name provided to lookup_specialist_by_town")
+            return None
+        
+        town_name = town_name.strip()
+        
+        # Use PostgreSQL array overlap operator via raw SQL
+        # This searches if the counties array contains the town name (case-insensitive)
+        result = supabase.rpc(
+            'find_specialist_by_county',
+            {'county_name': town_name}
+        ).execute()
+        
+        # Fallback: try direct query with contains operator
+        if not result.data or len(result.data) == 0:
+            logger.info(f"Trying direct query for: {town_name}")
+            result = supabase.table("specialists") \
+                .select("first_name, last_name, phone, counties") \
+                .eq("is_active", True) \
+                .execute()
+            
+            # Filter in Python (case-insensitive search in counties array)
+            if result.data:
+                for specialist in result.data:
+                    counties = specialist.get("counties", []) or []
+                    if any(town_name.lower() in county.lower() for county in counties):
+                        full_name = f"{specialist.get('first_name', '')} {specialist.get('last_name', '')}".strip()
+                        logger.info(f"Found specialist: {full_name} for {town_name}")
+                        return {
+                            "specialist_name": full_name,
+                            "specialist_phone": specialist.get("phone", "")
+                        }
+        
+        elif result.data and len(result.data) > 0:
             specialist = result.data[0]
-            # Combine first and last name
             full_name = f"{specialist.get('first_name', '')} {specialist.get('last_name', '')}".strip()
+            logger.info(f"Found specialist via RPC: {full_name} for {town_name}")
             return {
                 "specialist_name": full_name,
                 "specialist_phone": specialist.get("phone", "")
             }
+        
+        logger.info(f"No specialist found for: {town_name}")
         return None
+        
     except Exception as e:
         logger.error(f"Error looking up specialist: {e}")
         return None
@@ -421,7 +466,6 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
         
     except Exception as e:
         logger.error(f"Knowledge base search error: {e}")
-        # Return a helpful fallback message instead of error
         return "I'll connect you with one of our specialists who can help with your specific question. They'll have the most up-to-date information on feed recommendations."
 
 
@@ -436,7 +480,7 @@ def capture_lead(name: str, phone: str, location: str, interests: str) -> bool:
     """
     try:
         # Split name into first and last
-        name_parts = name.strip().split(None, 1)  # Split on first space
+        name_parts = name.strip().split(None, 1)
         first_name = name_parts[0] if name_parts else "Unknown"
         last_name = name_parts[1] if len(name_parts) > 1 else ""
         
@@ -492,13 +536,14 @@ async def retell_webhook(request: Request):
         call_id = call_data.get("call_id", "unknown")
         phone = call_data.get("from_number", "")
         
-        # Extract transcript from correct location (only present in call_ended event)
+        # Extract transcript from correct location
         transcript = call_data.get("transcript_object", [])
         
         # MEMORY LOOKUP - Check if caller has conversation history (only on call_started)
         memory_data = {"caller_name": "Caller", "conversation_history": ""}
         if event_type == "call_started":
             memory_data = await lookup_caller_in_zep(phone)
+            logger.info(f"Returning caller_name to Retell: {memory_data.get('caller_name')}")
         
         caller_name = memory_data.get("caller_name", "Caller")
         conversation_history = memory_data.get("conversation_history", "")
@@ -571,10 +616,8 @@ async def test_memory(request: Request):
         body = await request.json()
         phone = body.get("phone", "+14065551234")
         
-        # Test lookup
         lookup_result = await lookup_caller_in_zep(phone)
         
-        # Test save (with dummy data)
         test_transcript = [
             {"role": "user", "content": "Hello, I need feed for my cattle."},
             {"role": "agent", "content": "I'd be happy to help. What type of cattle?"}
@@ -602,7 +645,7 @@ async def test_memory(request: Request):
 
 
 # ============================================================================
-# RETELL FUNCTION ENDPOINTS (Individual URLs)
+# RETELL FUNCTION ENDPOINTS
 # ============================================================================
 
 @app.post("/retell/functions/get_warehouse")
@@ -613,7 +656,6 @@ async def get_warehouse(request: Request):
         arguments = body.get("arguments", {})
         location = arguments.get("location", "")
         
-        # TODO: Add actual warehouse lookup logic
         return JSONResponse(content={
             "result": f"Warehouse lookup for {location} - contact main office at 406-555-0100 for details",
             "success": True
@@ -645,8 +687,14 @@ async def lookup_town(request: Request):
     """Look up specialist by town name."""
     try:
         body = await request.json()
+        logger.info(f"lookup_town called with body: {json.dumps(body)}")
+        
         arguments = body.get("arguments", {})
-        town = arguments.get("town", "")
+        logger.info(f"Arguments: {json.dumps(arguments)}")
+        
+        # Try different possible argument names
+        town = arguments.get("town", "") or arguments.get("location", "") or arguments.get("city", "")
+        logger.info(f"Extracted town: '{town}'")
         
         specialist = lookup_specialist_by_town(town)
         
@@ -672,7 +720,6 @@ async def schedule_callback(request: Request):
         callback_time = arguments.get("callback_time", "")
         notes = arguments.get("notes", "")
         
-        # Save as lead with callback info
         success = capture_lead(name, phone_num, "callback", f"Callback: {callback_time} - {notes}")
         
         if success:
