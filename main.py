@@ -49,8 +49,8 @@ async def zep_create_user(user_id: str, phone: str, first_name: str = "Caller") 
     """Create or update a Zep user via direct HTTP call."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.put(
-                f"{ZEP_BASE_URL}/users/{user_id}",
+            response = await client.post(
+                f"{ZEP_BASE_URL}/users",
                 headers=ZEP_HEADERS,
                 json={
                     "user_id": user_id,
