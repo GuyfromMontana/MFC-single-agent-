@@ -2,7 +2,7 @@
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
 Updated: Direct HTTP API calls to Zep Cloud (no SDK dependency issues)
 Added: Individual function endpoints for Retell AI
-Fixed: Transcript extraction and latency optimization
+Fixed: Correct Supabase schema mappings
 """
 
 import os
@@ -356,20 +356,31 @@ async def save_call_to_zep_enhanced(
 
 
 # ============================================================================
-# SPECIALIST LOOKUP
+# SPECIALIST LOOKUP (FIXED FOR ACTUAL SCHEMA)
 # ============================================================================
 
 def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
-    """Look up territory specialist by town name."""
+    """
+    Look up specialist by town/county name.
+    Searches the specialists table's counties array.
+    """
     try:
-        result = supabase.table("territories") \
-            .select("specialist_name, specialist_phone") \
-            .ilike("towns", f"%{town_name}%") \
+        # Search specialists where counties array contains the town name
+        result = supabase.table("specialists") \
+            .select("first_name, last_name, phone") \
+            .filter("counties", "cs", f'{{{town_name}}}') \
+            .eq("is_active", True) \
             .limit(1) \
             .execute()
         
         if result.data and len(result.data) > 0:
-            return result.data[0]
+            specialist = result.data[0]
+            # Combine first and last name
+            full_name = f"{specialist.get('first_name', '')} {specialist.get('last_name', '')}".strip()
+            return {
+                "specialist_name": full_name,
+                "specialist_phone": specialist.get("phone", "")
+            }
         return None
     except Exception as e:
         logger.error(f"Error looking up specialist: {e}")
@@ -415,19 +426,30 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
 
 
 # ============================================================================
-# LEAD CAPTURE
+# LEAD CAPTURE (FIXED FOR ACTUAL SCHEMA)
 # ============================================================================
 
 def capture_lead(name: str, phone: str, location: str, interests: str) -> bool:
-    """Capture lead information."""
+    """
+    Capture lead information using correct schema.
+    Maps simple inputs to comprehensive leads table.
+    """
     try:
+        # Split name into first and last
+        name_parts = name.strip().split(None, 1)  # Split on first space
+        first_name = name_parts[0] if name_parts else "Unknown"
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
+        
         data = {
-            "name": name,
+            "first_name": first_name,
+            "last_name": last_name,
             "phone": phone,
-            "location": location,
-            "interests": interests,
-            "source": "retell_call",
-            "created_at": datetime.utcnow().isoformat()
+            "city": location,
+            "primary_interest": interests,
+            "lead_source": "retell_call",
+            "lead_status": "new",
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
         }
         
         result = supabase.table("leads").insert(data).execute()
