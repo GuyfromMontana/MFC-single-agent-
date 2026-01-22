@@ -1,6 +1,7 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
 Updated: Direct HTTP API calls to Zep Cloud (no SDK dependency issues)
+Added: Individual function endpoints for Retell AI
 """
 
 import os
@@ -349,7 +350,7 @@ async def save_call_to_zep_enhanced(
 
 
 # ============================================================================
-# SPECIALIST LOOKUP (Unchanged)
+# SPECIALIST LOOKUP
 # ============================================================================
 
 def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
@@ -370,7 +371,7 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
 
 
 # ============================================================================
-# KNOWLEDGE BASE SEARCH (Unchanged)
+# KNOWLEDGE BASE SEARCH
 # ============================================================================
 
 def search_knowledge_base(query: str, top_k: int = 3) -> str:
@@ -407,7 +408,7 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
 
 
 # ============================================================================
-# LEAD CAPTURE (Unchanged)
+# LEAD CAPTURE
 # ============================================================================
 
 def capture_lead(name: str, phone: str, location: str, interests: str) -> bool:
@@ -557,6 +558,256 @@ async def test_memory(request: Request):
             status_code=500,
             content={"error": str(e)}
         )
+
+
+# ============================================================================
+# RETELL FUNCTION ENDPOINTS (Individual URLs)
+# ============================================================================
+
+@app.post("/retell/functions/get_warehouse")
+async def get_warehouse(request: Request):
+    """Get warehouse information by location."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        location = arguments.get("location", "")
+        
+        # TODO: Add actual warehouse lookup logic
+        return JSONResponse(content={
+            "result": f"Warehouse lookup for {location} - contact main office at 406-555-0100 for details",
+            "success": True
+        })
+    except Exception as e:
+        logger.error(f"get_warehouse error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to get warehouse info"})
+
+
+@app.post("/retell/functions/transfer_call_tool")
+async def transfer_call_tool(request: Request):
+    """Handle call transfer requests."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        transfer_to = arguments.get("transfer_to", "")
+        
+        return JSONResponse(content={
+            "result": f"Transferring you to {transfer_to} now. Please hold.",
+            "success": True
+        })
+    except Exception as e:
+        logger.error(f"transfer_call_tool error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to transfer call"})
+
+
+@app.post("/retell/functions/lookup_town")
+async def lookup_town(request: Request):
+    """Look up specialist by town name."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        town = arguments.get("town", "")
+        
+        specialist = lookup_specialist_by_town(town)
+        
+        if specialist:
+            result = f"{specialist['specialist_name']} handles {town}. You can reach them at {specialist['specialist_phone']}."
+        else:
+            result = f"We don't have a specialist assigned to {town} yet. Please contact our main office at 406-555-0100."
+        
+        return JSONResponse(content={"result": result, "success": True})
+    except Exception as e:
+        logger.error(f"lookup_town error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to look up specialist"})
+
+
+@app.post("/retell/functions/schedule_callback")
+async def schedule_callback(request: Request):
+    """Schedule a callback."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        name = arguments.get("name", "")
+        phone_num = arguments.get("phone", body.get("call", {}).get("from_number", ""))
+        callback_time = arguments.get("callback_time", "")
+        notes = arguments.get("notes", "")
+        
+        # Save as lead with callback info
+        success = capture_lead(name, phone_num, "callback", f"Callback: {callback_time} - {notes}")
+        
+        if success:
+            result = f"Perfect, {name}. I've scheduled a callback for {callback_time}. Someone will call you at {phone_num}."
+        else:
+            result = f"I've noted your callback request for {callback_time}, but there was an issue saving it. Please call back if you don't hear from us."
+        
+        return JSONResponse(content={"result": result, "success": success})
+    except Exception as e:
+        logger.error(f"schedule_callback error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to schedule callback"})
+
+
+@app.post("/retell/functions/create_lead")
+async def create_lead_endpoint(request: Request):
+    """Capture lead information."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        name = arguments.get("name", "")
+        phone_num = arguments.get("phone", body.get("call", {}).get("from_number", ""))
+        location = arguments.get("location", "")
+        interests = arguments.get("interests", "")
+        
+        success = capture_lead(name, phone_num, location, interests)
+        
+        if success:
+            result = f"Thank you, {name}. I've saved your contact information and someone from our team will reach out to you soon."
+        else:
+            result = "I've noted your information. If you don't hear from us, please call back."
+        
+        return JSONResponse(content={"result": result, "success": success})
+    except Exception as e:
+        logger.error(f"create_lead error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to save contact info"})
+
+
+@app.post("/retell/functions/query_knowledge")
+async def query_knowledge(request: Request):
+    """Search knowledge base."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        query = arguments.get("query", "")
+        
+        results = search_knowledge_base(query, top_k=3)
+        
+        return JSONResponse(content={"result": results, "success": True})
+    except Exception as e:
+        logger.error(f"query_knowledge error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to search knowledge base"})
+
+
+@app.post("/retell/functions/query_mfc_knowledge")
+async def query_mfc_knowledge(request: Request):
+    """Search MFC-specific knowledge."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        query = arguments.get("query", "")
+        
+        results = search_knowledge_base(query, top_k=3)
+        
+        return JSONResponse(content={"result": results, "success": True})
+    except Exception as e:
+        logger.error(f"query_mfc_knowledge error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to search knowledge base"})
+
+
+@app.post("/retell/functions/search_products")
+async def search_products(request: Request):
+    """Search for product information."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        query = arguments.get("query", "")
+        
+        results = search_knowledge_base(f"products {query}", top_k=3)
+        
+        return JSONResponse(content={"result": results, "success": True})
+    except Exception as e:
+        logger.error(f"search_products error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to search products"})
+
+
+@app.post("/retell/functions/get_recommendations")
+async def get_recommendations(request: Request):
+    """Get feed recommendations."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        query = arguments.get("query", "")
+        animal_type = arguments.get("animal_type", "cattle")
+        
+        search_query = f"{animal_type} {query}" if animal_type else query
+        results = search_knowledge_base(search_query, top_k=3)
+        
+        return JSONResponse(content={"result": results, "success": True})
+    except Exception as e:
+        logger.error(f"get_recommendations error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to get recommendations"})
+
+
+@app.post("/retell/functions/end_call")
+async def end_call(request: Request):
+    """Handle call ending."""
+    try:
+        return JSONResponse(content={
+            "result": "Thank you for calling Montana Feed Company. Have a great day!",
+            "success": True
+        })
+    except Exception as e:
+        logger.error(f"end_call error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Goodbye"})
+
+
+@app.post("/retell/functions/lookup_staff")
+async def lookup_staff(request: Request):
+    """Look up staff member by location."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        location = arguments.get("location", "")
+        
+        specialist = lookup_specialist_by_town(location)
+        
+        if specialist:
+            result = f"For {location}, your specialist is {specialist['specialist_name']}. You can reach them at {specialist['specialist_phone']}."
+        else:
+            result = f"I don't have a staff member assigned to {location}. Let me connect you with our main office."
+        
+        return JSONResponse(content={"result": result, "success": True})
+    except Exception as e:
+        logger.error(f"lookup_staff error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to look up staff"})
+
+
+@app.post("/retell/functions/search_knowledge_base")
+async def search_knowledge_base_endpoint(request: Request):
+    """Search knowledge base."""
+    try:
+        body = await request.json()
+        arguments = body.get("arguments", {})
+        query = arguments.get("query", "")
+        
+        results = search_knowledge_base(query, top_k=3)
+        
+        return JSONResponse(content={"result": results, "success": True})
+    except Exception as e:
+        logger.error(f"search_knowledge_base error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to search knowledge base"})
+
+
+@app.post("/retell/functions/get_caller_history")
+async def get_caller_history(request: Request):
+    """Get caller's conversation history."""
+    try:
+        body = await request.json()
+        phone = body.get("call", {}).get("from_number", "")
+        
+        memory_data = await lookup_caller_in_zep(phone)
+        
+        history = memory_data.get("conversation_history", "")
+        if history:
+            result = f"Based on our previous conversations: {history}"
+        else:
+            result = "I don't see any previous conversations in our system."
+        
+        return JSONResponse(content={
+            "result": result,
+            "caller_name": memory_data.get("caller_name", "Caller"),
+            "success": True
+        })
+    except Exception as e:
+        logger.error(f"get_caller_history error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "result": "Unable to retrieve caller history"})
 
 
 # ============================================================================
