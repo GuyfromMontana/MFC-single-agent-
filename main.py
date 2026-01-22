@@ -37,7 +37,7 @@ openai.api_key = OPENAI_API_KEY
 # Zep Cloud REST API configuration
 ZEP_BASE_URL = "https://api.getzep.com/api/v2"
 ZEP_HEADERS = {
-    "Api-Key": ZEP_API_KEY,
+    "Authorization": f"Api-Key {ZEP_API_KEY}",
     "Content-Type": "application/json"
 }
 
