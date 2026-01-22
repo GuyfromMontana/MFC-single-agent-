@@ -27,7 +27,7 @@ app = FastAPI(title="Montana Feed Retell Webhook")
 # Environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-ZEP_API_KEY = os.getenv("ZEP_API_KEY")
+ZEP_API_KEY = os.getenv("ZEP_API_KEY", "").strip()  # Strip whitespace/newlines
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Initialize clients
