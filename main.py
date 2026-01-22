@@ -2,7 +2,7 @@
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
 Updated: Direct HTTP API calls to Zep Cloud (no SDK dependency issues)
 Added: Individual function endpoints for Retell AI
-Fixed: Transcript extraction from correct location and save on call_ended
+Fixed: Transcript extraction and latency optimization
 """
 
 import os
@@ -15,7 +15,7 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from supabase import create_client, Client
-import openai
+from openai import OpenAI
 
 # ============================================================================
 # CONFIGURATION
@@ -32,9 +32,13 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ZEP_API_KEY = os.getenv("ZEP_API_KEY", "").strip()  # Strip whitespace/newlines
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Initialize clients
+# Initialize clients with timeout settings
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-openai.api_key = OPENAI_API_KEY
+openai_client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=5.0,  # 5 second timeout for all OpenAI requests
+    max_retries=1  # Only retry once
+)
 
 # Zep Cloud REST API configuration
 ZEP_BASE_URL = "https://api.getzep.com/api/v2"
@@ -373,14 +377,14 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
 
 
 # ============================================================================
-# KNOWLEDGE BASE SEARCH
+# KNOWLEDGE BASE SEARCH (OPTIMIZED)
 # ============================================================================
 
 def search_knowledge_base(query: str, top_k: int = 3) -> str:
-    """Search knowledge base using semantic similarity."""
+    """Search knowledge base using semantic similarity with optimized performance."""
     try:
-        # Generate embedding for query
-        response = openai.embeddings.create(
+        # Generate embedding for query with short timeout
+        response = openai_client.embeddings.create(
             model="text-embedding-3-small",
             input=query
         )
@@ -402,11 +406,12 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
                 contexts.append(f"• {item['content']}")
             return "\n".join(contexts)
         
-        return "No relevant information found."
+        return "No relevant information found in our knowledge base."
         
     except Exception as e:
         logger.error(f"Knowledge base search error: {e}")
-        return "Knowledge base temporarily unavailable."
+        # Return a helpful fallback message instead of error
+        return "I'll connect you with one of our specialists who can help with your specific question. They'll have the most up-to-date information on feed recommendations."
 
 
 # ============================================================================
