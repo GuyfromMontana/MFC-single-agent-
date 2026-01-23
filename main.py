@@ -192,7 +192,6 @@ def extract_name_from_transcript(transcript: List[Dict]) -> Optional[str]:
                     continue
                 if len(name) < 2 or len(name) > 40:
                     continue
-                # Allow all-lowercase names from ASR transcripts
                 if not any(c.isalpha() for c in name):
                     continue
                 
@@ -283,7 +282,6 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
     try:
         user_id = f"caller_{normalize_phone(phone)}"
         
-        # Check Zep user only (skip Supabase to reduce latency)
         zep_user = await zep_get_user(user_id)
         
         caller_name = None
@@ -324,7 +322,6 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
     try:
         user_id = f"caller_{normalize_phone(phone)}"
         
-        # Try to extract name if not known
         extracted_name = None
         if not caller_name or caller_name.lower() in ["caller", "unknown", "new caller"]:
             extracted_name = extract_name_from_transcript(transcript)
@@ -332,7 +329,6 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
                 logger.info(f"Extracted name: {extracted_name}")
                 caller_name = extracted_name
         
-        # Update user and leads if we have a good name
         if caller_name and caller_name.lower() not in ["caller", "unknown", "new caller"]:
             await zep_create_or_update_user(user_id, phone, first_name=caller_name)
             name_parts = caller_name.split(None, 1)
@@ -342,11 +338,9 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
         else:
             await zep_create_or_update_user(user_id, phone, first_name="Caller")
         
-        # Create thread and save messages
         thread_id = f"call_{call_id}"
         await zep_create_thread(thread_id, user_id)
         
-        # Format messages
         zep_messages = []
         for entry in transcript:
             role = entry.get("role", "user")
@@ -364,7 +358,6 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
                 "metadata": {"call_id": call_id, "phone": phone}
             })
         
-        # Save in batches
         if zep_messages:
             batch_size = 30
             total_saved = 0
@@ -401,7 +394,6 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         town_name = town_name.strip()
         logger.info(f"Looking up specialist for: {town_name}")
         
-        # Try RPC first
         try:
             result = supabase.rpc('find_specialist_by_county', {'county_name': town_name}).execute()
             if result.data and len(result.data) > 0:
@@ -413,7 +405,6 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         except Exception:
             pass
         
-        # Fallback
         result = supabase.table("specialists") \
             .select("first_name, last_name, phone, counties") \
             .eq("is_active", True) \
@@ -452,7 +443,6 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
         ).execute()
         
         if result.data:
-            # Truncate to prevent token bloat
             return "\n".join([f"• {item['content'][:500]}" for item in result.data])
         
         return "No relevant information found."
@@ -513,11 +503,7 @@ async def health_check():
 
 @app.post("/retell-inbound-webhook")
 async def retell_inbound_webhook(request: Request):
-    """
-    Inbound webhook - called when phone number receives a call BEFORE agent starts.
-    This is configured in Phone Number settings, NOT agent settings.
-    Docs: https://docs.retellai.com/features/inbound-webhook
-    """
+    """Inbound webhook for phone number - sets dynamic variables before call starts."""
     try:
         body = await request.json()
         event = body.get("event")
@@ -531,25 +517,23 @@ async def retell_inbound_webhook(request: Request):
             to_number = call_inbound.get("to_number", "")
             agent_id = call_inbound.get("agent_id", "")
             
-            logger.info(f"Inbound call: {from_number} → {to_number} (agent: {agent_id})")
+            logger.info(f"Inbound call: {from_number} to {to_number} (agent: {agent_id})")
             
             if not from_number:
                 logger.warning("No from_number - returning empty response")
                 return JSONResponse(content={"call_inbound": {}})
             
-            # Ultra-fast lookup (Zep only)
             memory_data = await lookup_caller_fast(from_number)
             caller_name = memory_data.get("caller_name")
             
-            logger.info(f"[INBOUND] Caller lookup result: {caller_name or 'New caller'}")
+            logger.info(f"[INBOUND] Caller: {caller_name or 'New caller'}")
             
-            # Build response in Retell's expected format
             response = {
                 "call_inbound": {
                     "dynamic_variables": {
                         "caller_name": caller_name if caller_name else "New caller",
                         "is_returning": "true" if caller_name else "false",
-                        "conversation_history": memory_data.get("conversation_history", "") or ""
+                        "conversation_history": ""
                     }
                 }
             }
@@ -558,7 +542,6 @@ async def retell_inbound_webhook(request: Request):
             return JSONResponse(content=response)
         
         elif event == "chat_inbound":
-            # Handle SMS if you add that later
             chat_inbound = body.get("chat_inbound", {})
             logger.info(f"SMS inbound from: {chat_inbound.get('from_number', '')}")
             return JSONResponse(content={"chat_inbound": {}})
@@ -574,25 +557,19 @@ async def retell_inbound_webhook(request: Request):
 
 @app.post("/retell-webhook")
 async def retell_webhook(request: Request):
-    """
-    Agent Level Webhook - for analytics/logging only.
-    This receives call_started, call_ended, call_analyzed events.
-    This does NOT set dynamic variables (use inbound webhook for that).
-    """
+    """Agent Level Webhook - for analytics and function calls only."""
     try:
         body = await request.json()
         event_type = body.get("event", "unknown")
-        logger.info(f"Agent webhook received: {event_type}")
+        logger.info(f"Agent webhook: {event_type}")
         
         call_data = body.get("call", {})
         call_id = call_data.get("call_id", "unknown")
         phone = call_data.get("from_number", "")
         transcript = call_data.get("transcript_object", [])
         
-        # Build response
         response_data = {"call_id": call_id, "response_id": 1}
         
-        # Handle function calls
         function_call = body.get("function_call")
         if function_call:
             func_name = function_call.get("name")
@@ -609,21 +586,18 @@ async def retell_webhook(request: Request):
                 success = capture_lead(args.get("name", ""), phone, args.get("location", ""), args.get("interests", ""))
                 response_data["lead_captured"] = success
         
-        # SAVE TO MEMORY on call_ended
         if event_type == "call_ended" and transcript and phone:
             logger.info(f"Saving {len(transcript)} messages to Zep")
             
-            # Get caller_name from Retell's payload or re-lookup
             caller_name = body.get("retell_llm_dynamic_variables", {}).get("caller_name")
             if not caller_name or caller_name == "New caller":
-                # Fallback: quick re-lookup
                 memory_data = await lookup_caller_fast(phone)
                 caller_name = memory_data.get("caller_name")
             
             save_result = await save_call_to_zep(phone, transcript, call_id, caller_name)
             response_data["memory_saved"] = save_result.get("success", False)
             if save_result.get("extracted_name"):
-                logger.info(f"Name extracted and saved: {save_result['extracted_name']}")
+                logger.info(f"Name extracted: {save_result['extracted_name']}")
         
         return JSONResponse(content=response_data)
         
@@ -633,12 +607,12 @@ async def retell_webhook(request: Request):
 
 
 # ============================================================================
-# UTILITY ENDPOINT - FIX BAD ZEP DATA
+# UTILITY ENDPOINT
 # ============================================================================
 
 @app.post("/fix-zep-user")
 async def fix_zep_user(request: Request):
-    """Fix bad Zep user data. POST with {"phone": "+14062402889", "name": "Guy Hanson"}"""
+    """Fix Zep user data."""
     try:
         body = await request.json()
         phone = body.get("phone", "")
@@ -724,7 +698,6 @@ async def create_lead_endpoint(request: Request):
 
 @app.post("/retell/functions/search_knowledge_base")
 async def search_knowledge_base_endpoint(request: Request):
-    """Main knowledge search - consolidates multiple similar functions."""
     try:
         body = await request.json()
         query = body.get("arguments", {}).get("query", "")
@@ -758,30 +731,3 @@ async def lookup_staff(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-
-## What Changed in v2.4.1
-
-1. **Added `/retell-inbound-webhook` endpoint** - This is the key new webhook that will inject dynamic variables
-2. **Improved logging** - Better tracking of inbound webhook calls
-3. **Documented webhook purposes** - Clear comments about which webhook does what
-
-## Deployment Steps
-
-1. **Save this as your main.py**
-2. **Commit in GitHub Desktop**: "v2.4.1 - Add inbound webhook handler"
-3. **Push to GitHub**
-4. **Wait 30 seconds for Railway deployment**
-5. **Go to Retell Dashboard → Phone Numbers → +1(406)510-2925**
-6. **Check the box**: "☐ Add an inbound webhook"
-7. **Enter URL**: `https://mfc-single-agent-production.up.railway.app/retell-inbound-webhook`
-8. **Save**
-9. **Call your number and test!**
-
-You should see logs like:
-```
-INFO:main:=== INBOUND WEBHOOK ===
-INFO:main:Event: call_inbound
-INFO:main:Inbound call: +14062402889 → +14065102925
-INFO:main:[INBOUND] Caller lookup result: Guy Hanson
-INFO:main:[INBOUND] Returning caller_name: Guy Hanson
