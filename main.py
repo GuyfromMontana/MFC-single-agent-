@@ -1,6 +1,6 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 2.3.0 - Fixed dynamic_variables format for Retell
+Version 2.3.1 - Fixed retell_llm_dynamic_variables format for Retell
 """
 
 import os
@@ -474,7 +474,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "memory_enabled": bool(ZEP_API_KEY),
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -496,22 +496,22 @@ async def retell_webhook(request: Request):
         # Build response
         response_data = {"call_id": call_id, "response_id": 1}
         
-        # FAST LOOKUP on call_started - Return in dynamic_variables format for Retell
+        # FAST LOOKUP on call_started - Return in retell_llm_dynamic_variables format for Retell
         if event_type == "call_started":
             memory_data = await lookup_caller_fast(phone)
             caller_name = memory_data.get("caller_name")
             
-            # Retell requires dynamic_variables wrapper
-            response_data["dynamic_variables"] = {
+            # Retell requires retell_llm_dynamic_variables wrapper with all string values
+            response_data["retell_llm_dynamic_variables"] = {
                 "caller_name": caller_name if caller_name else "New caller",
-                "conversation_history": memory_data.get("conversation_history", ""),
+                "conversation_history": memory_data.get("conversation_history", "") or "",
                 "is_returning": "true" if caller_name else "false"
             }
             
             if caller_name:
-                logger.info(f"Returning dynamic_variables.caller_name: {caller_name}")
+                logger.info(f"Returning retell_llm_dynamic_variables.caller_name: {caller_name}")
             else:
-                logger.info("New caller - returning 'New caller' in dynamic_variables")
+                logger.info("New caller - returning 'New caller' in retell_llm_dynamic_variables")
         
         # Handle function calls
         function_call = body.get("function_call")
@@ -533,10 +533,10 @@ async def retell_webhook(request: Request):
         # SAVE TO MEMORY on call_ended
         if event_type == "call_ended" and transcript:
             logger.info(f"Saving {len(transcript)} messages to Zep")
-            # Get caller_name from dynamic_variables if we set it earlier
+            # Get caller_name from retell_llm_dynamic_variables if we set it earlier
             caller_name = None
-            if "dynamic_variables" in response_data:
-                dv_name = response_data["dynamic_variables"].get("caller_name")
+            if "retell_llm_dynamic_variables" in response_data:
+                dv_name = response_data["retell_llm_dynamic_variables"].get("caller_name")
                 if dv_name and dv_name != "New caller":
                     caller_name = dv_name
             
