@@ -97,7 +97,6 @@ async def zep_create_or_update_user(user_id: str, phone: str, first_name: str = 
                 logger.info(f"Created Zep user: {user_id} with name: {first_name}")
                 return response.json()
             elif response.status_code == 400 and "already exists" in response.text:
-                # User exists, update them
                 update_data = {"first_name": first_name}
                 if metadata:
                     update_data["metadata"] = metadata
@@ -216,7 +215,6 @@ def extract_location_from_transcript(transcript: List[Dict]) -> Optional[str]:
     if not transcript:
         return None
     
-    # Montana towns/cities to look for
     montana_locations = [
         "polson", "missoula", "billings", "bozeman", "kalispell", "helena", 
         "great falls", "butte", "havre", "miles city", "livingston", "whitefish",
@@ -236,14 +234,12 @@ def extract_location_from_transcript(transcript: List[Dict]) -> Optional[str]:
     ]
     
     for message in user_messages:
-        # First check for known Montana locations (case insensitive)
         message_lower = message.lower()
         for location in montana_locations:
             if location in message_lower:
                 logger.info(f"Found Montana location in transcript: {location.title()}")
                 return location.title()
         
-        # Then try regex patterns
         for pattern in location_patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
@@ -336,7 +332,6 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
     try:
         user_id = f"caller_{normalize_phone(phone)}"
         
-        # Get user data from Zep
         zep_user = await zep_get_user(user_id)
         
         caller_name = None
@@ -345,14 +340,12 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
         conversation_context = ""
         
         if zep_user:
-            # Get name
             zep_name = zep_user.get("first_name", "")
             if zep_name and zep_name.lower() not in ["caller", "unknown", "wondering", ""]:
                 if not any(word in zep_name.lower() for word in ["wondering", "looking", "thinking", "calling"]):
                     caller_name = zep_name
                     logger.info(f"[MEMORY] Name: {caller_name}")
             
-            # Get metadata (location, specialist, etc.)
             metadata = zep_user.get("metadata", {})
             if metadata and isinstance(metadata, dict):
                 caller_location = metadata.get("location") or metadata.get("city") or metadata.get("town")
@@ -363,7 +356,6 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
                 if caller_specialist:
                     logger.info(f"[MEMORY] Specialist: {caller_specialist}")
                 
-                # Build conversation context
                 context_parts = []
                 if caller_location:
                     context_parts.append(f"Location: {caller_location}")
@@ -412,7 +404,6 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
     try:
         user_id = f"caller_{normalize_phone(phone)}"
         
-        # Extract name if not known
         extracted_name = None
         if not caller_name or caller_name.lower() in ["caller", "unknown", "new caller"]:
             extracted_name = extract_name_from_transcript(transcript)
@@ -420,16 +411,13 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
                 logger.info(f"Extracted name: {extracted_name}")
                 caller_name = extracted_name
         
-        # Extract location from transcript
         extracted_location = extract_location_from_transcript(transcript)
         
-        # Build metadata
         metadata = {"phone": phone}
         if extracted_location:
             metadata["location"] = extracted_location
             logger.info(f"Extracted location: {extracted_location}")
         
-        # Update user with name and metadata
         if caller_name and caller_name.lower() not in ["caller", "unknown", "new caller"]:
             await zep_create_or_update_user(user_id, phone, first_name=caller_name, metadata=metadata)
             
@@ -440,11 +428,9 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
         else:
             await zep_create_or_update_user(user_id, phone, first_name="Caller", metadata=metadata)
         
-        # Create thread and save messages
         thread_id = f"call_{call_id}"
         await zep_create_thread(thread_id, user_id)
         
-        # Format messages
         zep_messages = []
         for entry in transcript:
             role = entry.get("role", "user")
@@ -462,7 +448,6 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
                 "metadata": {"call_id": call_id, "phone": phone}
             })
         
-        # Save in batches
         if zep_messages:
             batch_size = 30
             total_saved = 0
@@ -505,7 +490,6 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         town_name = town_name.strip()
         logger.info(f"[SPECIALIST] Looking up: '{town_name}'")
         
-        # Try RPC first
         try:
             result = supabase.rpc('find_specialist_by_county', {'county_name': town_name}).execute()
             if result.data and len(result.data) > 0:
@@ -519,7 +503,6 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         except Exception as e:
             logger.warning(f"[SPECIALIST] RPC failed: {e}")
         
-        # Fallback
         result = supabase.table("specialists") \
             .select("first_name, last_name, phone, counties") \
             .eq("is_active", True) \
@@ -641,30 +624,25 @@ async def retell_inbound_webhook(request: Request):
                 logger.warning("No from_number - returning empty")
                 return JSONResponse(content={"call_inbound": {}})
             
-            # Get full memory context
             memory_data = await lookup_caller_fast(from_number)
             caller_name = memory_data.get("caller_name")
             caller_location = memory_data.get("caller_location")
             caller_specialist = memory_data.get("caller_specialist")
             conversation_history = memory_data.get("conversation_history", "")
             
-            # Build dynamic variables with all available context
             dynamic_vars = {
                 "caller_name": caller_name if caller_name else "New caller",
                 "is_returning": "true" if caller_name else "false",
             }
             
-            # Add location if known
             if caller_location:
                 dynamic_vars["caller_location"] = caller_location
                 logger.info(f"[INBOUND] Including location: {caller_location}")
             
-            # Add specialist if known
             if caller_specialist:
                 dynamic_vars["caller_specialist"] = caller_specialist
                 logger.info(f"[INBOUND] Including specialist: {caller_specialist}")
             
-            # Add conversation context
             if conversation_history:
                 dynamic_vars["conversation_history"] = conversation_history
                 logger.info(f"[INBOUND] Including context: {conversation_history[:100]}")
@@ -707,7 +685,6 @@ async def retell_webhook(request: Request):
         
         response_data = {"call_id": call_id, "response_id": 1}
         
-        # Handle function calls
         function_call = body.get("function_call")
         if function_call:
             func_name = function_call.get("name")
@@ -726,11 +703,9 @@ async def retell_webhook(request: Request):
                 success = capture_lead(args.get("name", ""), phone, args.get("location", ""), args.get("interests", ""))
                 response_data["lead_captured"] = success
         
-        # Save to memory on call_ended
         if event_type == "call_ended" and transcript and phone:
             logger.info(f"[SAVE] Saving {len(transcript)} messages to Zep")
             
-            # Get caller_name from dynamic variables
             caller_name = body.get("retell_llm_dynamic_variables", {}).get("caller_name")
             if not caller_name or caller_name == "New caller":
                 memory_data = await lookup_caller_fast(phone)
@@ -751,13 +726,9 @@ async def retell_webhook(request: Request):
         return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 
-# ============================================================================
-# UTILITY ENDPOINTS
-# ============================================================================
-
 @app.post("/fix-zep-user")
 async def fix_zep_user(request: Request):
-    """Fix Zep user data. POST: {"phone": "+14062402889", "name": "Guy Hanson"}"""
+    """Fix Zep user data."""
     try:
         body = await request.json()
         phone = body.get("phone", "")
@@ -788,7 +759,7 @@ async def fix_zep_user(request: Request):
 
 @app.post("/set-user-location")
 async def set_user_location(request: Request):
-    """Set user location. POST: {"phone": "+14062402889", "location": "Polson"}"""
+    """Set user location."""
     try:
         body = await request.json()
         phone = body.get("phone", "")
@@ -814,10 +785,6 @@ async def set_user_location(request: Request):
     except Exception as e:
         return {"error": str(e)}
 
-
-# ============================================================================
-# RETELL FUNCTION ENDPOINTS
-# ============================================================================
 
 @app.post("/retell/functions/lookup_town")
 async def lookup_town(request: Request):
@@ -911,7 +878,3 @@ async def lookup_staff(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-
-
-
