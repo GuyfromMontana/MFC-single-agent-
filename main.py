@@ -1,6 +1,6 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 2.3.1 - Fixed retell_llm_dynamic_variables format for Retell
+Version 2.4.0 - Optimized for latency + fixed call_ended logic
 """
 
 import os
@@ -31,8 +31,14 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ZEP_API_KEY = os.getenv("ZEP_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Validate critical env vars
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.warning("Supabase not configured; lead features will be limited")
+if not ZEP_API_KEY:
+    logger.warning("Zep not configured; memory features disabled")
+
 # Initialize clients
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=5.0, max_retries=1)
 
 # Zep Cloud REST API configuration
@@ -43,13 +49,23 @@ ZEP_HEADERS = {
 }
 
 # ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def normalize_phone(phone: str) -> str:
+    """Normalize phone number for consistent user IDs."""
+    return phone.replace("+", "").replace(" ", "").replace("-", "")
+
+# ============================================================================
 # ZEP CLOUD HTTP API FUNCTIONS
 # ============================================================================
 
 async def zep_get_user(user_id: str) -> Optional[Dict]:
     """Get a Zep user's details."""
+    if not ZEP_API_KEY:
+        return None
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:  # Reduced from 5.0
             response = await client.get(f"{ZEP_BASE_URL}/users/{user_id}", headers=ZEP_HEADERS)
             if response.status_code == 200:
                 return response.json()
@@ -61,6 +77,8 @@ async def zep_get_user(user_id: str) -> Optional[Dict]:
 
 async def zep_create_or_update_user(user_id: str, phone: str, first_name: str = "Caller") -> Optional[Dict]:
     """Create or update a Zep user."""
+    if not ZEP_API_KEY:
+        return None
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
@@ -91,6 +109,8 @@ async def zep_create_or_update_user(user_id: str, phone: str, first_name: str = 
 
 async def zep_create_thread(thread_id: str, user_id: str) -> Optional[Dict]:
     """Create a new thread."""
+    if not ZEP_API_KEY:
+        return None
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
@@ -108,6 +128,8 @@ async def zep_create_thread(thread_id: str, user_id: str) -> Optional[Dict]:
 
 async def zep_add_messages(thread_id: str, messages: List[Dict]) -> Optional[Dict]:
     """Add messages to a thread."""
+    if not ZEP_API_KEY:
+        return None
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
@@ -170,7 +192,8 @@ def extract_name_from_transcript(transcript: List[Dict]) -> Optional[str]:
                     continue
                 if len(name) < 2 or len(name) > 40:
                     continue
-                if not any(c.isupper() for c in name):
+                # Allow all-lowercase names from ASR transcripts
+                if not any(c.isalpha() for c in name):
                     continue
                 
                 logger.info(f"Extracted name from transcript: {name}")
@@ -185,6 +208,8 @@ def extract_name_from_transcript(transcript: List[Dict]) -> Optional[str]:
 
 def get_caller_name_from_leads(phone: str) -> Optional[str]:
     """Look up caller name from leads table."""
+    if not supabase:
+        return None
     try:
         result = supabase.table("leads") \
             .select("first_name, last_name") \
@@ -208,6 +233,8 @@ def get_caller_name_from_leads(phone: str) -> Optional[str]:
 
 def update_lead_with_name(phone: str, first_name: str, last_name: str = "") -> bool:
     """Update or create a lead record with the caller's name."""
+    if not supabase:
+        return False
     try:
         existing = supabase.table("leads") \
             .select("id, first_name") \
@@ -248,35 +275,27 @@ def update_lead_with_name(phone: str, first_name: str, last_name: str = "") -> b
 
 
 # ============================================================================
-# MEMORY LOOKUP - FAST VERSION
+# MEMORY LOOKUP - ULTRA-FAST VERSION (ZEP ONLY)
 # ============================================================================
 
 async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
-    """FAST caller lookup - minimal HTTP calls."""
+    """ULTRA-FAST caller lookup - Zep only for minimum latency."""
     try:
-        user_id = f"caller_{phone.replace('+', '').replace(' ', '')}"
+        user_id = f"caller_{normalize_phone(phone)}"
         
-        # Check leads first (local DB, fast)
-        leads_name = get_caller_name_from_leads(phone)
-        
-        # Check Zep user
+        # Check Zep user only (skip Supabase to reduce latency)
         zep_user = await zep_get_user(user_id)
         
         caller_name = None
-        
-        # Priority 1: Leads table
-        if leads_name:
-            caller_name = leads_name
-            logger.info(f"Found name in leads: {caller_name}")
-        # Priority 2: Zep user record
-        elif zep_user:
+        if zep_user:
             zep_name = zep_user.get("first_name", "")
             if zep_name and zep_name.lower() not in ["caller", "unknown", "wondering", ""]:
                 if not any(word in zep_name.lower() for word in ["wondering", "looking", "thinking", "calling"]):
                     caller_name = zep_name
                     logger.info(f"Found name in Zep: {caller_name}")
         
-        logger.info(f"Fast lookup complete: caller_name={caller_name or 'New caller'}")
+        if not caller_name:
+            logger.info("New caller - no name found")
         
         return {
             "found": caller_name is not None,
@@ -290,7 +309,7 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
         logger.error(f"Error in lookup_caller_fast: {e}", exc_info=True)
         return {
             "found": False,
-            "user_id": f"caller_{phone.replace('+', '')}",
+            "user_id": f"caller_{normalize_phone(phone)}",
             "caller_name": None,
             "conversation_history": "",
             "message": f"Error: {str(e)}"
@@ -299,8 +318,11 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
 
 async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, caller_name: str = None) -> Dict[str, Any]:
     """Save call transcript to Zep Cloud."""
+    if not ZEP_API_KEY:
+        return {"success": False, "message": "Zep not configured"}
+    
     try:
-        user_id = f"caller_{phone.replace('+', '').replace(' ', '')}"
+        user_id = f"caller_{normalize_phone(phone)}"
         
         # Try to extract name if not known
         extracted_name = None
@@ -370,6 +392,8 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
 
 def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
     """Look up specialist by town/county name."""
+    if not supabase:
+        return None
     try:
         if not town_name or not town_name.strip():
             return None
@@ -416,6 +440,8 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
 
 def search_knowledge_base(query: str, top_k: int = 3) -> str:
     """Search knowledge base using semantic similarity."""
+    if not supabase:
+        return "Knowledge base unavailable."
     try:
         response = openai_client.embeddings.create(model="text-embedding-3-small", input=query)
         query_embedding = response.data[0].embedding
@@ -426,7 +452,8 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
         ).execute()
         
         if result.data:
-            return "\n".join([f"• {item['content']}" for item in result.data])
+            # Truncate to prevent token bloat
+            return "\n".join([f"• {item['content'][:500]}" for item in result.data])
         
         return "No relevant information found."
     except Exception as e:
@@ -440,6 +467,9 @@ def search_knowledge_base(query: str, top_k: int = 3) -> str:
 
 def capture_lead(name: str, phone: str, location: str, interests: str) -> bool:
     """Capture lead information."""
+    if not supabase:
+        logger.warning("Cannot capture lead - Supabase not configured")
+        return False
     try:
         name_parts = name.strip().split(None, 1)
         first_name = name_parts[0] if name_parts else "Unknown"
@@ -474,8 +504,9 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "2.3.1",
+        "version": "2.4.0",
         "memory_enabled": bool(ZEP_API_KEY),
+        "supabase_enabled": supabase is not None,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -493,25 +524,27 @@ async def retell_webhook(request: Request):
         phone = call_data.get("from_number", "")
         transcript = call_data.get("transcript_object", [])
         
+        # Early exit if no phone on call_started
+        if event_type == "call_started" and not phone:
+            logger.warning("call_started without from_number")
+            return JSONResponse(content={"call_id": call_id, "response_id": 1})
+        
         # Build response
         response_data = {"call_id": call_id, "response_id": 1}
         
-        # FAST LOOKUP on call_started - Return in retell_llm_dynamic_variables format for Retell
-        if event_type == "call_started":
+        # ULTRA-FAST LOOKUP on call_started - Zep only
+        if event_type == "call_started" and phone:
             memory_data = await lookup_caller_fast(phone)
             caller_name = memory_data.get("caller_name")
             
-            # Retell requires retell_llm_dynamic_variables wrapper with all string values
+            # Retell requires retell_llm_dynamic_variables with all string values
             response_data["retell_llm_dynamic_variables"] = {
                 "caller_name": caller_name if caller_name else "New caller",
                 "conversation_history": memory_data.get("conversation_history", "") or "",
                 "is_returning": "true" if caller_name else "false"
             }
             
-            if caller_name:
-                logger.info(f"Returning retell_llm_dynamic_variables.caller_name: {caller_name}")
-            else:
-                logger.info("New caller - returning 'New caller' in retell_llm_dynamic_variables")
+            logger.info(f"[FAST] Returning caller_name: {caller_name or 'New caller'} in {response_data.get('lookup_ms', '?')}ms")
         
         # Handle function calls
         function_call = body.get("function_call")
@@ -530,15 +563,16 @@ async def retell_webhook(request: Request):
                 success = capture_lead(args.get("name", ""), phone, args.get("location", ""), args.get("interests", ""))
                 response_data["lead_captured"] = success
         
-        # SAVE TO MEMORY on call_ended
-        if event_type == "call_ended" and transcript:
+        # SAVE TO MEMORY on call_ended - FIX: Re-lookup caller_name properly
+        if event_type == "call_ended" and transcript and phone:
             logger.info(f"Saving {len(transcript)} messages to Zep")
-            # Get caller_name from retell_llm_dynamic_variables if we set it earlier
-            caller_name = None
-            if "retell_llm_dynamic_variables" in response_data:
-                dv_name = response_data["retell_llm_dynamic_variables"].get("caller_name")
-                if dv_name and dv_name != "New caller":
-                    caller_name = dv_name
+            
+            # Get caller_name from Retell's payload or re-lookup
+            caller_name = body.get("retell_llm_dynamic_variables", {}).get("caller_name")
+            if not caller_name or caller_name == "New caller":
+                # Fallback: quick re-lookup
+                memory_data = await lookup_caller_fast(phone)
+                caller_name = memory_data.get("caller_name")
             
             save_result = await save_call_to_zep(phone, transcript, call_id, caller_name)
             response_data["memory_saved"] = save_result.get("success", False)
@@ -549,7 +583,7 @@ async def retell_webhook(request: Request):
         
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 
 # ============================================================================
@@ -567,7 +601,7 @@ async def fix_zep_user(request: Request):
         if not phone or not name:
             return {"error": "Provide phone and name"}
         
-        user_id = f"caller_{phone.replace('+', '').replace(' ', '')}"
+        user_id = f"caller_{normalize_phone(phone)}"
         
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.patch(
@@ -642,42 +676,12 @@ async def create_lead_endpoint(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@app.post("/retell/functions/query_knowledge")
-async def query_knowledge(request: Request):
+@app.post("/retell/functions/search_knowledge_base")
+async def search_knowledge_base_endpoint(request: Request):
+    """Main knowledge search - consolidates multiple similar functions."""
     try:
         body = await request.json()
         query = body.get("arguments", {}).get("query", "")
-        return JSONResponse(content={"result": search_knowledge_base(query), "success": True})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/retell/functions/query_mfc_knowledge")
-async def query_mfc_knowledge(request: Request):
-    try:
-        body = await request.json()
-        query = body.get("arguments", {}).get("query", "")
-        return JSONResponse(content={"result": search_knowledge_base(query), "success": True})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/retell/functions/search_products")
-async def search_products(request: Request):
-    try:
-        body = await request.json()
-        query = body.get("arguments", {}).get("query", "")
-        return JSONResponse(content={"result": search_knowledge_base(f"products {query}"), "success": True})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/retell/functions/get_recommendations")
-async def get_recommendations(request: Request):
-    try:
-        body = await request.json()
-        args = body.get("arguments", {})
-        query = f"{args.get('animal_type', 'cattle')} {args.get('query', '')}"
         return JSONResponse(content={"result": search_knowledge_base(query), "success": True})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -705,53 +709,8 @@ async def lookup_staff(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@app.post("/retell/functions/search_knowledge_base")
-async def search_knowledge_base_endpoint(request: Request):
-    try:
-        body = await request.json()
-        query = body.get("arguments", {}).get("query", "")
-        return JSONResponse(content={"result": search_knowledge_base(query), "success": True})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/retell/functions/get_caller_history")
-async def get_caller_history(request: Request):
-    try:
-        body = await request.json()
-        phone = body.get("call", {}).get("from_number", "")
-        memory_data = await lookup_caller_fast(phone)
-        
-        return JSONResponse(content={
-            "result": f"Caller: {memory_data.get('caller_name', 'Unknown')}",
-            "caller_name": memory_data.get("caller_name"),
-            "success": True
-        })
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/retell/functions/get_warehouse")
-async def get_warehouse(request: Request):
-    try:
-        body = await request.json()
-        location = body.get("arguments", {}).get("location", "")
-        return JSONResponse(content={
-            "result": f"For {location} warehouse info, contact main office at 406-555-0100.",
-            "success": True
-        })
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/retell/functions/transfer_call_tool")
-async def transfer_call_tool(request: Request):
-    try:
-        body = await request.json()
-        transfer_to = body.get("arguments", {}).get("transfer_to", "")
-        return JSONResponse(content={"result": f"Transferring to {transfer_to}.", "success": True})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+# REMOVED: get_caller_history function - redundant with dynamic variables
+# If agent calls this, it means dynamic variables aren't working
 
 
 if __name__ == "__main__":
