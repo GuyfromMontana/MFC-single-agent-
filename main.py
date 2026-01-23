@@ -1,6 +1,6 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 2.4.0 - Optimized for latency + fixed call_ended logic
+Version 2.4.1 - Added inbound webhook for dynamic variables
 """
 
 import os
@@ -65,7 +65,7 @@ async def zep_get_user(user_id: str) -> Optional[Dict]:
     if not ZEP_API_KEY:
         return None
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:  # Reduced from 5.0
+        async with httpx.AsyncClient(timeout=3.0) as client:
             response = await client.get(f"{ZEP_BASE_URL}/users/{user_id}", headers=ZEP_HEADERS)
             if response.status_code == 200:
                 return response.json()
@@ -504,47 +504,93 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "2.4.0",
+        "version": "2.4.1",
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
         "timestamp": datetime.utcnow().isoformat()
     }
 
 
+@app.post("/retell-inbound-webhook")
+async def retell_inbound_webhook(request: Request):
+    """
+    Inbound webhook - called when phone number receives a call BEFORE agent starts.
+    This is configured in Phone Number settings, NOT agent settings.
+    Docs: https://docs.retellai.com/features/inbound-webhook
+    """
+    try:
+        body = await request.json()
+        event = body.get("event")
+        
+        logger.info(f"=== INBOUND WEBHOOK ===")
+        logger.info(f"Event: {event}")
+        
+        if event == "call_inbound":
+            call_inbound = body.get("call_inbound", {})
+            from_number = call_inbound.get("from_number", "")
+            to_number = call_inbound.get("to_number", "")
+            agent_id = call_inbound.get("agent_id", "")
+            
+            logger.info(f"Inbound call: {from_number} → {to_number} (agent: {agent_id})")
+            
+            if not from_number:
+                logger.warning("No from_number - returning empty response")
+                return JSONResponse(content={"call_inbound": {}})
+            
+            # Ultra-fast lookup (Zep only)
+            memory_data = await lookup_caller_fast(from_number)
+            caller_name = memory_data.get("caller_name")
+            
+            logger.info(f"[INBOUND] Caller lookup result: {caller_name or 'New caller'}")
+            
+            # Build response in Retell's expected format
+            response = {
+                "call_inbound": {
+                    "dynamic_variables": {
+                        "caller_name": caller_name if caller_name else "New caller",
+                        "is_returning": "true" if caller_name else "false",
+                        "conversation_history": memory_data.get("conversation_history", "") or ""
+                    }
+                }
+            }
+            
+            logger.info(f"[INBOUND] Returning caller_name: {caller_name or 'New caller'}")
+            return JSONResponse(content=response)
+        
+        elif event == "chat_inbound":
+            # Handle SMS if you add that later
+            chat_inbound = body.get("chat_inbound", {})
+            logger.info(f"SMS inbound from: {chat_inbound.get('from_number', '')}")
+            return JSONResponse(content={"chat_inbound": {}})
+        
+        else:
+            logger.warning(f"Unknown inbound event: {event}")
+            return JSONResponse(content={})
+        
+    except Exception as e:
+        logger.error(f"Inbound webhook error: {e}", exc_info=True)
+        return JSONResponse(content={})
+
+
 @app.post("/retell-webhook")
 async def retell_webhook(request: Request):
-    """Main webhook endpoint for Retell AI."""
+    """
+    Agent Level Webhook - for analytics/logging only.
+    This receives call_started, call_ended, call_analyzed events.
+    This does NOT set dynamic variables (use inbound webhook for that).
+    """
     try:
         body = await request.json()
         event_type = body.get("event", "unknown")
-        logger.info(f"Webhook received: {event_type}")
+        logger.info(f"Agent webhook received: {event_type}")
         
         call_data = body.get("call", {})
         call_id = call_data.get("call_id", "unknown")
         phone = call_data.get("from_number", "")
         transcript = call_data.get("transcript_object", [])
         
-        # Early exit if no phone on call_started
-        if event_type == "call_started" and not phone:
-            logger.warning("call_started without from_number")
-            return JSONResponse(content={"call_id": call_id, "response_id": 1})
-        
         # Build response
         response_data = {"call_id": call_id, "response_id": 1}
-        
-        # ULTRA-FAST LOOKUP on call_started - Zep only
-        if event_type == "call_started" and phone:
-            memory_data = await lookup_caller_fast(phone)
-            caller_name = memory_data.get("caller_name")
-            
-            # Retell requires retell_llm_dynamic_variables with all string values
-            response_data["retell_llm_dynamic_variables"] = {
-                "caller_name": caller_name if caller_name else "New caller",
-                "conversation_history": memory_data.get("conversation_history", "") or "",
-                "is_returning": "true" if caller_name else "false"
-            }
-            
-            logger.info(f"[FAST] Returning caller_name: {caller_name or 'New caller'} in {response_data.get('lookup_ms', '?')}ms")
         
         # Handle function calls
         function_call = body.get("function_call")
@@ -563,7 +609,7 @@ async def retell_webhook(request: Request):
                 success = capture_lead(args.get("name", ""), phone, args.get("location", ""), args.get("interests", ""))
                 response_data["lead_captured"] = success
         
-        # SAVE TO MEMORY on call_ended - FIX: Re-lookup caller_name properly
+        # SAVE TO MEMORY on call_ended
         if event_type == "call_ended" and transcript and phone:
             logger.info(f"Saving {len(transcript)} messages to Zep")
             
@@ -582,7 +628,7 @@ async def retell_webhook(request: Request):
         return JSONResponse(content=response_data)
         
     except Exception as e:
-        logger.error(f"Webhook error: {e}", exc_info=True)
+        logger.error(f"Agent webhook error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 
@@ -709,10 +755,33 @@ async def lookup_staff(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-# REMOVED: get_caller_history function - redundant with dynamic variables
-# If agent calls this, it means dynamic variables aren't working
-
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+## What Changed in v2.4.1
+
+1. **Added `/retell-inbound-webhook` endpoint** - This is the key new webhook that will inject dynamic variables
+2. **Improved logging** - Better tracking of inbound webhook calls
+3. **Documented webhook purposes** - Clear comments about which webhook does what
+
+## Deployment Steps
+
+1. **Save this as your main.py**
+2. **Commit in GitHub Desktop**: "v2.4.1 - Add inbound webhook handler"
+3. **Push to GitHub**
+4. **Wait 30 seconds for Railway deployment**
+5. **Go to Retell Dashboard → Phone Numbers → +1(406)510-2925**
+6. **Check the box**: "☐ Add an inbound webhook"
+7. **Enter URL**: `https://mfc-single-agent-production.up.railway.app/retell-inbound-webhook`
+8. **Save**
+9. **Call your number and test!**
+
+You should see logs like:
+```
+INFO:main:=== INBOUND WEBHOOK ===
+INFO:main:Event: call_inbound
+INFO:main:Inbound call: +14062402889 → +14065102925
+INFO:main:[INBOUND] Caller lookup result: Guy Hanson
+INFO:main:[INBOUND] Returning caller_name: Guy Hanson
