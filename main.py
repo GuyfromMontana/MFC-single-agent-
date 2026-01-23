@@ -913,46 +913,5 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
 ```
 
-## What's New in v2.5.0
 
-### 1. **Full Memory Retrieval**
-- Retrieves location, specialist, and conversation context from Zep
-- Passes ALL known info to agent via dynamic variables
 
-### 2. **Location Extraction**
-- Automatically extracts location from conversation transcripts
-- Looks for Montana towns specifically
-- Saves location to Zep metadata for future calls
-
-### 3. **Better Logging**
-- `[MEMORY]`, `[INBOUND]`, `[SPECIALIST]`, `[FUNCTION]` tags
-- Can trace exactly what data is being retrieved and passed
-
-### 4. **Dynamic Variables Now Include:**
-- `caller_name` - Who they are
-- `caller_location` - Where they're from
-- `caller_specialist` - Who they work with
-- `conversation_history` - Quick context summary
-
-## Deploy & Test
-
-1. **Deploy:**
-```
-   Commit: "v2.5.0 - Full memory retrieval"
-   Push to GitHub
-   Wait for Railway
-```
-
-2. **Test with location set:**
-   First, set your location manually:
-```
-   POST to: https://mfc-single-agent-production.up.railway.app/set-user-location
-   Body: {"phone": "+14062402889", "location": "Polson"}
-```
-
-3. **Call and watch logs:**
-   You should see:
-```
-   [MEMORY] Name: Guy Hanson
-   [MEMORY] Location: Polson
-   [INBOUND] Including location: Polson
