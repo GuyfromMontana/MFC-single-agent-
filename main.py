@@ -556,16 +556,22 @@ async def retell_webhook(request: Request):
         # Build response
         response_data = {"call_id": call_id, "response_id": 1}
         
-        # FAST LOOKUP on call_started
+        # FAST LOOKUP on call_started - Return in dynamic_variables format for Retell
         if event_type == "call_started":
             memory_data = await lookup_caller_fast(phone)
             caller_name = memory_data.get("caller_name")
-            response_data["caller_name"] = caller_name
-            response_data["conversation_history"] = ""
+            
+            # Retell requires dynamic_variables wrapper
+            response_data["dynamic_variables"] = {
+                "caller_name": caller_name if caller_name else "New caller",
+                "conversation_history": memory_data.get("conversation_history", ""),
+                "is_returning": "true" if caller_name else "false"
+            }
+            
             if caller_name:
-                logger.info(f"Returning caller_name: {caller_name}")
+                logger.info(f"Returning dynamic_variables.caller_name: {caller_name}")
             else:
-                logger.info("New caller - no name found")
+                logger.info("New caller - returning 'New caller' in dynamic_variables")
         
         # Handle function calls
         function_call = body.get("function_call")
