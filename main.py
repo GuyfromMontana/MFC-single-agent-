@@ -1,12 +1,9 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 2.6.0 - Optimized with all Priority 1-5 improvements
-Changes:
-- Fixed dynamic variables to always be strings
-- Removed function handling from agent webhook (simplified)
-- Added town→county resolution for Montana
-- Auto-save specialist to Zep metadata
-- Persistent HTTP client for better latency
+Version 3.0.0 - FINAL with Corrected 7 LPS Territories
+- Danielle Peterson retired, Taylor took her territory
+- Isabell covers Western MT (Missoula area)
+- All performance improvements included
 """
 
 import os
@@ -53,7 +50,7 @@ ZEP_HEADERS = {
     "Content-Type": "application/json"
 }
 
-# IMPROVEMENT #5: Global persistent HTTP client for Zep (reduces latency)
+# Persistent HTTP client for Zep (reduces latency)
 _zep_client: Optional[httpx.AsyncClient] = None
 
 @asynccontextmanager
@@ -82,65 +79,169 @@ app = FastAPI(
 )
 
 # ============================================================================
-# IMPROVEMENT #3: MONTANA TOWN → COUNTY RESOLUTION
+# CORRECTED MONTANA TOWN → COUNTY RESOLUTION (7 LPS)
 # ============================================================================
 
 MONTANA_TOWN_TO_COUNTY = {
-    # Lake County
+    # SOUTHWEST MONTANA - Taylor Staudenmeyer (YELLOW + BROWN - took over Danielle's territory)
+    "dillon": "Beaverhead County",
+    "lima": "Beaverhead County",
+    "dell": "Beaverhead County",
+    "wisdom": "Beaverhead County",
+    "jackson": "Beaverhead County",
+    "ennis": "Madison County",
+    "virginia city": "Madison County",
+    "sheridan": "Madison County",
+    "twin bridges": "Madison County",
+    "alder": "Madison County",
+    "boulder": "Jefferson County",
+    "whitehall": "Jefferson County",
+    "butte": "Silver Bow County",
+    "anaconda": "Deer Lodge County",
+    "deer lodge": "Deer Lodge County",
+    "philipsburg": "Granite County",
+    "hamilton": "Ravalli County",
+    "stevensville": "Ravalli County",
+    "darby": "Ravalli County",
+    "victor": "Ravalli County",
+    "corvallis": "Ravalli County",
+    "superior": "Mineral County",
+    "alberton": "Mineral County",
+    
+    # WESTERN MONTANA - Isabell Gilleard (DULL ORANGE)
+    # Missoula, Ravalli, Lake, Flathead
+    "missoula": "Missoula County",
+    "lolo": "Missoula County",
+    "frenchtown": "Missoula County",
+    "bonner": "Missoula County",
+    "clinton": "Missoula County",
+    "seeley lake": "Missoula County",
+    "thompson falls": "Sanders County",
+    "plains": "Sanders County",
+    "hot springs": "Sanders County",
+    "trout creek": "Sanders County",
+    "noxon": "Sanders County",
     "polson": "Lake County",
     "ronan": "Lake County",
     "st ignatius": "Lake County",
     "saint ignatius": "Lake County",
     "charlo": "Lake County",
     "pablo": "Lake County",
-    
-    # Missoula County
-    "missoula": "Missoula County",
-    "lolo": "Missoula County",
-    "frenchtown": "Missoula County",
-    "bonner": "Missoula County",
-    "clinton": "Missoula County",
-    
-    # Flathead County
+    "bigfork": "Lake County",
     "kalispell": "Flathead County",
     "whitefish": "Flathead County",
     "columbia falls": "Flathead County",
-    "bigfork": "Flathead County",
-    
-    # Ravalli County
-    "hamilton": "Ravalli County",
-    "stevensville": "Ravalli County",
-    "darby": "Ravalli County",
-    
-    # Sanders County
-    "thompson falls": "Sanders County",
-    "plains": "Sanders County",
-    "hot springs": "Sanders County",
-    
-    # Lincoln County
+    "lakeside": "Flathead County",
+    "somers": "Flathead County",
     "libby": "Lincoln County",
     "troy": "Lincoln County",
     "eureka": "Lincoln County",
+    "fortine": "Lincoln County",
     
-    # Gallatin County
+    # NORTH-CENTRAL MONTANA - Brady Johnson (DARK GREEN)
+    "great falls": "Cascade County",
+    "belt": "Cascade County",
+    "neihart": "Cascade County",
+    "cascade": "Cascade County",
+    "simms": "Cascade County",
+    "sun river": "Cascade County",
+    "helena": "Lewis and Clark County",
+    "east helena": "Lewis and Clark County",
+    "augusta": "Lewis and Clark County",
+    "lincoln": "Lewis and Clark County",
+    "fort benton": "Chouteau County",
+    "geraldine": "Chouteau County",
+    "choteau": "Teton County",
+    "fairfield": "Teton County",
+    "dutton": "Teton County",
+    "conrad": "Pondera County",
+    "valier": "Pondera County",
+    "cut bank": "Glacier County",
+    "browning": "Glacier County",
+    "shelby": "Toole County",
+    "chester": "Liberty County",
+    
+    # NORTHEAST MONTANA - Austin Buzanowski (RED)
+    "glasgow": "Valley County",
+    "nashua": "Valley County",
+    "malta": "Phillips County",
+    "saco": "Phillips County",
+    "scobey": "Daniels County",
+    "plentywood": "Sheridan County",
+    "wolf point": "Roosevelt County",
+    "poplar": "Roosevelt County",
+    "culbertson": "Roosevelt County",
+    "havre": "Hill County",
+    "chinook": "Blaine County",
+    "harlem": "Blaine County",
+    
+    # CENTRAL MONTANA - Hannah Imer (BLUE)
+    "lewistown": "Fergus County",
+    "roy": "Fergus County",
+    "grass range": "Fergus County",
+    "winifred": "Fergus County",
+    "stanford": "Judith Basin County",
+    "hobson": "Judith Basin County",
+    "geyser": "Judith Basin County",
+    "harlowton": "Wheatland County",
+    "two dot": "Wheatland County",
+    "white sulphur springs": "Meagher County",
+    "martinsdale": "Meagher County",
+    "ryegate": "Golden Valley County",
+    "lavina": "Golden Valley County",
+    "roundup": "Musselshell County",
+    "melstone": "Musselshell County",
+    
+    # SOUTHERN MONTANA/WYOMING - Kaylee Klaahsen (LIGHT GREEN/LIME)
+    "billings": "Yellowstone County",
+    "laurel": "Yellowstone County",
+    "shepherd": "Yellowstone County",
+    "huntley": "Yellowstone County",
+    "columbus": "Stillwater County",
+    "absarokee": "Stillwater County",
+    "nye": "Stillwater County",
+    "big timber": "Sweet Grass County",
+    "greycliff": "Sweet Grass County",
+    "livingston": "Park County",
+    "gardiner": "Park County",
+    "pray": "Park County",
+    "clyde park": "Park County",
+    "red lodge": "Carbon County",
+    "bearcreek": "Carbon County",
+    "bridger": "Carbon County",
     "bozeman": "Gallatin County",
     "belgrade": "Gallatin County",
     "manhattan": "Gallatin County",
+    "three forks": "Gallatin County",
+    "west yellowstone": "Gallatin County",
+    "broadus": "Powder River County",
+    "hardin": "Big Horn County",
+    "crow agency": "Big Horn County",
+    "lodge grass": "Big Horn County",
+    "forsyth": "Rosebud County",
+    "colstrip": "Rosebud County",
+    "hysham": "Treasure County",
+    "miles city": "Custer County",
+    "ismay": "Custer County",
+    "riverton": "Wyoming",
     
-    # Yellowstone County
-    "billings": "Yellowstone County",
-    "laurel": "Yellowstone County",
+    # EASTERN MONTANA - Caitlin Lapicki (PURPLE)
+    "jordan": "Garfield County",
+    "circle": "McCone County",
+    "glendive": "Dawson County",
+    "sidney": "Richland County",
+    "fairview": "Richland County",
+    "savage": "Richland County",
+    "terry": "Prairie County",
+    "wibaux": "Wibaux County",
+    "baker": "Fallon County",
+    "plevna": "Fallon County",
+    "ekalaka": "Carter County",
     
-    # Cascade County
-    "great falls": "Cascade County",
-    
-    # Lewis and Clark County
-    "helena": "Lewis and Clark County",
-    
-    # Silver Bow County
-    "butte": "Silver Bow County",
-    
-    # Add more as needed...
+    # Common alternate names
+    "msla": "Missoula County",
+    "gt falls": "Cascade County",
+    "gf": "Cascade County",
 }
 
 def resolve_town_to_county(location: str) -> str:
@@ -638,7 +739,7 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         if not town_name or not town_name.strip():
             return None
 
-        # IMPROVEMENT #3: Resolve town to county
+        # Resolve town to county
         county_name = resolve_town_to_county(town_name.strip())
         logger.info(f"[SPECIALIST] Looking up: '{town_name}' → '{county_name}'")
 
@@ -650,7 +751,7 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
                 specialist_info = {
                     "specialist_name": f"{s.get('first_name', '')} {s.get('last_name', '')}".strip(),
                     "specialist_phone": s.get("phone", ""),
-                    "territory": county_name  # Include for context
+                    "territory": county_name
                 }
                 logger.info(f"[SPECIALIST] Found via RPC: {specialist_info['specialist_name']}")
                 return specialist_info
@@ -753,7 +854,8 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "2.6.0",
+        "version": "3.0.0",
+        "lps_count": 7,  # Updated to 7
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
         "persistent_client": _zep_client is not None,
@@ -789,7 +891,7 @@ async def retell_inbound_webhook(request: Request):
             caller_specialist = memory_data.get("caller_specialist")
             conversation_history = memory_data.get("conversation_history", "")
 
-            # IMPROVEMENT #1: Always include all variables as strings
+            # Always include all variables as strings (no None values)
             dynamic_vars = {
                 "caller_name": caller_name if caller_name else "New caller",
                 "is_returning": "true" if caller_name else "false",
@@ -798,7 +900,7 @@ async def retell_inbound_webhook(request: Request):
                 "caller_specialist": caller_specialist or "",
             }
 
-            # Simplified logging - one line with all key data
+            # Simplified logging
             logger.info(f"[INBOUND] Dynamic vars: name={dynamic_vars['caller_name']}, "
                        f"location={dynamic_vars['caller_location'] or 'None'}, "
                        f"specialist={dynamic_vars['caller_specialist'] or 'None'}")
@@ -831,7 +933,7 @@ async def retell_inbound_webhook(request: Request):
 @app.post("/retell-webhook")
 async def retell_webhook(request: Request):
     """
-    IMPROVEMENT #2: Simplified agent webhook - ONLY handles call_ended for analytics.
+    Agent webhook - ONLY handles call_ended for analytics.
     Function calls are handled directly by /retell/functions/* endpoints.
     """
     try:
@@ -937,9 +1039,7 @@ async def set_user_location(request: Request):
 
 @app.post("/retell/functions/lookup_town")
 async def lookup_town(request: Request):
-    """
-    IMPROVEMENT #4: Now saves specialist to Zep metadata for future calls.
-    """
+    """Look up specialist by town and save to Zep metadata."""
     try:
         body = await request.json()
         args = body.get("arguments", {})
@@ -954,7 +1054,7 @@ async def lookup_town(request: Request):
         specialist = lookup_specialist_by_town(town)
 
         if specialist and phone:
-            # IMPROVEMENT #4: Save specialist to Zep for future calls
+            # Save specialist to Zep for future calls
             user_id = f"caller_{normalize_phone(phone)}"
             await zep_update_user_metadata(user_id, {
                 "specialist": specialist["specialist_name"],
@@ -1023,7 +1123,7 @@ async def end_call(request: Request):
 
 @app.post("/retell/functions/lookup_staff")
 async def lookup_staff(request: Request):
-    """Also saves specialist to Zep when found."""
+    """Look up specialist by location and save to Zep."""
     try:
         body = await request.json()
         location = body.get("arguments", {}).get("location", "")
