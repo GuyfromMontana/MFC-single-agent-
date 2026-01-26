@@ -1,9 +1,8 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.0 - MODULAR REFACTOR
-- Danielle Peterson retired, Taylor took her territory
-- Isabell covers Western MT (Missoula area)
-- All performance improvements included
+Version 3.0.1 - FIXED INBOUND WEBHOOK
+- Fixed event type handling (call_started vs call_inbound)
+- Fixed data structure for phone number lookup
 """
 
 from datetime import datetime
@@ -57,7 +56,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.0",
+        "version": "3.0.1",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
@@ -76,18 +75,21 @@ async def retell_inbound_webhook(request: Request):
         logger.info(f"=== INBOUND WEBHOOK ===")
         logger.info(f"Event: {event}")
 
-        if event == "call_inbound":
-            call_inbound = body.get("call_inbound", {})
-            from_number = call_inbound.get("from_number", "")
-            to_number = call_inbound.get("to_number", "")
-            agent_id = call_inbound.get("agent_id", "")
+        # Handle both "call_inbound" and "call_started" events
+        if event in ["call_inbound", "call_started"]:
+            # Try both data structures
+            call_data = body.get("call_inbound") or body.get("call", {})
+            from_number = call_data.get("from_number", "")
+            to_number = call_data.get("to_number", "")
+            agent_id = call_data.get("agent_id", "")
 
             logger.info(f"Inbound: {from_number} -> {to_number} (agent: {agent_id})")
 
             if not from_number:
                 logger.warning("No from_number - returning empty")
-                return JSONResponse(content={"call_inbound": {}})
+                return JSONResponse(content={"call_inbound": {}, "dynamic_variables": {}})
 
+            # Look up caller in memory
             memory_data = await lookup_caller_fast(from_number)
             caller_name = memory_data.get("caller_name")
             caller_location = memory_data.get("caller_location")
@@ -110,10 +112,9 @@ async def retell_inbound_webhook(request: Request):
             if conversation_history:
                 logger.info(f"[INBOUND] Context: {conversation_history[:100]}")
 
+            # Return response with dynamic variables
             response = {
-                "call_inbound": {
-                    "dynamic_variables": dynamic_vars
-                }
+                "dynamic_variables": dynamic_vars
             }
 
             return JSONResponse(content=response)
