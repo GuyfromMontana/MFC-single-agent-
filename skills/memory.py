@@ -1,6 +1,7 @@
 """
 Montana Feed Company - Memory Skills (Zep Cloud Integration)
 Caller recognition, transcript analysis, and conversation memory
+Version 3.0.1 - Added automatic specialist lookup
 """
 
 import re
@@ -252,11 +253,11 @@ def extract_location_from_transcript(transcript: List[Dict]) -> Optional[str]:
 
 
 # ============================================================================
-# MEMORY LOOKUP - WITH FULL CONTEXT RETRIEVAL
+# MEMORY LOOKUP - WITH FULL CONTEXT RETRIEVAL AND AUTO-SPECIALIST LOOKUP
 # ============================================================================
 
 async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
-    """Fast caller lookup with memory context retrieval."""
+    """Fast caller lookup with memory context retrieval and automatic specialist assignment."""
     try:
         user_id = f"caller_{normalize_phone(phone)}"
 
@@ -278,6 +279,18 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
             if metadata and isinstance(metadata, dict):
                 caller_location = metadata.get("location") or metadata.get("city") or metadata.get("town")
                 caller_specialist = metadata.get("specialist")
+
+                # AUTO-LOOKUP: If we have location but no specialist, look it up now
+                if caller_location and not caller_specialist:
+                    from .specialists import lookup_specialist_by_town
+                    specialist_info = lookup_specialist_by_town(caller_location)
+                    if specialist_info:
+                        caller_specialist = specialist_info["specialist_name"]
+                        # Save it to metadata for next time
+                        await zep_update_user_metadata(user_id, {
+                            "specialist": caller_specialist
+                        })
+                        logger.info(f"[MEMORY] Auto-assigned specialist: {caller_specialist}")
 
                 if caller_location:
                     logger.info(f"[MEMORY] Location: {caller_location}")
