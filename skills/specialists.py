@@ -218,6 +218,7 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
                 specialist_info = {
                     "specialist_name": f"{s.get('first_name', '')} {s.get('last_name', '')}".strip(),
                     "specialist_phone": s.get("phone", ""),
+                    "specialist_email": s.get("email", ""),
                     "territory": county_name
                 }
                 logger.info(f"[SPECIALIST] Found via RPC: {specialist_info['specialist_name']}")
@@ -225,9 +226,9 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         except Exception as e:
             logger.warning(f"[SPECIALIST] RPC failed: {e}")
 
-        # Fallback: table scan
+        # Fallback: table scan - NOW INCLUDING EMAIL
         result = supabase.table("specialists") \
-            .select("first_name, last_name, phone, counties") \
+            .select("first_name, last_name, phone, email, counties") \
             .eq("is_active", True) \
             .execute()
 
@@ -239,6 +240,7 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
                     specialist_info = {
                         "specialist_name": f"{s.get('first_name', '')} {s.get('last_name', '')}".strip(),
                         "specialist_phone": s.get("phone", ""),
+                        "specialist_email": s.get("email", ""),
                         "territory": county_name
                     }
                     logger.info(f"[SPECIALIST] Found via table: {specialist_info['specialist_name']}")
