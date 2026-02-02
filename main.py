@@ -1,9 +1,8 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.2 - ADDED CALL_ENDED HANDLING + EMAIL NOTIFICATIONS
-- Fixed call_ended event handling in /retell-inbound-webhook
-- Added contact/message saving to Supabase
-- Added email notifications to specialists
+Version 3.0.2 - CALL_ENDED HANDLING with EXISTING TABLES
+- Uses existing 'contacts' and 'conversation_messages' tables
+- Uses existing RESEND_API_KEY from Railway
 """
 
 from datetime import datetime
@@ -68,7 +67,7 @@ async def send_specialist_email(specialist_email: str, specialist_name: str, cal
         <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %I:%M %p MT')}</p>
         <hr>
         <h3>Call Summary:</h3>
-        <p>{call_summary or 'No summary available'}</p>
+        <p style="white-space: pre-wrap;">{call_summary or 'No summary available'}</p>
         <hr>
         <p><small>This is an automated notification from Montana Feed Company voice system.</small></p>
         """
@@ -187,7 +186,7 @@ async def retell_inbound_webhook(request: Request):
             return JSONResponse(content=response)
 
         # ========================================================================
-        # CALL ENDED - Save to Supabase and send email
+        # CALL ENDED - Save to existing Supabase tables and send email
         # ========================================================================
         elif event == "call_ended":
             call_data = body.get("call", {})
@@ -231,12 +230,12 @@ async def retell_inbound_webhook(request: Request):
             # Create a summary from transcript
             call_summary = ""
             if transcript:
-                # Take first 500 chars of transcript as summary
-                call_summary = transcript[:500] + ("..." if len(transcript) > 500 else "")
+                # Take first 800 chars of transcript as summary
+                call_summary = transcript[:800] + ("..." if len(transcript) > 800 else "")
             elif transcript_object:
                 # Build summary from transcript object
                 messages = []
-                for msg in transcript_object[:5]:  # First 5 messages
+                for msg in transcript_object[:8]:  # First 8 messages
                     role = "Caller" if msg.get("role") == "user" else "Agent"
                     content = msg.get("content", "")
                     if content:
@@ -244,28 +243,45 @@ async def retell_inbound_webhook(request: Request):
                 call_summary = "\n".join(messages)
 
             # ====================================================================
-            # SAVE TO SUPABASE
+            # SAVE TO EXISTING SUPABASE TABLES
             # ====================================================================
             if supabase:
                 try:
-                    # Create message record
-                    message_data = {
-                        "caller_phone": from_number,
-                        "caller_name": caller_name,
-                        "caller_location": caller_location,
-                        "specialist_name": specialist_name,
-                        "call_id": call_id,
-                        "call_duration": duration_seconds,
-                        "transcript": transcript or call_summary,
-                        "created_at": datetime.utcnow().isoformat(),
+                    # 1. Save/update contact in 'contacts' table
+                    contact_data = {
+                        "phone": from_number,
+                        "name": caller_name,
+                        "location": caller_location,
+                        "specialist": specialist_name,
+                        "last_contact": datetime.utcnow().isoformat(),
                         "source": "retell_voice"
                     }
                     
-                    result = supabase.table("messages").insert(message_data).execute()
-                    logger.info(f"✅ Saved message to Supabase: {result.data}")
+                    # Upsert - update if exists, insert if new
+                    contact_result = supabase.table("contacts").upsert(
+                        contact_data,
+                        on_conflict="phone"
+                    ).execute()
+                    
+                    logger.info(f"✅ Saved contact to Supabase")
+                    
+                    # 2. Save conversation message to 'conversation_messages' table
+                    message_data = {
+                        "phone": from_number,
+                        "caller_name": caller_name,
+                        "specialist": specialist_name,
+                        "message": call_summary or transcript,
+                        "call_id": call_id,
+                        "duration": duration_seconds,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "source": "retell_voice"
+                    }
+                    
+                    message_result = supabase.table("conversation_messages").insert(message_data).execute()
+                    logger.info(f"✅ Saved message to conversation_messages")
                     
                 except Exception as e:
-                    logger.error(f"❌ Failed to save to Supabase: {e}")
+                    logger.error(f"❌ Failed to save to Supabase: {e}", exc_info=True)
 
             # ====================================================================
             # SEND EMAIL TO SPECIALIST
@@ -296,9 +312,17 @@ async def retell_inbound_webhook(request: Request):
 
             return JSONResponse(content={
                 "call_id": call_id,
+                "contact_saved": True,
                 "message_saved": True,
                 "email_sent": bool(specialist_name and RESEND_API_KEY)
             })
+
+        # ========================================================================
+        # CALL ANALYZED
+        # ========================================================================
+        elif event == "call_analyzed":
+            logger.info(f"Call analyzed event received")
+            return JSONResponse(content={})
 
         # ========================================================================
         # CHAT INBOUND (SMS)
