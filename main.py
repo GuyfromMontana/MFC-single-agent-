@@ -1,11 +1,14 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.1 - FIXED INBOUND WEBHOOK
-- Fixed event type handling (call_started vs call_inbound)
-- Fixed data structure for phone number lookup
+Version 3.0.2 - ADDED CALL_ENDED HANDLING + EMAIL NOTIFICATIONS
+- Fixed call_ended event handling in /retell-inbound-webhook
+- Added contact/message saving to Supabase
+- Added email notifications to specialists
 """
 
 from datetime import datetime
+import os
+import httpx
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -38,6 +41,67 @@ from skills import (
 )
 
 # ============================================================================
+# EMAIL CONFIGURATION
+# ============================================================================
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "notifications@montanafeed.com")
+
+async def send_specialist_email(specialist_email: str, specialist_name: str, caller_name: str, 
+                                caller_phone: str, caller_location: str, call_summary: str):
+    """Send email notification to specialist about new call"""
+    if not RESEND_API_KEY:
+        logger.warning("RESEND_API_KEY not set - skipping email")
+        return False
+    
+    try:
+        # Format the email
+        subject = f"New Call from {caller_name or caller_phone}"
+        
+        html_content = f"""
+        <h2>New Call Received</h2>
+        <p><strong>Specialist:</strong> {specialist_name}</p>
+        <hr>
+        <p><strong>Caller:</strong> {caller_name or 'Unknown'}</p>
+        <p><strong>Phone:</strong> {caller_phone}</p>
+        <p><strong>Location:</strong> {caller_location or 'Not specified'}</p>
+        <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %I:%M %p MT')}</p>
+        <hr>
+        <h3>Call Summary:</h3>
+        <p>{call_summary or 'No summary available'}</p>
+        <hr>
+        <p><small>This is an automated notification from Montana Feed Company voice system.</small></p>
+        """
+        
+        # Send via Resend API
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "from": FROM_EMAIL,
+                    "to": [specialist_email],
+                    "subject": subject,
+                    "html": html_content
+                },
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"✅ Email sent to {specialist_email}")
+                return True
+            else:
+                logger.error(f"❌ Email failed: {response.status_code} - {response.text}")
+                return False
+                
+    except Exception as e:
+        logger.error(f"❌ Email error: {e}", exc_info=True)
+        return False
+
+# ============================================================================
 # FASTAPI APPLICATION
 # ============================================================================
 
@@ -56,10 +120,11 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.1",
+        "version": "3.0.2",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
+        "email_enabled": bool(RESEND_API_KEY),
         "persistent_client": get_zep_client() is not None,
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -67,7 +132,7 @@ async def health_check():
 
 @app.post("/retell-inbound-webhook")
 async def retell_inbound_webhook(request: Request):
-    """Inbound webhook - sets dynamic variables with full memory context."""
+    """Inbound webhook - handles call_started and call_ended events."""
     try:
         body = await request.json()
         event = body.get("event")
@@ -75,7 +140,9 @@ async def retell_inbound_webhook(request: Request):
         logger.info(f"=== INBOUND WEBHOOK ===")
         logger.info(f"Event: {event}")
 
-        # Handle both "call_inbound" and "call_started" events
+        # ========================================================================
+        # CALL STARTED - Set dynamic variables with memory context
+        # ========================================================================
         if event in ["call_inbound", "call_started"]:
             # Try both data structures
             call_data = body.get("call_inbound") or body.get("call", {})
@@ -119,6 +186,123 @@ async def retell_inbound_webhook(request: Request):
 
             return JSONResponse(content=response)
 
+        # ========================================================================
+        # CALL ENDED - Save to Supabase and send email
+        # ========================================================================
+        elif event == "call_ended":
+            call_data = body.get("call", {})
+            from_number = call_data.get("from_number", "")
+            to_number = call_data.get("to_number", "")
+            call_id = call_data.get("call_id", "")
+            agent_id = call_data.get("agent_id", "")
+            
+            # Get transcript if available
+            transcript = call_data.get("transcript", "")
+            transcript_object = call_data.get("transcript_object", [])
+            
+            # Get call duration
+            start_time = call_data.get("start_timestamp")
+            end_time = call_data.get("end_timestamp")
+            duration_seconds = None
+            if start_time and end_time:
+                duration_seconds = int((end_time - start_time) / 1000)  # Convert ms to seconds
+            
+            logger.info(f"[CALL_ENDED] {from_number}, duration: {duration_seconds}s")
+
+            if not from_number:
+                logger.warning("No from_number in call_ended")
+                return JSONResponse(content={})
+
+            # Look up caller info from memory
+            memory_data = await lookup_caller_fast(from_number)
+            caller_name = memory_data.get("caller_name")
+            caller_location = memory_data.get("caller_location")
+            specialist_name = memory_data.get("caller_specialist")
+
+            logger.info(f"[MEMORY] Name: {caller_name or 'Unknown'}")
+            logger.info(f"[MEMORY] Location: {caller_location or 'Unknown'}")
+            logger.info(f"[MEMORY] Specialist: {specialist_name or 'Unknown'}")
+
+            # Save transcript to Zep if available
+            if transcript_object and len(transcript_object) > 0:
+                logger.info(f"[SAVE] Saving {len(transcript_object)} messages to Zep")
+                await save_call_to_zep(from_number, transcript_object, call_id, caller_name)
+
+            # Create a summary from transcript
+            call_summary = ""
+            if transcript:
+                # Take first 500 chars of transcript as summary
+                call_summary = transcript[:500] + ("..." if len(transcript) > 500 else "")
+            elif transcript_object:
+                # Build summary from transcript object
+                messages = []
+                for msg in transcript_object[:5]:  # First 5 messages
+                    role = "Caller" if msg.get("role") == "user" else "Agent"
+                    content = msg.get("content", "")
+                    if content:
+                        messages.append(f"{role}: {content}")
+                call_summary = "\n".join(messages)
+
+            # ====================================================================
+            # SAVE TO SUPABASE
+            # ====================================================================
+            if supabase:
+                try:
+                    # Create message record
+                    message_data = {
+                        "caller_phone": from_number,
+                        "caller_name": caller_name,
+                        "caller_location": caller_location,
+                        "specialist_name": specialist_name,
+                        "call_id": call_id,
+                        "call_duration": duration_seconds,
+                        "transcript": transcript or call_summary,
+                        "created_at": datetime.utcnow().isoformat(),
+                        "source": "retell_voice"
+                    }
+                    
+                    result = supabase.table("messages").insert(message_data).execute()
+                    logger.info(f"✅ Saved message to Supabase: {result.data}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Failed to save to Supabase: {e}")
+
+            # ====================================================================
+            # SEND EMAIL TO SPECIALIST
+            # ====================================================================
+            if specialist_name and RESEND_API_KEY:
+                # Look up specialist email
+                specialist = lookup_specialist_by_town(caller_location or "")
+                
+                if specialist and specialist.get("specialist_email"):
+                    specialist_email = specialist["specialist_email"]
+                    logger.info(f"[EMAIL] Sending to {specialist_email}")
+                    
+                    await send_specialist_email(
+                        specialist_email=specialist_email,
+                        specialist_name=specialist_name,
+                        caller_name=caller_name or "Unknown Caller",
+                        caller_phone=from_number,
+                        caller_location=caller_location or "Unknown",
+                        call_summary=call_summary or "No transcript available"
+                    )
+                else:
+                    logger.warning(f"[EMAIL] No email found for specialist: {specialist_name}")
+            else:
+                if not specialist_name:
+                    logger.warning("[EMAIL] No specialist assigned to caller")
+                if not RESEND_API_KEY:
+                    logger.warning("[EMAIL] RESEND_API_KEY not configured")
+
+            return JSONResponse(content={
+                "call_id": call_id,
+                "message_saved": True,
+                "email_sent": bool(specialist_name and RESEND_API_KEY)
+            })
+
+        # ========================================================================
+        # CHAT INBOUND (SMS)
+        # ========================================================================
         elif event == "chat_inbound":
             chat_inbound = body.get("chat_inbound", {})
             logger.info(f"SMS inbound from: {chat_inbound.get('from_number', '')}")
