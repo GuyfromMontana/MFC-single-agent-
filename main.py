@@ -1,8 +1,9 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.4 - ADDED TRANSFER_CALL_TOOL ENDPOINT
-- Added missing transfer_call_tool endpoint for call transfers
-- Fixes call transfer functionality
+Version 3.0.5 - FIXED DYNAMIC VARIABLES
+- Fixed dynamic_variables → retell_llm_dynamic_variables (Retell's expected format)
+- Fixed variable names to match system prompt (name, location, specialist)
+- Added transfer_call_tool endpoint for call transfers
 """
 
 from datetime import datetime
@@ -129,7 +130,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.4",
+        "version": "3.0.5",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
@@ -163,7 +164,7 @@ async def retell_inbound_webhook(request: Request):
 
             if not from_number:
                 logger.warning("No from_number - returning empty")
-                return JSONResponse(content={"call_inbound": {}, "dynamic_variables": {}})
+                return JSONResponse(content={"call_inbound": {}, "retell_llm_dynamic_variables": {}})
 
             # Look up caller in memory
             memory_data = await lookup_caller_fast(from_number)
@@ -173,24 +174,25 @@ async def retell_inbound_webhook(request: Request):
             conversation_history = memory_data.get("conversation_history", "")
 
             # Always include all variables as strings (no None values)
+            # Variable names must match {{name}}, {{location}}, etc. in system prompt
             dynamic_vars = {
-                "caller_name": caller_name if caller_name else "New caller",
+                "name": caller_name if caller_name else "New caller",
                 "is_returning": "true" if caller_name else "false",
                 "conversation_history": conversation_history or "",
-                "caller_location": caller_location or "",
-                "caller_specialist": caller_specialist or "",
+                "location": caller_location or "",
+                "specialist": caller_specialist or "",
             }
 
-            logger.info(f"[INBOUND] Dynamic vars: name={dynamic_vars['caller_name']}, "
-                       f"location={dynamic_vars['caller_location'] or 'None'}, "
-                       f"specialist={dynamic_vars['caller_specialist'] or 'None'}")
+            logger.info(f"[INBOUND] Dynamic vars: name={dynamic_vars['name']}, "
+                       f"location={dynamic_vars['location'] or 'None'}, "
+                       f"specialist={dynamic_vars['specialist'] or 'None'}")
             
             if conversation_history:
                 logger.info(f"[INBOUND] Context: {conversation_history[:100]}")
 
             # Return response with dynamic variables
             response = {
-                "dynamic_variables": dynamic_vars
+                "retell_llm_dynamic_variables": dynamic_vars
             }
 
             return JSONResponse(content=response)
