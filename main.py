@@ -1,9 +1,8 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.5 - FIXED DYNAMIC VARIABLES
-- Fixed dynamic_variables → retell_llm_dynamic_variables (Retell's expected format)
-- Fixed variable names to match system prompt (name, location, specialist)
-- Added transfer_call_tool endpoint for call transfers
+Version 3.0.6 - FIXED INBOUND WEBHOOK FORMAT
+- Fixed response format: call_inbound.dynamic_variables (not retell_llm_dynamic_variables)
+- This is the correct format for Retell's inbound webhook
 """
 
 from datetime import datetime
@@ -130,7 +129,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.5",
+        "version": "3.0.6",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
@@ -164,7 +163,7 @@ async def retell_inbound_webhook(request: Request):
 
             if not from_number:
                 logger.warning("No from_number - returning empty")
-                return JSONResponse(content={"call_inbound": {}, "retell_llm_dynamic_variables": {}})
+                return JSONResponse(content={"call_inbound": {}})
 
             # Look up caller in memory
             memory_data = await lookup_caller_fast(from_number)
@@ -190,9 +189,11 @@ async def retell_inbound_webhook(request: Request):
             if conversation_history:
                 logger.info(f"[INBOUND] Context: {conversation_history[:100]}")
 
-            # Return response with dynamic variables
+            # Return response with dynamic variables in correct format for inbound webhook
             response = {
-                "retell_llm_dynamic_variables": dynamic_vars
+                "call_inbound": {
+                    "dynamic_variables": dynamic_vars
+                }
             }
 
             return JSONResponse(content=response)
