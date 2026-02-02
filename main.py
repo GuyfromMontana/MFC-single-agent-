@@ -1,13 +1,15 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.2 - CALL_ENDED HANDLING with EXISTING TABLES
-- Uses existing 'contacts' and 'conversation_messages' tables
-- Uses existing RESEND_API_KEY from Railway
+Version 3.0.3 - PROPER SCHEMA MAPPING
+- Uses conversations table to create call records
+- Uses conversation_messages table to store transcript
+- Matches your exact column names and data types
 """
 
 from datetime import datetime
 import os
 import httpx
+import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -47,13 +49,21 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "notifications@montanafeed.com")
 
 async def send_specialist_email(specialist_email: str, specialist_name: str, caller_name: str, 
-                                caller_phone: str, caller_location: str, call_summary: str):
+                                caller_phone: str, caller_location: str, call_summary: str,
+                                duration: int = None):
     """Send email notification to specialist about new call"""
     if not RESEND_API_KEY:
         logger.warning("RESEND_API_KEY not set - skipping email")
         return False
     
     try:
+        # Format duration nicely
+        duration_str = f"{duration}s" if duration else "Unknown"
+        if duration and duration >= 60:
+            minutes = duration // 60
+            seconds = duration % 60
+            duration_str = f"{minutes}m {seconds}s"
+        
         # Format the email
         subject = f"New Call from {caller_name or caller_phone}"
         
@@ -64,10 +74,11 @@ async def send_specialist_email(specialist_email: str, specialist_name: str, cal
         <p><strong>Caller:</strong> {caller_name or 'Unknown'}</p>
         <p><strong>Phone:</strong> {caller_phone}</p>
         <p><strong>Location:</strong> {caller_location or 'Not specified'}</p>
+        <p><strong>Duration:</strong> {duration_str}</p>
         <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %I:%M %p MT')}</p>
         <hr>
-        <h3>Call Summary:</h3>
-        <p style="white-space: pre-wrap;">{call_summary or 'No summary available'}</p>
+        <h3>Conversation:</h3>
+        <p style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 10px; border-radius: 5px;">{call_summary or 'No transcript available'}</p>
         <hr>
         <p><small>This is an automated notification from Montana Feed Company voice system.</small></p>
         """
@@ -119,7 +130,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.2",
+        "version": "3.0.3",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
@@ -186,7 +197,7 @@ async def retell_inbound_webhook(request: Request):
             return JSONResponse(content=response)
 
         # ========================================================================
-        # CALL ENDED - Save to existing Supabase tables and send email
+        # CALL ENDED - Save to Supabase conversations + messages tables
         # ========================================================================
         elif event == "call_ended":
             call_data = body.get("call", {})
@@ -199,12 +210,17 @@ async def retell_inbound_webhook(request: Request):
             transcript = call_data.get("transcript", "")
             transcript_object = call_data.get("transcript_object", [])
             
-            # Get call duration
+            # Get call duration and timestamps
             start_time = call_data.get("start_timestamp")
             end_time = call_data.get("end_timestamp")
             duration_seconds = None
+            start_datetime = None
+            end_datetime = None
+            
             if start_time and end_time:
                 duration_seconds = int((end_time - start_time) / 1000)  # Convert ms to seconds
+                start_datetime = datetime.fromtimestamp(start_time / 1000)
+                end_datetime = datetime.fromtimestamp(end_time / 1000)
             
             logger.info(f"[CALL_ENDED] {from_number}, duration: {duration_seconds}s")
 
@@ -227,58 +243,64 @@ async def retell_inbound_webhook(request: Request):
                 logger.info(f"[SAVE] Saving {len(transcript_object)} messages to Zep")
                 await save_call_to_zep(from_number, transcript_object, call_id, caller_name)
 
-            # Create a summary from transcript
+            # Create a formatted summary from transcript
             call_summary = ""
-            if transcript:
-                # Take first 800 chars of transcript as summary
-                call_summary = transcript[:800] + ("..." if len(transcript) > 800 else "")
-            elif transcript_object:
-                # Build summary from transcript object
+            if transcript_object:
+                # Build formatted conversation
                 messages = []
-                for msg in transcript_object[:8]:  # First 8 messages
+                for msg in transcript_object:
                     role = "Caller" if msg.get("role") == "user" else "Agent"
                     content = msg.get("content", "")
                     if content:
                         messages.append(f"{role}: {content}")
-                call_summary = "\n".join(messages)
+                call_summary = "\n\n".join(messages)
+            elif transcript:
+                call_summary = transcript
 
             # ====================================================================
-            # SAVE TO EXISTING SUPABASE TABLES
+            # SAVE TO SUPABASE - conversations and conversation_messages tables
             # ====================================================================
+            conversation_id = None
+            
             if supabase:
                 try:
-                    # 1. Save/update contact in 'contacts' table
-                    contact_data = {
-                        "phone": from_number,
-                        "name": caller_name,
-                        "location": caller_location,
-                        "specialist": specialist_name,
-                        "last_contact": datetime.utcnow().isoformat(),
-                        "source": "retell_voice"
+                    # 1. Create conversation record
+                    conversation_data = {
+                        "id": str(uuid.uuid4()),
+                        "phone_number": from_number,
+                        "conversation_type": "voice_call",
+                        "direction": "inbound",
+                        "status": "completed",
+                        "start_time": start_datetime.isoformat() if start_datetime else None,
+                        "end_time": end_datetime.isoformat() if end_datetime else None,
+                        "duration_seconds": duration_seconds,
+                        "vapi_call_id": call_id,  # Store Retell call_id here
+                        "ai_summary": call_summary[:500] if call_summary else None,  # Short summary
+                        "created_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat()
                     }
                     
-                    # Upsert - update if exists, insert if new
-                    contact_result = supabase.table("contacts").upsert(
-                        contact_data,
-                        on_conflict="phone"
-                    ).execute()
+                    conversation_result = supabase.table("conversations").insert(conversation_data).execute()
                     
-                    logger.info(f"✅ Saved contact to Supabase")
-                    
-                    # 2. Save conversation message to 'conversation_messages' table
-                    message_data = {
-                        "phone": from_number,
-                        "caller_name": caller_name,
-                        "specialist": specialist_name,
-                        "message": call_summary or transcript,
-                        "call_id": call_id,
-                        "duration": duration_seconds,
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "source": "retell_voice"
-                    }
-                    
-                    message_result = supabase.table("conversation_messages").insert(message_data).execute()
-                    logger.info(f"✅ Saved message to conversation_messages")
+                    if conversation_result.data and len(conversation_result.data) > 0:
+                        conversation_id = conversation_result.data[0]["id"]
+                        logger.info(f"✅ Created conversation: {conversation_id}")
+                        
+                        # 2. Save individual messages to conversation_messages
+                        if transcript_object:
+                            for msg in transcript_object:
+                                message_data = {
+                                    "id": str(uuid.uuid4()),
+                                    "conversation_id": conversation_id,
+                                    "content": msg.get("content", ""),
+                                    "sender": "user" if msg.get("role") == "user" else "assistant",
+                                    "message_type": "voice",
+                                    "created_at": datetime.utcnow().isoformat()
+                                }
+                                
+                                supabase.table("conversation_messages").insert(message_data).execute()
+                            
+                            logger.info(f"✅ Saved {len(transcript_object)} messages to conversation_messages")
                     
                 except Exception as e:
                     logger.error(f"❌ Failed to save to Supabase: {e}", exc_info=True)
@@ -300,7 +322,8 @@ async def retell_inbound_webhook(request: Request):
                         caller_name=caller_name or "Unknown Caller",
                         caller_phone=from_number,
                         caller_location=caller_location or "Unknown",
-                        call_summary=call_summary or "No transcript available"
+                        call_summary=call_summary or "No transcript available",
+                        duration=duration_seconds
                     )
                 else:
                     logger.warning(f"[EMAIL] No email found for specialist: {specialist_name}")
@@ -312,8 +335,8 @@ async def retell_inbound_webhook(request: Request):
 
             return JSONResponse(content={
                 "call_id": call_id,
-                "contact_saved": True,
-                "message_saved": True,
+                "conversation_id": conversation_id,
+                "messages_saved": len(transcript_object) if transcript_object else 0,
                 "email_sent": bool(specialist_name and RESEND_API_KEY)
             })
 
