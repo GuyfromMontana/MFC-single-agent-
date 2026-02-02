@@ -1,9 +1,8 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.3 - PROPER SCHEMA MAPPING
-- Uses conversations table to create call records
-- Uses conversation_messages table to store transcript
-- Matches your exact column names and data types
+Version 3.0.4 - ADDED TRANSFER_CALL_TOOL ENDPOINT
+- Added missing transfer_call_tool endpoint for call transfers
+- Fixes call transfer functionality
 """
 
 from datetime import datetime
@@ -130,7 +129,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.3",
+        "version": "3.0.4",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
@@ -583,6 +582,52 @@ async def lookup_staff(request: Request):
 
         return JSONResponse(content={"result": result, "success": bool(specialist)})
     except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/retell/functions/transfer_call_tool")
+async def transfer_call_tool(request: Request):
+    """Transfer call to specialist's phone number - used by Retell's Dynamic Routing."""
+    try:
+        body = await request.json()
+        call_data = body.get("call", {})
+        from_number = call_data.get("from_number", "")
+        
+        logger.info(f"[TRANSFER] Transfer requested for caller: {from_number}")
+        
+        # Look up caller's location and specialist from memory
+        memory_data = await lookup_caller_fast(from_number)
+        caller_location = memory_data.get("caller_location")
+        specialist_name = memory_data.get("caller_specialist")
+        
+        logger.info(f"[TRANSFER] Caller location: {caller_location}, Specialist: {specialist_name}")
+        
+        # Look up specialist details
+        specialist = lookup_specialist_by_town(caller_location or "")
+        
+        if specialist and specialist.get("specialist_phone"):
+            phone_number = specialist["specialist_phone"]
+            specialist_name = specialist.get("specialist_name", "your specialist")
+            
+            logger.info(f"[TRANSFER] Transferring to {specialist_name} at {phone_number}")
+            
+            # Return phone number for Retell to transfer to
+            return JSONResponse(content={
+                "phone_number": phone_number,
+                "specialist_name": specialist_name,
+                "success": True
+            })
+        else:
+            logger.warning(f"[TRANSFER] No specialist found for location: {caller_location}")
+            # Fallback to main office
+            return JSONResponse(content={
+                "phone_number": "+14068834290",
+                "specialist_name": "main office",
+                "success": True
+            })
+        
+    except Exception as e:
+        logger.error(f"[TRANSFER] Error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
