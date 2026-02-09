@@ -1,8 +1,8 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.6 - FIXED INBOUND WEBHOOK FORMAT
-- Fixed response format: call_inbound.dynamic_variables (not retell_llm_dynamic_variables)
-- This is the correct format for Retell's inbound webhook
+Version 3.0.7 - FIXED EMAIL LOOKUP BY SPECIALIST NAME
+- Fixed: Email lookup now queries specialists table by name (not by town)
+- This ensures emails are sent even when location data is garbled
 """
 
 from datetime import datetime
@@ -129,7 +129,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.6",
+        "version": "3.0.7",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
@@ -308,16 +308,37 @@ async def retell_inbound_webhook(request: Request):
                     logger.error(f"❌ Failed to save to Supabase: {e}", exc_info=True)
 
             # ====================================================================
-            # SEND EMAIL TO SPECIALIST
+            # SEND EMAIL TO SPECIALIST (v3.0.7 FIX: lookup by name, not town)
             # ====================================================================
             if specialist_name and RESEND_API_KEY:
-                # Look up specialist email
-                specialist = lookup_specialist_by_town(caller_location or "")
+                specialist_email = None
                 
-                if specialist and specialist.get("specialist_email"):
-                    specialist_email = specialist["specialist_email"]
-                    logger.info(f"[EMAIL] Sending to {specialist_email}")
+                # Look up specialist email by NAME directly from specialists table
+                if supabase:
+                    try:
+                        name_parts = specialist_name.split(None, 1)
+                        first_name = name_parts[0]
+                        last_name = name_parts[1] if len(name_parts) > 1 else ""
+                        
+                        logger.info(f"[EMAIL] Looking up email for: {first_name} {last_name}")
+                        
+                        result = supabase.table("specialists")\
+                            .select("email, first_name, last_name")\
+                            .ilike("first_name", first_name)\
+                            .ilike("last_name", last_name)\
+                            .eq("is_active", True)\
+                            .execute()
+                        
+                        if result.data and len(result.data) > 0:
+                            specialist_email = result.data[0].get("email")
+                            logger.info(f"[EMAIL] Found email: {specialist_email}")
+                        else:
+                            logger.warning(f"[EMAIL] No specialist found matching: {first_name} {last_name}")
                     
+                    except Exception as e:
+                        logger.error(f"[EMAIL] Specialist lookup error: {e}")
+                
+                if specialist_email:
                     await send_specialist_email(
                         specialist_email=specialist_email,
                         specialist_name=specialist_name,
