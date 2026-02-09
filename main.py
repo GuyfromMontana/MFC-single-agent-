@@ -1,8 +1,10 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.7 - FIXED EMAIL LOOKUP BY SPECIALIST NAME
-- Fixed: Email lookup now queries specialists table by name (not by town)
-- This ensures emails are sent even when location data is garbled
+Version 3.0.8 - CALL CACHE + EMAIL BY NAME
+- Added in-memory call cache: Zep lookup happens once at call_started, 
+  cached data reused at call_ended (eliminates 2 redundant API calls per call)
+- Email lookup by specialist name (not town) from v3.0.7
+- Cache auto-cleans after call_ended processing
 """
 
 from datetime import datetime
@@ -39,6 +41,14 @@ from skills import (
     capture_lead,
     update_lead_with_name,
 )
+
+# ============================================================================
+# CALL CACHE - Store Zep lookups from call_started for reuse at call_ended
+# ============================================================================
+# Keyed by phone number, stores memory_data dict
+# Cleaned up after call_ended processing completes
+
+_call_cache: dict[str, dict] = {}
 
 # ============================================================================
 # EMAIL CONFIGURATION
@@ -129,12 +139,13 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.7",
+        "version": "3.0.8",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
         "email_enabled": bool(RESEND_API_KEY),
         "persistent_client": get_zep_client() is not None,
+        "active_calls_cached": len(_call_cache),
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -165,15 +176,22 @@ async def retell_inbound_webhook(request: Request):
                 logger.warning("No from_number - returning empty")
                 return JSONResponse(content={"call_inbound": {}})
 
-            # Look up caller in memory
-            memory_data = await lookup_caller_fast(from_number)
+            # Check if we already cached this caller (call_inbound fires before call_started)
+            if from_number in _call_cache:
+                memory_data = _call_cache[from_number]
+                logger.info(f"[CACHE HIT] Using cached Zep data for {from_number}")
+            else:
+                # First event for this call - do the Zep lookup and cache it
+                memory_data = await lookup_caller_fast(from_number)
+                _call_cache[from_number] = memory_data
+                logger.info(f"[CACHE MISS] Looked up Zep and cached for {from_number}")
+
             caller_name = memory_data.get("caller_name")
             caller_location = memory_data.get("caller_location")
             caller_specialist = memory_data.get("caller_specialist")
             conversation_history = memory_data.get("conversation_history", "")
 
             # Always include all variables as strings (no None values)
-            # Variable names must match {{name}}, {{location}}, etc. in system prompt
             dynamic_vars = {
                 "name": caller_name if caller_name else "New caller",
                 "is_returning": "true" if caller_name else "false",
@@ -189,14 +207,11 @@ async def retell_inbound_webhook(request: Request):
             if conversation_history:
                 logger.info(f"[INBOUND] Context: {conversation_history[:100]}")
 
-            # Return response with dynamic variables in correct format for inbound webhook
-            response = {
+            return JSONResponse(content={
                 "call_inbound": {
                     "dynamic_variables": dynamic_vars
                 }
-            }
-
-            return JSONResponse(content=response)
+            })
 
         # ========================================================================
         # CALL ENDED - Save to Supabase conversations + messages tables
@@ -220,7 +235,7 @@ async def retell_inbound_webhook(request: Request):
             end_datetime = None
             
             if start_time and end_time:
-                duration_seconds = int((end_time - start_time) / 1000)  # Convert ms to seconds
+                duration_seconds = int((end_time - start_time) / 1000)
                 start_datetime = datetime.fromtimestamp(start_time / 1000)
                 end_datetime = datetime.fromtimestamp(end_time / 1000)
             
@@ -230,8 +245,14 @@ async def retell_inbound_webhook(request: Request):
                 logger.warning("No from_number in call_ended")
                 return JSONResponse(content={})
 
-            # Look up caller info from memory
-            memory_data = await lookup_caller_fast(from_number)
+            # Use cached memory data if available, otherwise fall back to Zep
+            if from_number in _call_cache:
+                memory_data = _call_cache[from_number]
+                logger.info(f"[CACHE HIT] Using cached Zep data for call_ended")
+            else:
+                logger.info(f"[CACHE MISS] No cached data - looking up Zep for call_ended")
+                memory_data = await lookup_caller_fast(from_number)
+
             caller_name = memory_data.get("caller_name")
             caller_location = memory_data.get("caller_location")
             specialist_name = memory_data.get("caller_specialist")
@@ -248,7 +269,6 @@ async def retell_inbound_webhook(request: Request):
             # Create a formatted summary from transcript
             call_summary = ""
             if transcript_object:
-                # Build formatted conversation
                 messages = []
                 for msg in transcript_object:
                     role = "Caller" if msg.get("role") == "user" else "Agent"
@@ -260,13 +280,12 @@ async def retell_inbound_webhook(request: Request):
                 call_summary = transcript
 
             # ====================================================================
-            # SAVE TO SUPABASE - conversations and conversation_messages tables
+            # SAVE TO SUPABASE
             # ====================================================================
             conversation_id = None
             
             if supabase:
                 try:
-                    # 1. Create conversation record
                     conversation_data = {
                         "id": str(uuid.uuid4()),
                         "phone_number": from_number,
@@ -276,8 +295,8 @@ async def retell_inbound_webhook(request: Request):
                         "start_time": start_datetime.isoformat() if start_datetime else None,
                         "end_time": end_datetime.isoformat() if end_datetime else None,
                         "duration_seconds": duration_seconds,
-                        "vapi_call_id": call_id,  # Store Retell call_id here
-                        "ai_summary": call_summary[:500] if call_summary else None,  # Short summary
+                        "vapi_call_id": call_id,
+                        "ai_summary": call_summary[:500] if call_summary else None,
                         "created_at": datetime.utcnow().isoformat(),
                         "updated_at": datetime.utcnow().isoformat()
                     }
@@ -288,7 +307,6 @@ async def retell_inbound_webhook(request: Request):
                         conversation_id = conversation_result.data[0]["id"]
                         logger.info(f"✅ Created conversation: {conversation_id}")
                         
-                        # 2. Save individual messages to conversation_messages
                         if transcript_object:
                             for msg in transcript_object:
                                 message_data = {
@@ -299,7 +317,6 @@ async def retell_inbound_webhook(request: Request):
                                     "message_type": "voice",
                                     "created_at": datetime.utcnow().isoformat()
                                 }
-                                
                                 supabase.table("conversation_messages").insert(message_data).execute()
                             
                             logger.info(f"✅ Saved {len(transcript_object)} messages to conversation_messages")
@@ -308,12 +325,11 @@ async def retell_inbound_webhook(request: Request):
                     logger.error(f"❌ Failed to save to Supabase: {e}", exc_info=True)
 
             # ====================================================================
-            # SEND EMAIL TO SPECIALIST (v3.0.7 FIX: lookup by name, not town)
+            # SEND EMAIL TO SPECIALIST (lookup by name, not town)
             # ====================================================================
             if specialist_name and RESEND_API_KEY:
                 specialist_email = None
                 
-                # Look up specialist email by NAME directly from specialists table
                 if supabase:
                     try:
                         name_parts = specialist_name.split(None, 1)
@@ -355,6 +371,10 @@ async def retell_inbound_webhook(request: Request):
                     logger.warning("[EMAIL] No specialist assigned to caller")
                 if not RESEND_API_KEY:
                     logger.warning("[EMAIL] RESEND_API_KEY not configured")
+
+            # Clean up cache for this caller
+            _call_cache.pop(from_number, None)
+            logger.info(f"[CACHE] Cleaned up cache for {from_number}")
 
             return JSONResponse(content={
                 "call_id": call_id,
@@ -403,14 +423,18 @@ async def retell_webhook(request: Request):
         phone = call_data.get("from_number", "")
         transcript = call_data.get("transcript_object", [])
 
-        # Only handle call_ended for Zep saving and analytics
         if event_type == "call_ended" and transcript and phone:
             logger.info(f"[SAVE] Saving {len(transcript)} messages to Zep")
 
             caller_name = body.get("retell_llm_dynamic_variables", {}).get("caller_name")
             if not caller_name or caller_name == "New caller":
-                memory_data = await lookup_caller_fast(phone)
-                caller_name = memory_data.get("caller_name")
+                # Try cache first, then Zep
+                if phone in _call_cache:
+                    caller_name = _call_cache[phone].get("caller_name")
+                    logger.info(f"[CACHE HIT] Got caller name from cache: {caller_name}")
+                else:
+                    memory_data = await lookup_caller_fast(phone)
+                    caller_name = memory_data.get("caller_name")
 
             save_result = await save_call_to_zep(phone, transcript, call_id, caller_name)
 
@@ -424,7 +448,6 @@ async def retell_webhook(request: Request):
                 "memory_saved": save_result.get("success", False)
             })
 
-        # For other events, just acknowledge
         return JSONResponse(content={"call_id": call_id})
 
     except Exception as e:
@@ -478,8 +501,6 @@ async def set_user_location(request: Request):
             return {"error": "Provide phone and location"}
 
         user_id = f"caller_{normalize_phone(phone)}"
-        
-        # Use the safe metadata update function
         success = await zep_update_user_metadata(user_id, {"location": location})
 
         if success:
@@ -503,7 +524,6 @@ async def lookup_town(request: Request):
         args = body.get("arguments", {})
         town = args.get("town", "") or args.get("location", "") or args.get("city", "")
         
-        # Get caller phone for metadata update
         call_data = body.get("call", {})
         phone = call_data.get("from_number", "")
 
@@ -512,7 +532,6 @@ async def lookup_town(request: Request):
         specialist = lookup_specialist_by_town(town)
 
         if specialist and phone:
-            # Save specialist to Zep for future calls
             user_id = f"caller_{normalize_phone(phone)}"
             await zep_update_user_metadata(user_id, {
                 "specialist": specialist["specialist_name"],
@@ -594,7 +613,6 @@ async def lookup_staff(request: Request):
         specialist = lookup_specialist_by_town(location)
 
         if specialist and phone:
-            # Save to Zep
             user_id = f"caller_{normalize_phone(phone)}"
             await zep_update_user_metadata(user_id, {
                 "specialist": specialist["specialist_name"],
@@ -611,7 +629,7 @@ async def lookup_staff(request: Request):
 
 @app.post("/retell/functions/transfer_call_tool")
 async def transfer_call_tool(request: Request):
-    """Transfer call to specialist's phone number - used by Retell's Dynamic Routing."""
+    """Transfer call to specialist's phone number."""
     try:
         body = await request.json()
         call_data = body.get("call", {})
@@ -619,14 +637,18 @@ async def transfer_call_tool(request: Request):
         
         logger.info(f"[TRANSFER] Transfer requested for caller: {from_number}")
         
-        # Look up caller's location and specialist from memory
-        memory_data = await lookup_caller_fast(from_number)
+        # Try cache first for caller info, then fall back to Zep
+        if from_number in _call_cache:
+            memory_data = _call_cache[from_number]
+            logger.info(f"[TRANSFER] [CACHE HIT] Using cached data")
+        else:
+            memory_data = await lookup_caller_fast(from_number)
+        
         caller_location = memory_data.get("caller_location")
         specialist_name = memory_data.get("caller_specialist")
         
         logger.info(f"[TRANSFER] Caller location: {caller_location}, Specialist: {specialist_name}")
         
-        # Look up specialist details
         specialist = lookup_specialist_by_town(caller_location or "")
         
         if specialist and specialist.get("specialist_phone"):
@@ -635,7 +657,6 @@ async def transfer_call_tool(request: Request):
             
             logger.info(f"[TRANSFER] Transferring to {specialist_name} at {phone_number}")
             
-            # Return phone number for Retell to transfer to
             return JSONResponse(content={
                 "phone_number": phone_number,
                 "specialist_name": specialist_name,
@@ -643,7 +664,6 @@ async def transfer_call_tool(request: Request):
             })
         else:
             logger.warning(f"[TRANSFER] No specialist found for location: {caller_location}")
-            # Fallback to main office
             return JSONResponse(content={
                 "phone_number": "+14068834290",
                 "specialist_name": "main office",
