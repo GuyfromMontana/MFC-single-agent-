@@ -1,10 +1,10 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.8 - CALL CACHE + EMAIL BY NAME
-- Added in-memory call cache: Zep lookup happens once at call_started, 
-  cached data reused at call_ended (eliminates 2 redundant API calls per call)
-- Email lookup by specialist name (not town) from v3.0.7
-- Cache auto-cleans after call_ended processing
+Version 3.0.9 - WIDGET CALL SUPPORT
+- Widget calls (no phone number) now handled gracefully with call_id fallback
+- Widget conversations saved to Supabase (skips Zep which needs phone-based IDs)
+- Cache, transfer, and agent webhook all support widget callers
+- Previous: v3.0.8 call cache + email by name
 """
 
 from datetime import datetime
@@ -139,7 +139,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.8",
+        "version": "3.0.9",
         "lps_count": 7,
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
@@ -170,21 +170,32 @@ async def retell_inbound_webhook(request: Request):
             to_number = call_data.get("to_number", "")
             agent_id = call_data.get("agent_id", "")
 
-            logger.info(f"Inbound: {from_number} -> {to_number} (agent: {agent_id})")
+            # Widget calls have no from_number — use call_id as fallback
+            call_id = call_data.get("call_id", "")
+            is_widget = not from_number
+            caller_key = from_number or f"widget_{call_id}"
 
-            if not from_number:
-                logger.warning("No from_number - returning empty")
-                return JSONResponse(content={"call_inbound": {}})
+            logger.info(f"Inbound: {caller_key} -> {to_number} (agent: {agent_id}, {'widget' if is_widget else 'phone'})")
 
             # Check if we already cached this caller (call_inbound fires before call_started)
-            if from_number in _call_cache:
-                memory_data = _call_cache[from_number]
-                logger.info(f"[CACHE HIT] Using cached Zep data for {from_number}")
+            if caller_key in _call_cache:
+                memory_data = _call_cache[caller_key]
+                logger.info(f"[CACHE HIT] Using cached Zep data for {caller_key}")
+            elif is_widget:
+                # Widget caller — no Zep history possible, return new caller defaults
+                memory_data = {
+                    "found": False, "user_id": f"widget_{call_id}",
+                    "caller_name": None, "caller_location": None,
+                    "caller_specialist": None, "conversation_history": "",
+                    "message": "Widget caller"
+                }
+                _call_cache[caller_key] = memory_data
+                logger.info(f"[WIDGET] New widget caller, cached as {caller_key}")
             else:
                 # First event for this call - do the Zep lookup and cache it
-                memory_data = await lookup_caller_fast(from_number)
-                _call_cache[from_number] = memory_data
-                logger.info(f"[CACHE MISS] Looked up Zep and cached for {from_number}")
+                memory_data = await lookup_caller_fast(caller_key)
+                _call_cache[caller_key] = memory_data
+                logger.info(f"[CACHE MISS] Looked up Zep and cached for {caller_key}")
 
             caller_name = memory_data.get("caller_name")
             caller_location = memory_data.get("caller_location")
@@ -239,19 +250,25 @@ async def retell_inbound_webhook(request: Request):
                 start_datetime = datetime.fromtimestamp(start_time / 1000)
                 end_datetime = datetime.fromtimestamp(end_time / 1000)
             
-            logger.info(f"[CALL_ENDED] {from_number}, duration: {duration_seconds}s")
+            # Widget calls have no from_number — use call_id as fallback
+            is_widget = not from_number
+            caller_key = from_number or f"widget_{call_id}"
 
-            if not from_number:
-                logger.warning("No from_number in call_ended")
-                return JSONResponse(content={})
+            logger.info(f"[CALL_ENDED] {caller_key} ({'widget' if is_widget else 'phone'}), duration: {duration_seconds}s")
 
             # Use cached memory data if available, otherwise fall back to Zep
-            if from_number in _call_cache:
-                memory_data = _call_cache[from_number]
+            if caller_key in _call_cache:
+                memory_data = _call_cache[caller_key]
                 logger.info(f"[CACHE HIT] Using cached Zep data for call_ended")
+            elif is_widget:
+                memory_data = {
+                    "found": False, "caller_name": None,
+                    "caller_location": None, "caller_specialist": None
+                }
+                logger.info(f"[WIDGET] No cached data for widget caller")
             else:
                 logger.info(f"[CACHE MISS] No cached data - looking up Zep for call_ended")
-                memory_data = await lookup_caller_fast(from_number)
+                memory_data = await lookup_caller_fast(caller_key)
 
             caller_name = memory_data.get("caller_name")
             caller_location = memory_data.get("caller_location")
@@ -261,10 +278,13 @@ async def retell_inbound_webhook(request: Request):
             logger.info(f"[MEMORY] Location: {caller_location or 'Unknown'}")
             logger.info(f"[MEMORY] Specialist: {specialist_name or 'Unknown'}")
 
-            # Save transcript to Zep if available
+            # Save transcript to Zep if available (use phone for Zep, skip for widget)
             if transcript_object and len(transcript_object) > 0:
-                logger.info(f"[SAVE] Saving {len(transcript_object)} messages to Zep")
-                await save_call_to_zep(from_number, transcript_object, call_id, caller_name)
+                if not is_widget:
+                    logger.info(f"[SAVE] Saving {len(transcript_object)} messages to Zep")
+                    await save_call_to_zep(from_number, transcript_object, call_id, caller_name)
+                else:
+                    logger.info(f"[WIDGET] Skipping Zep save (no phone number for memory)")
 
             # Create a formatted summary from transcript
             call_summary = ""
@@ -288,7 +308,7 @@ async def retell_inbound_webhook(request: Request):
                 try:
                     conversation_data = {
                         "id": str(uuid.uuid4()),
-                        "phone_number": from_number,
+                        "phone_number": from_number or f"widget_{call_id}",
                         "conversation_type": "voice_call",
                         "direction": "inbound",
                         "status": "completed",
@@ -373,8 +393,8 @@ async def retell_inbound_webhook(request: Request):
                     logger.warning("[EMAIL] RESEND_API_KEY not configured")
 
             # Clean up cache for this caller
-            _call_cache.pop(from_number, None)
-            logger.info(f"[CACHE] Cleaned up cache for {from_number}")
+            _call_cache.pop(caller_key, None)
+            logger.info(f"[CACHE] Cleaned up cache for {caller_key}")
 
             return JSONResponse(content={
                 "call_id": call_id,
@@ -423,20 +443,27 @@ async def retell_webhook(request: Request):
         phone = call_data.get("from_number", "")
         transcript = call_data.get("transcript_object", [])
 
-        if event_type == "call_ended" and transcript and phone:
-            logger.info(f"[SAVE] Saving {len(transcript)} messages to Zep")
+        is_widget = not phone
+        caller_key = phone or f"widget_{call_id}"
+
+        if event_type == "call_ended" and transcript and caller_key:
+            logger.info(f"[SAVE] Saving {len(transcript)} messages ({'widget' if is_widget else 'phone'})")
 
             caller_name = body.get("retell_llm_dynamic_variables", {}).get("caller_name")
             if not caller_name or caller_name == "New caller":
                 # Try cache first, then Zep
-                if phone in _call_cache:
-                    caller_name = _call_cache[phone].get("caller_name")
+                if caller_key in _call_cache:
+                    caller_name = _call_cache[caller_key].get("caller_name")
                     logger.info(f"[CACHE HIT] Got caller name from cache: {caller_name}")
-                else:
+                elif not is_widget:
                     memory_data = await lookup_caller_fast(phone)
                     caller_name = memory_data.get("caller_name")
 
-            save_result = await save_call_to_zep(phone, transcript, call_id, caller_name)
+            if is_widget:
+                logger.info(f"[WIDGET] Skipping Zep save for widget call {call_id}")
+                save_result = {"success": True, "message": "Widget call - no Zep save"}
+            else:
+                save_result = await save_call_to_zep(phone, transcript, call_id, caller_name)
 
             if save_result.get("extracted_name"):
                 logger.info(f"[SAVE] Name extracted: {save_result['extracted_name']}")
@@ -635,14 +662,18 @@ async def transfer_call_tool(request: Request):
         call_data = body.get("call", {})
         from_number = call_data.get("from_number", "")
         
-        logger.info(f"[TRANSFER] Transfer requested for caller: {from_number}")
-        
+        is_widget = not from_number
+        caller_key = from_number or f"widget_{call_data.get('call_id', '')}"
+        logger.info(f"[TRANSFER] Transfer requested for caller: {caller_key}")
+
         # Try cache first for caller info, then fall back to Zep
-        if from_number in _call_cache:
-            memory_data = _call_cache[from_number]
+        if caller_key in _call_cache:
+            memory_data = _call_cache[caller_key]
             logger.info(f"[TRANSFER] [CACHE HIT] Using cached data")
-        else:
+        elif not is_widget:
             memory_data = await lookup_caller_fast(from_number)
+        else:
+            memory_data = {"caller_location": None, "caller_specialist": None}
         
         caller_location = memory_data.get("caller_location")
         specialist_name = memory_data.get("caller_specialist")
