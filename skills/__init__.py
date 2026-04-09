@@ -19,6 +19,8 @@ from .specialists import (
     MONTANA_TOWN_TO_COUNTY,
     resolve_town_to_county,
     lookup_specialist_by_town,
+    lookup_staff_by_name,
+    is_lps,
 )
 
 from .knowledge import (
@@ -29,6 +31,7 @@ from .leads import (
     get_caller_name_from_leads,
     update_lead_with_name,
     capture_lead,
+    create_message_for_specialist,
 )
 
 __all__ = [
@@ -46,10 +49,13 @@ __all__ = [
     "MONTANA_TOWN_TO_COUNTY",
     "resolve_town_to_county",
     "lookup_specialist_by_town",
+    "lookup_staff_by_name",
+    "is_lps",
     # Knowledge
     "search_knowledge_base",
     # Leads
     "get_caller_name_from_leads",
     "update_lead_with_name",
     "capture_lead",
+    "create_message_for_specialist",
 ]

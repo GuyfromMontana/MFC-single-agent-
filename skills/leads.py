@@ -104,3 +104,54 @@ def capture_lead(name: str, phone: str, location: str, interests: str) -> bool:
     except Exception as e:
         logger.error(f"Error capturing lead: {e}")
         return False
+
+
+def create_message_for_specialist(
+    specialist_id: Optional[str],
+    specialist_name: Optional[str],
+    specialist_email: Optional[str],
+    caller_name: Optional[str],
+    caller_phone: Optional[str],
+    message: str,
+    reason: str = "message",
+) -> Optional[str]:
+    """
+    Create a callback row in the `callbacks` table representing a message
+    left by a caller for a specific staff member.
+
+    The existing `callbacks` table has exactly the right columns for this
+    (specialist_id, specialist_email, specialist_assigned, caller_phone,
+    caller_name, reason, notes, status). The `schedule_callback` tool
+    historically dumped everything into `leads` instead — this function is
+    the correct path for any "please tell X that..." flow.
+
+    Returns the new callback row id on success, None on failure.
+    """
+    if not supabase:
+        logger.warning("[MESSAGE] Cannot create message - Supabase not configured")
+        return None
+    try:
+        payload = {
+            "caller_phone": caller_phone or "unknown",
+            "caller_name": caller_name,
+            "specialist_id": specialist_id,
+            "specialist_email": specialist_email,
+            "specialist_assigned": specialist_name,
+            "reason": reason,
+            "notes": message,
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        result = supabase.table("callbacks").insert(payload).execute()
+        if result.data and len(result.data) > 0:
+            row_id = result.data[0].get("id")
+            logger.info(
+                f"[MESSAGE] Created callback {row_id} for "
+                f"{specialist_name or 'unknown'} from {caller_name or caller_phone}"
+            )
+            return row_id
+        return None
+    except Exception as e:
+        logger.error(f"[MESSAGE] Error creating callback: {e}")
+        return None

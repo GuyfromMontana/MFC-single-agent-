@@ -196,6 +196,101 @@ def resolve_town_to_county(location: str) -> str:
     return f"{location} County"
 
 
+def is_lps(specialist: Dict) -> bool:
+    """
+    Is this specialist a Livestock Performance Specialist (live-transfer eligible)?
+
+    Per 2026-04-09 design decision: only active LPSs get live call transfers.
+    Non-LPS staff (managers, warehouse, corporate) are message-only.
+    """
+    if not specialist or not specialist.get("is_active"):
+        return False
+    role = (specialist.get("role") or "").lower()
+    return "livestock performance" in role or role == "lps"
+
+
+def lookup_staff_by_name(name: str) -> list:
+    """
+    Fuzzy-match active staff in the `specialists` table by name.
+
+    Matches against first_name, last_name, and the concatenated full name
+    using case-insensitive ILIKE. Returns a list of matches (0, 1, or many).
+
+    Accepts single names ("Sheryl"), full names ("Sheryl Shea"), or partials
+    ("shea"). Inactive staff are excluded.
+
+    Each result is a dict with: id, first_name, last_name, full_name, email,
+    phone, role, specialties, counties, is_lps (live-transfer eligible).
+    """
+    if not supabase:
+        logger.warning("[STAFF] Supabase not configured")
+        return []
+
+    if not name or not name.strip():
+        return []
+
+    query = name.strip()
+    # Uppercase & lowercase variants both work — PostgREST ilike is case-insensitive.
+    # Supabase Python client uses `%` wildcards and `or_` for disjunction.
+    logger.info(f"[STAFF] Looking up by name: '{query}'")
+
+    try:
+        # Split into tokens so "Sheryl Shea" matches even if columns differ
+        tokens = [t.strip() for t in query.split() if t.strip()]
+
+        # Start with is_active=true, then build an OR filter on tokens
+        q = supabase.table("specialists") \
+            .select("id, first_name, last_name, email, phone, role, specialties, counties, is_active") \
+            .eq("is_active", True)
+
+        if len(tokens) >= 2:
+            # Multi-token: require full_name ilike OR (first ilike AND last ilike).
+            # PostgREST 'or' filter: first_name.ilike.%tok1%,last_name.ilike.%tok2%, ...
+            first_tok, last_tok = tokens[0], tokens[-1]
+            or_filter = (
+                f"and(first_name.ilike.%{first_tok}%,last_name.ilike.%{last_tok}%),"
+                f"and(first_name.ilike.%{last_tok}%,last_name.ilike.%{first_tok}%),"
+                f"first_name.ilike.%{query}%,"
+                f"last_name.ilike.%{query}%"
+            )
+            q = q.or_(or_filter)
+        else:
+            # Single token: match any column containing it
+            tok = tokens[0]
+            or_filter = (
+                f"first_name.ilike.%{tok}%,"
+                f"last_name.ilike.%{tok}%"
+            )
+            q = q.or_(or_filter)
+
+        result = q.execute()
+        rows = result.data or []
+
+        # Normalize output for the voice agent
+        matches = []
+        for s in rows:
+            full_name = f"{s.get('first_name','')} {s.get('last_name','')}".strip()
+            matches.append({
+                "id": s.get("id"),
+                "first_name": s.get("first_name"),
+                "last_name": s.get("last_name"),
+                "full_name": full_name,
+                "email": s.get("email"),
+                "phone": s.get("phone"),
+                "role": s.get("role"),
+                "specialties": s.get("specialties") or [],
+                "counties": s.get("counties") or [],
+                "is_lps": is_lps(s),
+            })
+
+        logger.info(f"[STAFF] Found {len(matches)} match(es) for '{query}'")
+        return matches
+
+    except Exception as e:
+        logger.error(f"[STAFF] lookup_staff_by_name error: {e}")
+        return []
+
+
 def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
     """Look up specialist by town/county name with automatic town→county resolution."""
     if not supabase:

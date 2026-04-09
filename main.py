@@ -35,12 +35,20 @@ from skills import (
     zep_update_user_metadata,
     # Specialists
     lookup_specialist_by_town,
+    lookup_staff_by_name,
+    is_lps,
     # Knowledge
     search_knowledge_base,
     # Leads
     capture_lead,
     update_lead_with_name,
+    create_message_for_specialist,
 )
+
+# Main office fallback number for the voice agent. Single source of truth —
+# used by lookup_staff, lookup_staff_by_name, and schedule_callback when a
+# request can't be routed to a specific person.
+MFC_MAIN_OFFICE_PHONE = "406-728-7020"
 
 # ============================================================================
 # CALL CACHE - Store Zep lookups from call_started for reuse at call_ended
@@ -579,19 +587,111 @@ async def lookup_town(request: Request):
 
 @app.post("/retell/functions/schedule_callback")
 async def schedule_callback(request: Request):
-    """Schedule a callback for a caller."""
+    """
+    Schedule a callback OR leave a message for a specific staff member.
+
+    Two call shapes:
+
+    1. SCHEDULED CALLBACK (caller wants a return call at a future time):
+       { "caller_name": "...", "callback_time": "...", "reason": "..." }
+
+    2. LEAVE A MESSAGE FOR X (caller wants a specific person to get a message):
+       { "caller_name": "...", "reason": "message",
+         "specialist_name": "Sheryl Shea",
+         "specialist_id": "<uuid>",
+         "specialist_email": "sheryl@axmen.com",
+         "message_content": "..." }
+
+    Both shapes write to the `callbacks` table (NOT `leads`). If a specialist
+    email is present, the message is immediately sent via Resend.
+    """
     try:
         body = await request.json()
         args = body.get("arguments", {})
-        name = args.get("name", "")
-        phone_num = args.get("phone", body.get("call", {}).get("from_number", ""))
+        call_data = body.get("call", {}) or {}
+
+        caller_name = args.get("caller_name") or args.get("name", "")
+        caller_phone = args.get("phone") or call_data.get("from_number", "")
+        reason = (args.get("reason") or "callback").strip().lower()
         callback_time = args.get("callback_time", "")
+        message_content = args.get("message_content") or args.get("notes", "")
 
-        success = capture_lead(name, phone_num, "callback", f"Callback: {callback_time}")
-        result = f"Scheduled callback for {callback_time}." if success else "Noted your request."
+        specialist_id = args.get("specialist_id")
+        specialist_name = args.get("specialist_name")
+        specialist_email = args.get("specialist_email")
 
-        return JSONResponse(content={"result": result, "success": success})
+        # Compose the notes field: either the message body or the callback timeframe
+        if reason == "message" and message_content:
+            notes = message_content
+        elif callback_time:
+            notes = f"Requested callback time: {callback_time}"
+            if message_content:
+                notes += f"\n\n{message_content}"
+        else:
+            notes = message_content or "(no details provided)"
+
+        # Write to callbacks table via the skill function
+        callback_id = create_message_for_specialist(
+            specialist_id=specialist_id,
+            specialist_name=specialist_name,
+            specialist_email=specialist_email,
+            caller_name=caller_name,
+            caller_phone=caller_phone,
+            message=notes,
+            reason=reason,
+        )
+
+        if not callback_id:
+            # Fallback: at least log a lead so nothing is lost
+            capture_lead(caller_name, caller_phone, "callback", notes[:500])
+            return JSONResponse(content={
+                "result": (
+                    "I've noted your request. Our team will follow up with you at "
+                    f"{MFC_MAIN_OFFICE_PHONE} or the number you're calling from."
+                ),
+                "success": False,
+            })
+
+        # If we have a specialist email, fire off an email notification right now
+        email_sent = False
+        if specialist_email:
+            try:
+                email_sent = await send_specialist_email(
+                    specialist_email=specialist_email,
+                    specialist_name=specialist_name or "Team",
+                    caller_name=caller_name or "Unknown caller",
+                    caller_phone=caller_phone or "unknown",
+                    caller_location="",
+                    call_summary=notes,
+                    duration=None,
+                )
+            except Exception as e:
+                logger.error(f"[SCHEDULE_CALLBACK] Email send failed: {e}")
+
+        # Build a user-facing confirmation the voice agent can speak back
+        if reason == "message" and specialist_name:
+            spoken = (
+                f"Got it. I'll make sure {specialist_name} gets your message"
+                f"{' by email' if email_sent else ''}. "
+                f"They'll reach out to you at the number you called from."
+            )
+        elif callback_time and specialist_name:
+            spoken = (
+                f"Scheduled a callback from {specialist_name} for {callback_time}."
+            )
+        elif callback_time:
+            spoken = f"Scheduled your callback for {callback_time}."
+        else:
+            spoken = "Your request has been noted and the team will follow up."
+
+        return JSONResponse(content={
+            "result": spoken,
+            "success": True,
+            "callback_id": callback_id,
+            "email_sent": email_sent,
+        })
     except Exception as e:
+        logger.error(f"[SCHEDULE_CALLBACK] Error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
@@ -631,12 +731,18 @@ async def end_call(request: Request):
 
 @app.post("/retell/functions/lookup_staff")
 async def lookup_staff(request: Request):
-    """Look up specialist by location and save to Zep."""
+    """
+    Legacy endpoint — misnamed. Historically this took a `location` arg and
+    called `lookup_specialist_by_town`. Kept for backwards compatibility with
+    any existing Retell agent config referencing this URL, but the agent
+    should prefer `lookup_staff_by_name` for actual name-based requests and
+    `lookup_town` for territorial routing.
+    """
     try:
         body = await request.json()
         location = body.get("arguments", {}).get("location", "")
         phone = body.get("call", {}).get("from_number", "")
-        
+
         specialist = lookup_specialist_by_town(location)
 
         if specialist and phone:
@@ -647,10 +753,114 @@ async def lookup_staff(request: Request):
             })
             result = f"Your specialist is {specialist['specialist_name']} at {specialist['specialist_phone']}."
         else:
-            result = "Let me connect you with our main office at 406-883-4290."
+            result = f"Let me connect you with our main office at {MFC_MAIN_OFFICE_PHONE}."
 
         return JSONResponse(content={"result": result, "success": bool(specialist)})
     except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/retell/functions/lookup_staff_by_name")
+async def lookup_staff_by_name_endpoint(request: Request):
+    """
+    Look up a staff member by name. Handles single names ("Sheryl"),
+    full names ("Sheryl Shea"), or partials ("shea"). Returns structured
+    data the voice agent can use to decide how to route the caller.
+
+    Response shape:
+        {
+          "result": "<natural-language summary the agent can speak>",
+          "success": true/false,
+          "match_count": N,
+          "matches": [
+            {
+              "id": "<uuid>",
+              "full_name": "Sheryl Shea",
+              "role": "manager",
+              "email": "sheryl@axmen.com",
+              "phone": "406-610-2520",
+              "is_lps": false,          # can we live-transfer?
+              "specialties": [...],
+            },
+            ...
+          ],
+          "main_office": "406-728-7020"
+        }
+
+    Routing guidance for the agent:
+      - match_count == 0  -> offer main office or lookup by town
+      - match_count == 1  -> confirm with caller, then offer:
+                              * live transfer if is_lps == true
+                              * leave a message otherwise (via schedule_callback)
+      - match_count >= 2  -> ask caller to clarify (first name only + last name)
+    """
+    try:
+        body = await request.json()
+        args = body.get("arguments", {})
+        name_query = (args.get("name") or "").strip()
+
+        if not name_query:
+            return JSONResponse(content={
+                "result": "I need a name to search for. Who are you trying to reach?",
+                "success": False,
+                "match_count": 0,
+                "matches": [],
+                "main_office": MFC_MAIN_OFFICE_PHONE,
+            })
+
+        matches = lookup_staff_by_name(name_query)
+
+        # Trim / sanitize for the voice agent — don't ship phone/email in the
+        # spoken summary by default, but DO include them in the structured data
+        # so the agent can act on them.
+        cleaned = []
+        for m in matches:
+            cleaned.append({
+                "id": m.get("id"),
+                "full_name": m.get("full_name"),
+                "role": m.get("role"),
+                "email": m.get("email"),
+                "phone": m.get("phone"),
+                "is_lps": bool(m.get("is_lps")),
+                "specialties": m.get("specialties") or [],
+            })
+
+        count = len(cleaned)
+        if count == 0:
+            spoken = (
+                f"I can't find anyone matching '{name_query}' in our directory. "
+                f"Would you like me to connect you with our main office at "
+                f"{MFC_MAIN_OFFICE_PHONE}?"
+            )
+        elif count == 1:
+            m = cleaned[0]
+            if m["is_lps"]:
+                spoken = (
+                    f"I found {m['full_name']}, your {m['role']}. "
+                    f"Would you like me to connect you, or take a message?"
+                )
+            else:
+                spoken = (
+                    f"I found {m['full_name']} in {m['role'] or 'our team'}. "
+                    f"They handle calls by message — I can take a message and "
+                    f"email it to them right now if you'd like."
+                )
+        else:
+            names = ", ".join(m["full_name"] for m in cleaned[:4])
+            spoken = (
+                f"I found {count} people matching '{name_query}': {names}. "
+                f"Which one are you trying to reach?"
+            )
+
+        return JSONResponse(content={
+            "result": spoken,
+            "success": count > 0,
+            "match_count": count,
+            "matches": cleaned,
+            "main_office": MFC_MAIN_OFFICE_PHONE,
+        })
+    except Exception as e:
+        logger.error(f"[LOOKUP_STAFF_BY_NAME] Error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
