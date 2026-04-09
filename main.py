@@ -796,10 +796,22 @@ async def lookup_staff_by_name_endpoint(request: Request):
     """
     try:
         body = await request.json()
-        args = body.get("arguments", {})
+
+        # Defensive arg parsing: Retell sends function arguments as the top-level
+        # body (with an `execution_message` field alongside), NOT wrapped in an
+        # `arguments` key. Fall back to both to be robust against either format.
+        if "arguments" in body and isinstance(body["arguments"], dict):
+            args = body["arguments"]
+        else:
+            args = body
         name_query = (args.get("name") or "").strip()
 
+        # Always log the raw body at INFO so we can diagnose future failures
+        # without needing to re-reproduce the exact call.
+        logger.info(f"[LOOKUP_STAFF_BY_NAME] raw body keys: {list(body.keys())}, name='{name_query}'")
+
         if not name_query:
+            logger.warning(f"[LOOKUP_STAFF_BY_NAME] empty name_query, body={body}")
             return JSONResponse(content={
                 "result": "I need a name to search for. Who are you trying to reach?",
                 "success": False,
@@ -808,7 +820,27 @@ async def lookup_staff_by_name_endpoint(request: Request):
                 "main_office": MFC_MAIN_OFFICE_PHONE,
             })
 
+        # First pass: try the exact query as given
         matches = lookup_staff_by_name(name_query)
+
+        # Fallback: if a multi-word query returns zero, the ASR probably mis-heard
+        # part of the name (e.g. "Cheryl Shea" instead of "Sheryl Shea"). Retry
+        # with each token individually and merge results. This is forgiving of
+        # partial matches without losing correctness — if both tokens happened to
+        # match different people, we return both and the agent asks to clarify.
+        if not matches:
+            tokens = [t.strip() for t in name_query.split() if len(t.strip()) >= 3]
+            if len(tokens) >= 2:
+                logger.info(f"[LOOKUP_STAFF_BY_NAME] zero matches for '{name_query}', retrying tokens: {tokens}")
+                seen_ids = set()
+                merged = []
+                for tok in tokens:
+                    for m in lookup_staff_by_name(tok):
+                        if m.get("id") not in seen_ids:
+                            seen_ids.add(m.get("id"))
+                            merged.append(m)
+                matches = merged
+                logger.info(f"[LOOKUP_STAFF_BY_NAME] token fallback found {len(matches)} match(es)")
 
         # Trim / sanitize for the voice agent — don't ship phone/email in the
         # spoken summary by default, but DO include them in the structured data
