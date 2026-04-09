@@ -836,14 +836,15 @@ async def lookup_staff_by_name_endpoint(request: Request):
             m = cleaned[0]
             if m["is_lps"]:
                 spoken = (
-                    f"I found {m['full_name']}, your {m['role']}. "
+                    f"I found {m['full_name']}, {m['role']}. "
                     f"Would you like me to connect you, or take a message?"
                 )
             else:
+                role_phrase = f"from our {m['role']} team" if m['role'] else "on our team"
                 spoken = (
-                    f"I found {m['full_name']} in {m['role'] or 'our team'}. "
-                    f"They handle calls by message — I can take a message and "
-                    f"email it to them right now if you'd like."
+                    f"I found {m['full_name']} {role_phrase}. "
+                    f"I can take a message and email it to them right now — "
+                    f"would you like to leave one?"
                 )
         else:
             names = ", ".join(m["full_name"] for m in cleaned[:4])
