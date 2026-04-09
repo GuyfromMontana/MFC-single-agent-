@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager
 
 import httpx
 from supabase import create_client, Client
-from openai import OpenAI
 
 # ============================================================================
 # LOGGING
@@ -26,7 +25,6 @@ logger = logging.getLogger(__name__)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ZEP_API_KEY = os.getenv("ZEP_API_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Validate critical env vars
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -40,9 +38,6 @@ if not ZEP_API_KEY:
 
 # Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
-
-# OpenAI client
-openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=5.0, max_retries=1)
 
 # ============================================================================
 # ZEP CLOUD REST API CONFIGURATION
