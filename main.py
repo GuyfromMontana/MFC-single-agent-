@@ -63,7 +63,7 @@ _call_cache: dict[str, dict] = {}
 # ============================================================================
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-FROM_EMAIL = os.getenv("FROM_EMAIL", "notifications@montanafeed.com")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "notifications@axmen.com")
 
 async def send_specialist_email(specialist_email: str, specialist_name: str, caller_name: str, 
                                 caller_phone: str, caller_location: str, call_summary: str,
