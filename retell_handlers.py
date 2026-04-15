@@ -31,23 +31,7 @@ from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# We'll import these from main.py when this module is loaded
-# This allows us to reuse all your existing V3-migrated functions
-zep = None
-supabase = None
-
 router = APIRouter(prefix="/retell", tags=["Retell"])
-
-# ============================================================================
-# INITIALIZATION - Called when main.py imports this module
-# ============================================================================
-
-def init_clients(zep_client, supabase_client):
-    """Initialize with clients from main.py"""
-    global zep, supabase
-    zep = zep_client
-    supabase = supabase_client
-    print("✅ Retell handlers initialized with Zep V3 and Supabase clients")
 
 # ============================================================================
 # RETELL SIGNATURE VERIFICATION
@@ -57,33 +41,35 @@ def verify_retell_signature(body: bytes, signature: str) -> bool:
     """
     Verify the request is from Retell using HMAC signature.
     Retell signs the request body with your API key.
+
+    Behavior:
+      - If RETELL_API_KEY is not set, we FAIL CLOSED in production-like
+        environments. Set RETELL_SIGNATURE_ENFORCE=false only for local testing.
     """
-    # TEMPORARY: Skip verification for testing
-    # TODO: Re-enable after adding RETELL_API_KEY to Railway
-    print("⚠️ SIGNATURE VERIFICATION DISABLED FOR TESTING")
-    return True
-    
-    # Commented out for testing - uncomment after adding API key
-    # api_key = os.getenv("RETELL_API_KEY", "")
-    # if not api_key:
-    #     print("⚠️ RETELL_API_KEY not set - skipping signature verification")
-    #     return True  # Allow requests if no key set (for testing)
-    # 
-    # if not signature:
-    #     print("⚠️ No x-retell-signature header")
-    #     return False
-    # 
-    # try:
-    #     # Retell uses the API key as the HMAC secret
-    #     expected = hmac.new(
-    #         api_key.encode('utf-8'),
-    #         body,
-    #         hashlib.sha256
-    #     ).hexdigest()
-    #     return hmac.compare_digest(expected, signature)
-    # except Exception as e:
-    #     print(f"⚠️ Signature verification error: {e}")
-    #     return False
+    api_key = os.getenv("RETELL_API_KEY", "").strip()
+    enforce = os.getenv("RETELL_SIGNATURE_ENFORCE", "true").lower() != "false"
+
+    if not api_key:
+        if enforce:
+            print("❌ RETELL_API_KEY not set — rejecting request (enforce=true)")
+            return False
+        print("⚠️ RETELL_API_KEY not set — allowing request (enforce=false, local dev only)")
+        return True
+
+    if not signature:
+        print("⚠️ No x-retell-signature header on request")
+        return False
+
+    try:
+        expected = hmac.new(
+            api_key.encode("utf-8"),
+            body,
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
+    except Exception as e:
+        print(f"⚠️ Signature verification error: {e}")
+        return False
 
 # ============================================================================
 # HEALTH CHECK

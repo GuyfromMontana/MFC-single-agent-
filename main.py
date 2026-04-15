@@ -7,12 +7,14 @@ Version 3.0.9 - WIDGET CALL SUPPORT
 - Previous: v3.0.8 call cache + email by name
 """
 
-from datetime import datetime
+import asyncio
 import os
-import httpx
+import time
 import uuid
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request
+import httpx
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # Import configuration and clients
@@ -53,10 +55,34 @@ MFC_MAIN_OFFICE_PHONE = "406-728-7020"
 # ============================================================================
 # CALL CACHE - Store Zep lookups from call_started for reuse at call_ended
 # ============================================================================
-# Keyed by phone number, stores memory_data dict
-# Cleaned up after call_ended processing completes
+# Keyed by phone number (or widget_<call_id>), stores {"data": dict, "ts": float}.
+# Entries auto-expire after CALL_CACHE_TTL_SECONDS so stalled/abandoned calls
+# can't leak memory if call_ended never fires.
 
+CALL_CACHE_TTL_SECONDS = 60 * 60  # 1 hour — longer than any real call
 _call_cache: dict[str, dict] = {}
+
+
+def _cache_set(key: str, data: dict) -> None:
+    _call_cache[key] = {"data": data, "ts": time.time()}
+    _cache_evict_expired()
+
+
+def _cache_get(key: str) -> dict | None:
+    entry = _call_cache.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["ts"] > CALL_CACHE_TTL_SECONDS:
+        _call_cache.pop(key, None)
+        return None
+    return entry["data"]
+
+
+def _cache_evict_expired() -> None:
+    now = time.time()
+    expired = [k for k, v in _call_cache.items() if now - v["ts"] > CALL_CACHE_TTL_SECONDS]
+    for k in expired:
+        _call_cache.pop(k, None)
 
 # ============================================================================
 # EMAIL CONFIGURATION
@@ -159,7 +185,7 @@ async def health_check():
 
 
 @app.post("/retell-inbound-webhook")
-async def retell_inbound_webhook(request: Request):
+async def retell_inbound_webhook(request: Request, background_tasks: BackgroundTasks):
     """Inbound webhook - handles call_started and call_ended events."""
     try:
         body = await request.json()
@@ -186,8 +212,9 @@ async def retell_inbound_webhook(request: Request):
             logger.info(f"Inbound: {caller_key} -> {to_number} (agent: {agent_id}, {'widget' if is_widget else 'phone'})")
 
             # Check if we already cached this caller (call_inbound fires before call_started)
-            if caller_key in _call_cache:
-                memory_data = _call_cache[caller_key]
+            cached = _cache_get(caller_key)
+            if cached is not None:
+                memory_data = cached
                 logger.info(f"[CACHE HIT] Using cached Zep data for {caller_key}")
             elif is_widget:
                 # Widget caller — no Zep history possible, return new caller defaults
@@ -197,12 +224,12 @@ async def retell_inbound_webhook(request: Request):
                     "caller_specialist": None, "conversation_history": "",
                     "message": "Widget caller"
                 }
-                _call_cache[caller_key] = memory_data
+                _cache_set(caller_key, memory_data)
                 logger.info(f"[WIDGET] New widget caller, cached as {caller_key}")
             else:
                 # First event for this call - do the Zep lookup and cache it
                 memory_data = await lookup_caller_fast(caller_key)
-                _call_cache[caller_key] = memory_data
+                _cache_set(caller_key, memory_data)
                 logger.info(f"[CACHE MISS] Looked up Zep and cached for {caller_key}")
 
             caller_name = memory_data.get("caller_name")
@@ -255,8 +282,8 @@ async def retell_inbound_webhook(request: Request):
             
             if start_time and end_time:
                 duration_seconds = int((end_time - start_time) / 1000)
-                start_datetime = datetime.fromtimestamp(start_time / 1000)
-                end_datetime = datetime.fromtimestamp(end_time / 1000)
+                start_datetime = datetime.fromtimestamp(start_time / 1000, tz=timezone.utc)
+                end_datetime = datetime.fromtimestamp(end_time / 1000, tz=timezone.utc)
             
             # Widget calls have no from_number — use call_id as fallback
             is_widget = not from_number
@@ -265,8 +292,9 @@ async def retell_inbound_webhook(request: Request):
             logger.info(f"[CALL_ENDED] {caller_key} ({'widget' if is_widget else 'phone'}), duration: {duration_seconds}s")
 
             # Use cached memory data if available, otherwise fall back to Zep
-            if caller_key in _call_cache:
-                memory_data = _call_cache[caller_key]
+            cached = _cache_get(caller_key)
+            if cached is not None:
+                memory_data = cached
                 logger.info(f"[CACHE HIT] Using cached Zep data for call_ended")
             elif is_widget:
                 memory_data = {
@@ -314,6 +342,7 @@ async def retell_inbound_webhook(request: Request):
             
             if supabase:
                 try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
                     conversation_data = {
                         "id": str(uuid.uuid4()),
                         "phone_number": from_number or f"widget_{call_id}",
@@ -325,30 +354,44 @@ async def retell_inbound_webhook(request: Request):
                         "duration_seconds": duration_seconds,
                         "vapi_call_id": call_id,
                         "ai_summary": call_summary[:500] if call_summary else None,
-                        "created_at": datetime.utcnow().isoformat(),
-                        "updated_at": datetime.utcnow().isoformat()
+                        "created_at": now_iso,
+                        "updated_at": now_iso,
                     }
-                    
-                    conversation_result = supabase.table("conversations").insert(conversation_data).execute()
-                    
+
+                    # Wrap blocking Supabase call so it doesn't block the event loop
+                    conversation_result = await asyncio.to_thread(
+                        lambda: supabase.table("conversations").insert(conversation_data).execute()
+                    )
+
                     if conversation_result.data and len(conversation_result.data) > 0:
                         conversation_id = conversation_result.data[0]["id"]
                         logger.info(f"✅ Created conversation: {conversation_id}")
-                        
-                        if transcript_object:
+
+                        # Defensive: only iterate if we actually have a list of dicts
+                        if isinstance(transcript_object, list) and transcript_object:
+                            messages_payload = []
                             for msg in transcript_object:
-                                message_data = {
+                                if not isinstance(msg, dict):
+                                    continue
+                                content = msg.get("content", "")
+                                if not content:
+                                    continue
+                                messages_payload.append({
                                     "id": str(uuid.uuid4()),
                                     "conversation_id": conversation_id,
-                                    "content": msg.get("content", ""),
+                                    "content": content,
                                     "sender": "user" if msg.get("role") == "user" else "assistant",
                                     "message_type": "voice",
-                                    "created_at": datetime.utcnow().isoformat()
-                                }
-                                supabase.table("conversation_messages").insert(message_data).execute()
-                            
-                            logger.info(f"✅ Saved {len(transcript_object)} messages to conversation_messages")
-                    
+                                    "created_at": now_iso,
+                                })
+
+                            if messages_payload:
+                                # Single batched insert instead of N inserts
+                                await asyncio.to_thread(
+                                    lambda: supabase.table("conversation_messages").insert(messages_payload).execute()
+                                )
+                                logger.info(f"✅ Saved {len(messages_payload)} messages to conversation_messages (batched)")
+
                 except Exception as e:
                     logger.error(f"❌ Failed to save to Supabase: {e}", exc_info=True)
 
@@ -357,41 +400,47 @@ async def retell_inbound_webhook(request: Request):
             # ====================================================================
             if specialist_name and RESEND_API_KEY:
                 specialist_email = None
-                
+
                 if supabase:
                     try:
+                        # Sanity-cap inputs before sending to ilike()
                         name_parts = specialist_name.split(None, 1)
-                        first_name = name_parts[0]
-                        last_name = name_parts[1] if len(name_parts) > 1 else ""
-                        
+                        first_name = name_parts[0][:50]
+                        last_name = (name_parts[1] if len(name_parts) > 1 else "")[:50]
+
                         logger.info(f"[EMAIL] Looking up email for: {first_name} {last_name}")
-                        
-                        result = supabase.table("specialists")\
-                            .select("email, first_name, last_name")\
-                            .ilike("first_name", first_name)\
-                            .ilike("last_name", last_name)\
-                            .eq("is_active", True)\
-                            .execute()
-                        
+
+                        result = await asyncio.to_thread(
+                            lambda: supabase.table("specialists")
+                                .select("email, first_name, last_name")
+                                .ilike("first_name", first_name)
+                                .ilike("last_name", last_name)
+                                .eq("is_active", True)
+                                .execute()
+                        )
+
                         if result.data and len(result.data) > 0:
                             specialist_email = result.data[0].get("email")
                             logger.info(f"[EMAIL] Found email: {specialist_email}")
                         else:
                             logger.warning(f"[EMAIL] No specialist found matching: {first_name} {last_name}")
-                    
+
                     except Exception as e:
                         logger.error(f"[EMAIL] Specialist lookup error: {e}")
-                
+
                 if specialist_email:
-                    await send_specialist_email(
+                    # Fire email in the background so the webhook can return immediately.
+                    background_tasks.add_task(
+                        send_specialist_email,
                         specialist_email=specialist_email,
                         specialist_name=specialist_name,
                         caller_name=caller_name or "Unknown Caller",
                         caller_phone=from_number,
                         caller_location=caller_location or "Unknown",
                         call_summary=call_summary or "No transcript available",
-                        duration=duration_seconds
+                        duration=duration_seconds,
                     )
+                    logger.info("[EMAIL] Queued specialist notification email (background)")
                 else:
                     logger.warning(f"[EMAIL] No email found for specialist: {specialist_name}")
             else:
@@ -460,8 +509,9 @@ async def retell_webhook(request: Request):
             caller_name = body.get("retell_llm_dynamic_variables", {}).get("caller_name")
             if not caller_name or caller_name == "New caller":
                 # Try cache first, then Zep
-                if caller_key in _call_cache:
-                    caller_name = _call_cache[caller_key].get("caller_name")
+                cached = _cache_get(caller_key)
+                if cached is not None:
+                    caller_name = cached.get("caller_name")
                     logger.info(f"[CACHE HIT] Got caller name from cache: {caller_name}")
                 elif not is_widget:
                     memory_data = await lookup_caller_fast(phone)
@@ -515,7 +565,7 @@ async def fix_zep_user(request: Request):
 
         if response.status_code == 200:
             name_parts = name.split(None, 1)
-            update_lead_with_name(phone, name_parts[0], name_parts[1] if len(name_parts) > 1 else "")
+            await update_lead_with_name(phone, name_parts[0], name_parts[1] if len(name_parts) > 1 else "")
             return {"success": True, "message": f"Updated {user_id} to {name}"}
         else:
             return {"success": False, "error": response.text}
@@ -564,7 +614,7 @@ async def lookup_town(request: Request):
 
         logger.info(f"[LOOKUP_TOWN] Searching for: '{town}'")
 
-        specialist = lookup_specialist_by_town(town)
+        specialist = await lookup_specialist_by_town(town)
 
         if specialist and phone:
             user_id = f"caller_{normalize_phone(phone)}"
@@ -631,7 +681,7 @@ async def schedule_callback(request: Request):
             notes = message_content or "(no details provided)"
 
         # Write to callbacks table via the skill function
-        callback_id = create_message_for_specialist(
+        callback_id = await create_message_for_specialist(
             specialist_id=specialist_id,
             specialist_name=specialist_name,
             specialist_email=specialist_email,
@@ -643,7 +693,7 @@ async def schedule_callback(request: Request):
 
         if not callback_id:
             # Fallback: at least log a lead so nothing is lost
-            capture_lead(caller_name, caller_phone, "callback", notes[:500])
+            await capture_lead(caller_name, caller_phone, "callback", notes[:500])
             return JSONResponse(content={
                 "result": (
                     "I've noted your request. Our team will follow up with you at "
@@ -704,7 +754,7 @@ async def create_lead_endpoint(request: Request):
         name = args.get("name", "")
         phone_num = args.get("phone", body.get("call", {}).get("from_number", ""))
 
-        success = capture_lead(name, phone_num, args.get("location", ""), args.get("interests", ""))
+        success = await capture_lead(name, phone_num, args.get("location", ""), args.get("interests", ""))
         result = f"Saved your info, {name}." if success else "Noted your information."
 
         return JSONResponse(content={"result": result, "success": success})
@@ -743,7 +793,7 @@ async def lookup_staff(request: Request):
         location = body.get("arguments", {}).get("location", "")
         phone = body.get("call", {}).get("from_number", "")
 
-        specialist = lookup_specialist_by_town(location)
+        specialist = await lookup_specialist_by_town(location)
 
         if specialist and phone:
             user_id = f"caller_{normalize_phone(phone)}"
@@ -821,7 +871,7 @@ async def lookup_staff_by_name_endpoint(request: Request):
             })
 
         # First pass: try the exact query as given
-        matches = lookup_staff_by_name(name_query)
+        matches = await lookup_staff_by_name(name_query)
 
         # Fallback: if a multi-word query returns zero, the ASR probably mis-heard
         # part of the name (e.g. "Cheryl Shea" instead of "Sheryl Shea"). Retry
@@ -835,7 +885,7 @@ async def lookup_staff_by_name_endpoint(request: Request):
                 seen_ids = set()
                 merged = []
                 for tok in tokens:
-                    for m in lookup_staff_by_name(tok):
+                    for m in await lookup_staff_by_name(tok):
                         if m.get("id") not in seen_ids:
                             seen_ids.add(m.get("id"))
                             merged.append(m)
@@ -910,8 +960,9 @@ async def transfer_call_tool(request: Request):
         logger.info(f"[TRANSFER] Transfer requested for caller: {caller_key}")
 
         # Try cache first for caller info, then fall back to Zep
-        if caller_key in _call_cache:
-            memory_data = _call_cache[caller_key]
+        cached = _cache_get(caller_key)
+        if cached is not None:
+            memory_data = cached
             logger.info(f"[TRANSFER] [CACHE HIT] Using cached data")
         elif not is_widget:
             memory_data = await lookup_caller_fast(from_number)
@@ -923,7 +974,7 @@ async def transfer_call_tool(request: Request):
         
         logger.info(f"[TRANSFER] Caller location: {caller_location}, Specialist: {specialist_name}")
         
-        specialist = lookup_specialist_by_town(caller_location or "")
+        specialist = await lookup_specialist_by_town(caller_location or "")
         
         if specialist and specialist.get("specialist_phone"):
             phone_number = specialist["specialist_phone"]

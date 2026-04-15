@@ -283,7 +283,7 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
                 # AUTO-LOOKUP: If we have location but no specialist, look it up now
                 if caller_location and not caller_specialist:
                     from .specialists import lookup_specialist_by_town
-                    specialist_info = lookup_specialist_by_town(caller_location)
+                    specialist_info = await lookup_specialist_by_town(caller_location)
                     if specialist_info:
                         caller_specialist = specialist_info["specialist_name"]
                         # Save it to metadata for next time
@@ -365,7 +365,7 @@ async def save_call_to_zep(phone: str, transcript: List[Dict], call_id: str, cal
             name_parts = caller_name.split(None, 1)
             first_name = name_parts[0]
             last_name = name_parts[1] if len(name_parts) > 1 else ""
-            update_lead_with_name(phone, first_name, last_name)
+            await update_lead_with_name(phone, first_name, last_name)
         else:
             await zep_create_or_update_user(user_id, phone, first_name="Caller", metadata=metadata)
 

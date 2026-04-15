@@ -1,8 +1,14 @@
 """
 Montana Feed Company - Specialist Lookup Skills
 7 Livestock Performance Specialists covering Montana + Wyoming
+
+DB-touching functions (lookup_staff_by_name, lookup_specialist_by_town) are
+`async` and offload the synchronous Supabase client to a worker thread via
+`asyncio.to_thread`, so they don't block the FastAPI event loop. Pure helpers
+(`is_lps`, `resolve_town_to_county`) stay synchronous.
 """
 
+import asyncio
 import logging
 from typing import Optional, Dict
 
@@ -209,7 +215,7 @@ def is_lps(specialist: Dict) -> bool:
     return "livestock performance" in role or role == "lps"
 
 
-def lookup_staff_by_name(name: str) -> list:
+async def lookup_staff_by_name(name: str) -> list:
     """
     Fuzzy-match active staff in the `specialists` table by name.
 
@@ -238,32 +244,31 @@ def lookup_staff_by_name(name: str) -> list:
         # Split into tokens so "Sheryl Shea" matches even if columns differ
         tokens = [t.strip() for t in query.split() if t.strip()]
 
-        # Start with is_active=true, then build an OR filter on tokens
-        q = supabase.table("specialists") \
-            .select("id, first_name, last_name, email, phone, role, specialties, counties, is_active") \
-            .eq("is_active", True)
+        def _run_query():
+            q = supabase.table("specialists") \
+                .select("id, first_name, last_name, email, phone, role, specialties, counties, is_active") \
+                .eq("is_active", True)
 
-        if len(tokens) >= 2:
-            # Multi-token: require full_name ilike OR (first ilike AND last ilike).
-            # PostgREST 'or' filter: first_name.ilike.%tok1%,last_name.ilike.%tok2%, ...
-            first_tok, last_tok = tokens[0], tokens[-1]
-            or_filter = (
-                f"and(first_name.ilike.%{first_tok}%,last_name.ilike.%{last_tok}%),"
-                f"and(first_name.ilike.%{last_tok}%,last_name.ilike.%{first_tok}%),"
-                f"first_name.ilike.%{query}%,"
-                f"last_name.ilike.%{query}%"
-            )
-            q = q.or_(or_filter)
-        else:
-            # Single token: match any column containing it
-            tok = tokens[0]
-            or_filter = (
-                f"first_name.ilike.%{tok}%,"
-                f"last_name.ilike.%{tok}%"
-            )
-            q = q.or_(or_filter)
+            if len(tokens) >= 2:
+                first_tok, last_tok = tokens[0], tokens[-1]
+                or_filter = (
+                    f"and(first_name.ilike.%{first_tok}%,last_name.ilike.%{last_tok}%),"
+                    f"and(first_name.ilike.%{last_tok}%,last_name.ilike.%{first_tok}%),"
+                    f"first_name.ilike.%{query}%,"
+                    f"last_name.ilike.%{query}%"
+                )
+                q = q.or_(or_filter)
+            else:
+                tok = tokens[0]
+                or_filter = (
+                    f"first_name.ilike.%{tok}%,"
+                    f"last_name.ilike.%{tok}%"
+                )
+                q = q.or_(or_filter)
 
-        result = q.execute()
+            return q.execute()
+
+        result = await asyncio.to_thread(_run_query)
         rows = result.data or []
 
         # Normalize output for the voice agent
@@ -291,12 +296,12 @@ def lookup_staff_by_name(name: str) -> list:
         return []
 
 
-def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
+async def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
     """Look up specialist by town/county name with automatic town→county resolution."""
     if not supabase:
         logger.warning("[SPECIALIST] Supabase not configured")
         return None
-    
+
     try:
         if not town_name or not town_name.strip():
             return None
@@ -307,7 +312,9 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
 
         # Try RPC with resolved county name
         try:
-            result = supabase.rpc('find_specialist_by_county', {'county_name': county_name}).execute()
+            result = await asyncio.to_thread(
+                lambda: supabase.rpc('find_specialist_by_county', {'county_name': county_name}).execute()
+            )
             if result.data and len(result.data) > 0:
                 s = result.data[0]
                 specialist_info = {
@@ -322,10 +329,12 @@ def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
             logger.warning(f"[SPECIALIST] RPC failed: {e}")
 
         # Fallback: table scan - NOW INCLUDING EMAIL
-        result = supabase.table("specialists") \
-            .select("first_name, last_name, phone, email, counties") \
-            .eq("is_active", True) \
-            .execute()
+        result = await asyncio.to_thread(
+            lambda: supabase.table("specialists")
+                .select("first_name, last_name, phone, email, counties")
+                .eq("is_active", True)
+                .execute()
+        )
 
         if result.data:
             for s in result.data:
