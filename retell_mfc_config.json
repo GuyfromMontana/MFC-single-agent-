@@ -1,0 +1,309 @@
+{
+  "agent_name": "Montana Feed Company Ranch Consultant",
+  "language": "en-US",
+  "voice_id": "11labs-Adrian",
+  "enable_call_transfer": true,
+  "call_transfer_destinations": [
+    {
+      "number": "+14066487033",
+      "name": "Brady Johnson",
+      "description": "Brady Johnson - Lewistown, Stanford, Hobson, Moore, Geyser, Moccasin, Denton, Winifred, Roy, Grass Range"
+    },
+    {
+      "number": "+14069253394",
+      "name": "Taylor Staudenmeyer",
+      "description": "Taylor Staudenmeyer - Missoula, Northwest MT"
+    },
+    {
+      "number": "+14066970366",
+      "name": "Hannah Imer",
+      "description": "Hannah Imer - Big Timber, Columbus, South Central MT"
+    },
+    {
+      "number": "+14063700907",
+      "name": "Isabell Gilleard",
+      "description": "Isabell Gilleard - Dillon, Butte, Southwest MT"
+    },
+    {
+      "number": "+14068518749",
+      "name": "Caitlin Lapicki",
+      "description": "Caitlin Lapicki - Roundup, Melstone, Miles City, Eastern MT"
+    },
+    {
+      "number": "+14068391255",
+      "name": "Austin Buzanowski",
+      "description": "Austin Buzanowski - Glendive, Terry, Baker, Far East MT"
+    },
+    {
+      "number": "+13078511393",
+      "name": "Kaylee Klaahsen",
+      "description": "Kaylee Klaahsen - Riverton, Buffalo, Wyoming"
+    }
+  ],
+  "tools": [
+    {
+      "type": "custom",
+      "name": "lookup_town",
+      "description": "Look up a caller's town to find their assigned territory and local livestock specialist. Call this IMMEDIATELY when the caller mentions their location.",
+      "url": "https://MFC-single-agent-production.up.railway.app/retell/functions/lookup_town",
+      "speak_during_execution": true,
+      "speak_after_execution": true,
+      "execution_message_description": "Looking up your local specialist",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "town_name": {
+            "type": "string",
+            "description": "The name of the town the caller is near"
+          },
+          "state": {
+            "type": "string",
+            "description": "Optional: 'MT' or 'WY'"
+          }
+        },
+        "required": [
+          "town_name"
+        ]
+      }
+    },
+    {
+      "type": "custom",
+      "name": "create_lead",
+      "description": "Creates a new lead when caller wants follow-up. Always ask permission first.",
+      "url": "https://MFC-single-agent-production.up.railway.app/retell/functions/create_lead",
+      "speak_during_execution": true,
+      "speak_after_execution": true,
+      "execution_message_description": "Creating your information in our system",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "first_name": {
+            "type": "string",
+            "description": "Caller's first name"
+          },
+          "last_name": {
+            "type": "string",
+            "description": "Caller's last name"
+          },
+          "phone": {
+            "type": "string",
+            "description": "Caller's phone number"
+          },
+          "email": {
+            "type": "string",
+            "description": "Caller's email address"
+          },
+          "ranch_name": {
+            "type": "string",
+            "description": "The name of the ranch or operation"
+          },
+          "county": {
+            "type": "string",
+            "description": "County where the ranch is located"
+          },
+          "zip_code": {
+            "type": "string",
+            "description": "Zip code"
+          },
+          "livestock_type": {
+            "type": "string",
+            "description": "Types of livestock they have"
+          },
+          "herd_size": {
+            "type": "string",
+            "description": "Number of animals"
+          },
+          "primary_interest": {
+            "type": "string",
+            "description": "What they are interested in or need help with"
+          },
+          "specialist_name": {
+            "type": "string",
+            "description": "The specialist's full name from lookup_town"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "type": "custom",
+      "name": "schedule_callback",
+      "description": "Schedule a return call OR leave a message for a specific staff member. Use this tool whenever a caller says 'tell X...', 'leave a message for X', 'have X call me back', or 'can I talk to X' and they agree to a message instead of a live transfer. Writes to the callbacks table and emails the specialist if their email is provided. For live transfer requests to LPS staff, use transfer_call_tool instead.",
+      "url": "https://MFC-single-agent-production.up.railway.app/retell/functions/schedule_callback",
+      "speak_during_execution": true,
+      "speak_after_execution": true,
+      "execution_message_description": "Scheduling your callback",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "caller_name": {
+            "type": "string",
+            "description": "The caller's name"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why they want a call. Use 'message' when leaving a note for a specific staff member to pass along. Use 'callback' for scheduled return calls."
+          },
+          "callback_date": {
+            "type": "string",
+            "description": "The day to call back"
+          },
+          "callback_time": {
+            "type": "string",
+            "description": "A specific time if provided"
+          },
+          "callback_timeframe": {
+            "type": "string",
+            "description": "General timeframe if no specific time"
+          },
+          "territory_id": {
+            "type": "string",
+            "description": "The territory UUID from lookup_town"
+          },
+          "specialist_id": {
+            "type": "string",
+            "description": "The specialist's UUID from lookup_town"
+          },
+          "specialist_name": {
+            "type": "string",
+            "description": "The specialist's full name from lookup_town"
+          },
+          "specialist_email": {
+            "type": "string",
+            "description": "The specialist's email from lookup_town"
+          },
+          "message_content": {
+            "type": "string",
+            "description": "The message content when the caller is leaving a note for a specific person (not scheduling a future callback)."
+          }
+        },
+        "required": [
+          "caller_name"
+        ]
+      }
+    },
+    {
+      "type": "custom",
+      "name": "query_knowledge",
+      "description": "Searches Supabase knowledge base for technical cattle nutrition, breeding, health, and ranch management answers. Use when caller asks how-to questions or needs expert advice.",
+      "url": "https://mfcagent.vercel.app/api/query-knowledge",
+      "speak_during_execution": true,
+      "speak_after_execution": false,
+      "execution_message_description": "Let me check our ranch consultation guides",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The caller's question about cattle management"
+          }
+        },
+        "required": [
+          "question"
+        ]
+      }
+    },
+    {
+      "type": "custom",
+      "name": "search_products",
+      "description": "Searches Purina product catalog for specific products or details",
+      "url": "https://mfcagent.vercel.app/api/search-products",
+      "speak_during_execution": true,
+      "speak_after_execution": false,
+      "execution_message_description": "Searching our product catalog",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search term like product name or keyword"
+          },
+          "category": {
+            "type": "string",
+            "description": "Product category like Minerals, Protein Supplements, Complete Feeds"
+          },
+          "livestock_type": {
+            "type": "string",
+            "description": "Type of livestock the product is for"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "type": "custom",
+      "name": "get_recommendations",
+      "description": "Provides personalized Purina product recommendations",
+      "url": "https://mfcagent.vercel.app/api/get-recommendations",
+      "speak_during_execution": true,
+      "speak_after_execution": false,
+      "execution_message_description": "Finding the best recommendations for you",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "livestock_type": {
+            "type": "string",
+            "description": "Type of livestock like beef cattle, dairy cattle, horses"
+          },
+          "herd_size": {
+            "type": "string",
+            "description": "Number of animals"
+          },
+          "need": {
+            "type": "string",
+            "description": "Specific need like winter feeding, minerals, protein supplement"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "type": "custom",
+      "name": "get_warehouse",
+      "description": "Gets warehouse locations, hours, and addresses",
+      "url": "https://mfcagent.vercel.app/api/get-warehouse",
+      "speak_during_execution": false,
+      "speak_after_execution": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "warehouse_code": {
+            "type": "string",
+            "description": "Warehouse code like Dillon or Miles"
+          },
+          "city": {
+            "type": "string",
+            "description": "City name to search for"
+          },
+          "region": {
+            "type": "string",
+            "description": "Region name to search for like Southwest Montana"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "type": "custom",
+      "name": "lookup_staff_by_name",
+      "description": "Look up a Montana Feed Company staff member BY NAME. Use this when a caller asks for someone by name \u2014 e.g., 'I need Sheryl Shea', 'Can I talk to Brady', 'Is Austin there?'. Do NOT use this for territorial routing (use lookup_town for that). Returns match_count (0, 1, or many) and a list of matches with their id, full_name, role, email, phone, and is_lps flag. When match_count is 1 and is_lps is true, offer the caller BOTH a live transfer (via transfer_call_tool) AND the option to leave a message (via schedule_callback with reason='message'). When is_lps is false (managers, warehouse, corporate staff like Sheryl), only offer to leave a message \u2014 they don't take live transfers. When match_count is 0, offer the main office at 406-728-7020.",
+      "url": "https://MFC-single-agent-production.up.railway.app/retell/functions/lookup_staff_by_name",
+      "speak_during_execution": true,
+      "speak_after_execution": true,
+      "execution_message_description": "Looking up that staff member",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name the caller gave, as you heard it. Can be a first name ('Sheryl'), last name ('Shea'), or full name ('Sheryl Shea')."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  ],
+  "_note": "REFERENCE FILE \u2014 Retell agent config is managed in the Retell dashboard. Keep this file in sync as the source-of-truth reference for tool schemas, descriptions, and transfer destinations. Any changes here MUST be copied into the Retell dashboard manually (or via the Retell API) to take effect. Last updated 2026-04-09."
+}
