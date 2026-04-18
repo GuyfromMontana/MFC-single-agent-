@@ -51,6 +51,7 @@ from skills import (
 # used by lookup_staff, lookup_staff_by_name, and schedule_callback when a
 # request can't be routed to a specific person.
 MFC_MAIN_OFFICE_PHONE = "406-728-7020"
+MFC_MAIN_OFFICE_E164 = "+1" + MFC_MAIN_OFFICE_PHONE.replace("-", "")
 
 # ============================================================================
 # CALL CACHE - Store Zep lookups from call_started for reuse at call_ended
@@ -626,7 +627,7 @@ async def lookup_town(request: Request):
             result = f"{specialist['specialist_name']} handles {town}. Reach them at {specialist['specialist_phone']}."
             logger.info(f"[LOOKUP_TOWN] Found: {specialist['specialist_name']}, saved to Zep")
         else:
-            result = f"No specialist found for {town}. Contact our main office at 406-883-4290."
+            result = f"No specialist found for {town}. Contact our main office at {MFC_MAIN_OFFICE_PHONE}."
             logger.info(f"[LOOKUP_TOWN] No match for '{town}'")
 
         return JSONResponse(content={"result": result, "success": bool(specialist)})
@@ -990,7 +991,7 @@ async def transfer_call_tool(request: Request):
         else:
             logger.warning(f"[TRANSFER] No specialist found for location: {caller_location}")
             return JSONResponse(content={
-                "phone_number": "+14068834290",
+                "phone_number": MFC_MAIN_OFFICE_E164,
                 "specialist_name": "main office",
                 "success": True
             })
