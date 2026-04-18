@@ -17,6 +17,8 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from retell_auth import read_and_verify, unauthorized_response
+
 # Import configuration and clients
 from config import (
     supabase,
@@ -188,8 +190,10 @@ async def health_check():
 @app.post("/retell-inbound-webhook")
 async def retell_inbound_webhook(request: Request, background_tasks: BackgroundTasks):
     """Inbound webhook - handles call_started and call_ended events."""
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
         event = body.get("event")
 
         logger.info(f"=== INBOUND WEBHOOK ===")
@@ -491,8 +495,10 @@ async def retell_webhook(request: Request):
     Agent webhook - ONLY handles call_ended for analytics.
     Function calls are handled directly by /retell/functions/* endpoints.
     """
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
         event_type = body.get("event", "unknown")
         logger.info(f"[AGENT] Webhook: {event_type}")
 
@@ -605,8 +611,10 @@ async def set_user_location(request: Request):
 @app.post("/retell/functions/lookup_town")
 async def lookup_town(request: Request):
     """Look up specialist by town and save to Zep metadata."""
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
         args = body.get("arguments", {})
         town = args.get("town", "") or args.get("location", "") or args.get("city", "")
         
@@ -656,8 +664,10 @@ async def schedule_callback(request: Request):
     Both shapes write to the `callbacks` table (NOT `leads`). If a specialist
     email is present, the message is immediately sent via Resend.
     """
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
         args = body.get("arguments", {})
         call_data = body.get("call", {}) or {}
 
@@ -749,8 +759,10 @@ async def schedule_callback(request: Request):
 @app.post("/retell/functions/create_lead")
 async def create_lead_endpoint(request: Request):
     """Create a new lead record."""
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
         args = body.get("arguments", {})
         name = args.get("name", "")
         phone_num = args.get("phone", body.get("call", {}).get("from_number", ""))
@@ -766,8 +778,10 @@ async def create_lead_endpoint(request: Request):
 @app.post("/retell/functions/search_knowledge_base")
 async def search_knowledge_base_endpoint(request: Request):
     """Search the knowledge base for relevant information."""
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
         query = body.get("arguments", {}).get("query", "")
         return JSONResponse(content={"result": search_knowledge_base(query), "success": True})
     except Exception as e:
@@ -777,6 +791,9 @@ async def search_knowledge_base_endpoint(request: Request):
 @app.post("/retell/functions/end_call")
 async def end_call(request: Request):
     """End the call gracefully."""
+    ok, _raw, _body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     return JSONResponse(content={"result": "Thanks for calling Montana Feed!", "success": True})
 
 
@@ -789,8 +806,10 @@ async def lookup_staff(request: Request):
     should prefer `lookup_staff_by_name` for actual name-based requests and
     `lookup_town` for territorial routing.
     """
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
         location = body.get("arguments", {}).get("location", "")
         phone = body.get("call", {}).get("from_number", "")
 
@@ -845,9 +864,10 @@ async def lookup_staff_by_name_endpoint(request: Request):
                               * leave a message otherwise (via schedule_callback)
       - match_count >= 2  -> ask caller to clarify (first name only + last name)
     """
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
-
         # Defensive arg parsing: Retell sends function arguments as the top-level
         # body (with an `execution_message` field alongside), NOT wrapped in an
         # `arguments` key. Fall back to both to be robust against either format.
@@ -951,8 +971,10 @@ async def lookup_staff_by_name_endpoint(request: Request):
 @app.post("/retell/functions/transfer_call_tool")
 async def transfer_call_tool(request: Request):
     """Transfer call to specialist's phone number."""
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
     try:
-        body = await request.json()
         call_data = body.get("call", {})
         from_number = call_data.get("from_number", "")
         
