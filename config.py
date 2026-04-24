@@ -52,10 +52,20 @@ ZEP_HEADERS = {
 # Persistent HTTP client for Zep (reduces latency)
 _zep_client: Optional[httpx.AsyncClient] = None
 
+# Persistent HTTP client for other outbound APIs (Resend, etc.). Kept
+# separate from the Zep client so a Zep outage can't starve the email
+# connection pool (and vice versa).
+_http_client: Optional[httpx.AsyncClient] = None
+
 
 def get_zep_client() -> Optional[httpx.AsyncClient]:
     """Get the persistent Zep HTTP client."""
     return _zep_client
+
+
+def get_http_client() -> Optional[httpx.AsyncClient]:
+    """Get the shared outbound HTTP client (Resend, etc.)."""
+    return _http_client
 
 
 # ============================================================================
@@ -67,6 +77,27 @@ def normalize_phone(phone: str) -> str:
     return phone.replace("+", "").replace(" ", "").replace("-", "")
 
 
+def redact_phone(phone: str) -> str:
+    """Mask a caller identifier for logging. Keeps the last 4 digits so on-call
+    can still correlate a specific complaint against logs, without spraying
+    full numbers into log aggregation / alerting systems.
+
+    Examples:
+        "+14065551234"     -> "***1234"
+        "widget_abc123xyz" -> "widget_***xyz"
+        ""                 -> "<unknown>"
+    """
+    if not phone:
+        return "<unknown>"
+    if phone.startswith("widget_"):
+        tail = phone[-3:] if len(phone) > 10 else "xxx"
+        return f"widget_***{tail}"
+    digits = "".join(c for c in phone if c.isdigit())
+    if len(digits) < 4:
+        return "***"
+    return f"***{digits[-4:]}"
+
+
 # ============================================================================
 # APPLICATION LIFESPAN MANAGER
 # ============================================================================
@@ -74,18 +105,29 @@ def normalize_phone(phone: str) -> str:
 @asynccontextmanager
 async def lifespan(app):
     """Manage application lifespan - setup and teardown."""
-    global _zep_client
-    
-    # Startup: create persistent HTTP client
+    global _zep_client, _http_client
+
+    # Startup: create persistent HTTP clients
     _zep_client = httpx.AsyncClient(
         timeout=httpx.Timeout(5.0, connect=2.0),
-        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
     )
     logger.info("✓ Started persistent Zep HTTP client")
-    
+
+    # Outbound client (Resend, etc.). 10s total is generous for transactional
+    # email providers — still well under Retell's webhook patience.
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0, connect=2.0),
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+    )
+    logger.info("✓ Started persistent outbound HTTP client")
+
     yield
-    
-    # Shutdown: close client
+
+    # Shutdown: close clients
     if _zep_client:
         await _zep_client.aclose()
         logger.info("✓ Closed Zep HTTP client")
+    if _http_client:
+        await _http_client.aclose()
+        logger.info("✓ Closed outbound HTTP client")

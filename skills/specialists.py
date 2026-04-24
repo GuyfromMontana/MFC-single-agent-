@@ -10,9 +10,24 @@ DB-touching functions (lookup_staff_by_name, lookup_specialist_by_town) are
 
 import asyncio
 import logging
+import re
 from typing import Optional, Dict
 
 from config import supabase, logger
+
+# Whitelist of characters allowed in a staff-name search. Everything else is
+# stripped before the value is interpolated into a PostgREST `or_()` filter —
+# `,`, `(`, `)`, `.`, `%`, and `*` are all meaningful to PostgREST filter
+# syntax or ILIKE, so letting them through risks filter injection or wildcard
+# abuse from ASR output / callers.
+_NAME_ALLOWED = re.compile(r"[^A-Za-z\-' ]+")
+
+
+def _sanitize_name(value: str) -> str:
+    """Strip anything that isn't a letter, space, hyphen, or apostrophe."""
+    if not value:
+        return ""
+    return _NAME_ALLOWED.sub("", value).strip()
 
 # ============================================================================
 # CORRECTED MONTANA TOWN → COUNTY RESOLUTION (7 LPS)
@@ -235,14 +250,23 @@ async def lookup_staff_by_name(name: str) -> list:
     if not name or not name.strip():
         return []
 
-    query = name.strip()
+    # Sanitize BEFORE anything else. Any caller-supplied character that isn't
+    # part of a plausible name is stripped so it can't alter PostgREST filter
+    # syntax (`,`, `(`, `)`, `.`) or become an ILIKE wildcard (`%`, `*`).
+    query = _sanitize_name(name)
+    if not query:
+        logger.warning(f"[STAFF] Name sanitized to empty — original: {name!r}")
+        return []
+
     # Uppercase & lowercase variants both work — PostgREST ilike is case-insensitive.
     # Supabase Python client uses `%` wildcards and `or_` for disjunction.
     logger.info(f"[STAFF] Looking up by name: '{query}'")
 
     try:
-        # Split into tokens so "Sheryl Shea" matches even if columns differ
-        tokens = [t.strip() for t in query.split() if t.strip()]
+        # Split into tokens so "Sheryl Shea" matches even if columns differ.
+        # Tokens are re-sanitized defensively in case the split leaves edge chars.
+        tokens = [_sanitize_name(t) for t in query.split()]
+        tokens = [t for t in tokens if t]
 
         def _run_query():
             q = supabase.table("specialists") \

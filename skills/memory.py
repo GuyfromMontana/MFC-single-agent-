@@ -4,6 +4,7 @@ Caller recognition, transcript analysis, and conversation memory
 Version 3.0.1 - Added automatic specialist lookup
 """
 
+import asyncio
 import re
 import logging
 from typing import Optional, Dict, List, Any
@@ -17,6 +18,25 @@ from config import (
     logger,
 )
 from .leads import update_lead_with_name
+
+# Hold references to fire-and-forget tasks so asyncio doesn't GC them
+# before they finish. Tasks remove themselves via the done_callback.
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro, label: str = "task") -> None:
+    """Schedule a coroutine to run without blocking the caller. Exceptions
+    are logged rather than silently swallowed."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        exc = t.exception()
+        if exc is not None:
+            logger.error(f"[BG] {label} failed: {exc}", exc_info=exc)
+
+    task.add_done_callback(_on_done)
 
 # ============================================================================
 # ZEP CLOUD HTTP API FUNCTIONS (USING PERSISTENT CLIENT)
@@ -62,15 +82,16 @@ async def zep_create_or_update_user(user_id: str, phone: str, first_name: str = 
             logger.info(f"Created Zep user: {user_id} with name: {first_name}")
             return response.json()
         elif response.status_code == 400 and "already exists" in response.text:
-            update_data = {"first_name": first_name}
-            if metadata:
-                update_data["metadata"] = metadata
-
+            # Update name only — metadata is MERGED separately below to avoid
+            # wiping existing fields like `specialist`, `last_topic`, etc.
+            # Zep PATCH replaces metadata wholesale; we must merge by hand.
             response = await _zep_client.patch(
                 f"{ZEP_BASE_URL}/users/{user_id}",
                 headers=ZEP_HEADERS,
-                json=update_data
+                json={"first_name": first_name},
             )
+            if metadata:
+                await zep_update_user_metadata(user_id, metadata)
             if response.status_code == 200:
                 logger.info(f"Updated Zep user {user_id}")
                 return response.json()
@@ -177,6 +198,14 @@ def extract_name_from_transcript(transcript: List[Dict]) -> Optional[str]:
         "customer", "caller", "rancher", "farmer", "producer",
     }
 
+    # Connectors that the case-insensitive regex can capture as a bogus second
+    # word (e.g. "my name is MacGregor and"). Trim these from the tail before
+    # returning.
+    trailing_connectors = {
+        "and", "from", "over", "out", "here", "calling", "up", "in", "at",
+        "with", "of", "on", "for", "to", "the", "a", "an",
+    }
+
     name_patterns = [
         r"my name is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
         r"this is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+calling",
@@ -205,8 +234,18 @@ def extract_name_from_transcript(transcript: List[Dict]) -> Optional[str]:
                 if not any(c.isalpha() for c in name):
                     continue
 
+                # Trim any trailing connector ("MacGregor and" -> "MacGregor")
+                # that the case-insensitive regex may have pulled in.
+                parts = name.split()
+                while len(parts) > 1 and parts[-1].lower() in trailing_connectors:
+                    parts.pop()
+                name = " ".join(parts)
+
+                # Don't `.title()` — the regex already captures `[A-Z][a-z]+`,
+                # so internal capitalization ("McDonald", "O'Brien",
+                # "MacCready") is preserved. Title-casing would mangle them.
                 logger.info(f"Extracted name from transcript: {name}")
-                return name.title()
+                return name
 
     return None
 
@@ -216,10 +255,19 @@ def extract_location_from_transcript(transcript: List[Dict]) -> Optional[str]:
     if not transcript:
         return None
 
-    montana_locations = [
+    # Towns we recognize by exact substring match in lowercased transcripts.
+    # Keep this aligned with MONTANA_TOWN_TO_COUNTY in skills/specialists.py —
+    # any town here should also have a county mapping there so the specialist
+    # lookup resolves.
+    known_locations = [
+        # Montana
         "polson", "missoula", "billings", "bozeman", "kalispell", "helena",
         "great falls", "butte", "havre", "miles city", "livingston", "whitefish",
-        "columbia falls", "bigfork", "ronan", "st ignatius", "charlo"
+        "columbia falls", "bigfork", "ronan", "st ignatius", "charlo",
+        "dillon", "lewistown", "columbus", "glasgow", "glendive",
+        # Wyoming — Riverton store service area
+        "riverton", "lander", "dubois", "thermopolis", "worland",
+        "shoshoni", "hudson", "pavillion",
     ]
 
     location_patterns = [
@@ -236,9 +284,9 @@ def extract_location_from_transcript(transcript: List[Dict]) -> Optional[str]:
 
     for message in user_messages:
         message_lower = message.lower()
-        for location in montana_locations:
+        for location in known_locations:
             if location in message_lower:
-                logger.info(f"Found Montana location in transcript: {location.title()}")
+                logger.info(f"Found known location in transcript: {location.title()}")
                 return location.title()
 
         for pattern in location_patterns:
@@ -280,16 +328,20 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
                 caller_location = metadata.get("location") or metadata.get("city") or metadata.get("town")
                 caller_specialist = metadata.get("specialist")
 
-                # AUTO-LOOKUP: If we have location but no specialist, look it up now
+                # AUTO-LOOKUP: If we have location but no specialist, look it up now.
+                # The Supabase lookup stays on the hot path because we need the
+                # specialist name for THIS call's dynamic vars. The Zep PATCH
+                # (which just saves the result for next time) is fire-and-forget
+                # so Retell gets its `call_inbound` response ~80ms sooner.
                 if caller_location and not caller_specialist:
                     from .specialists import lookup_specialist_by_town
                     specialist_info = await lookup_specialist_by_town(caller_location)
                     if specialist_info:
                         caller_specialist = specialist_info["specialist_name"]
-                        # Save it to metadata for next time
-                        await zep_update_user_metadata(user_id, {
-                            "specialist": caller_specialist
-                        })
+                        _fire_and_forget(
+                            zep_update_user_metadata(user_id, {"specialist": caller_specialist}),
+                            label=f"save_specialist({user_id})",
+                        )
                         logger.info(f"[MEMORY] Auto-assigned specialist: {caller_specialist}")
 
                 if caller_location:

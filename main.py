@@ -8,6 +8,7 @@ Version 3.0.9 - WIDGET CALL SUPPORT
 """
 
 import asyncio
+import html
 import os
 import time
 import uuid
@@ -17,7 +18,12 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from retell_auth import read_and_verify, unauthorized_response
+from retell_auth import (
+    read_and_verify,
+    unauthorized_response,
+    verify_admin_token,
+    forbidden_response,
+)
 
 # Import configuration and clients
 from config import (
@@ -26,7 +32,9 @@ from config import (
     ZEP_BASE_URL,
     ZEP_HEADERS,
     get_zep_client,
+    get_http_client,
     normalize_phone,
+    redact_phone,
     lifespan,
     logger,
 )
@@ -61,9 +69,16 @@ MFC_MAIN_OFFICE_E164 = "+1" + MFC_MAIN_OFFICE_PHONE.replace("-", "")
 # Keyed by phone number (or widget_<call_id>), stores {"data": dict, "ts": float}.
 # Entries auto-expire after CALL_CACHE_TTL_SECONDS so stalled/abandoned calls
 # can't leak memory if call_ended never fires.
+#
+# PROCESS-LOCAL: This cache lives in the Python process. The Procfile pins
+# uvicorn to --workers 1 for exactly this reason. If you ever need to scale
+# out horizontally, swap this for a shared store (Redis) — otherwise
+# call_inbound state won't match call_ended state across workers/pods.
 
 CALL_CACHE_TTL_SECONDS = 60 * 60  # 1 hour — longer than any real call
+_CACHE_SWEEP_INTERVAL = 300  # Evict expired entries at most every 5 minutes
 _call_cache: dict[str, dict] = {}
+_last_cache_sweep: float = 0.0
 
 
 def _cache_set(key: str, data: dict) -> None:
@@ -74,6 +89,7 @@ def _cache_set(key: str, data: dict) -> None:
 def _cache_get(key: str) -> dict | None:
     entry = _call_cache.get(key)
     if not entry:
+        _cache_evict_expired()  # opportunistic sweep on miss
         return None
     if time.time() - entry["ts"] > CALL_CACHE_TTL_SECONDS:
         _call_cache.pop(key, None)
@@ -82,7 +98,13 @@ def _cache_get(key: str) -> dict | None:
 
 
 def _cache_evict_expired() -> None:
+    """Drop entries past their TTL. Rate-limited so reads don't scan the
+    whole dict on every webhook hit."""
+    global _last_cache_sweep
     now = time.time()
+    if now - _last_cache_sweep < _CACHE_SWEEP_INTERVAL:
+        return
+    _last_cache_sweep = now
     expired = [k for k, v in _call_cache.items() if now - v["ts"] > CALL_CACHE_TTL_SECONDS]
     for k in expired:
         _call_cache.pop(k, None)
@@ -110,48 +132,64 @@ async def send_specialist_email(specialist_email: str, specialist_name: str, cal
             seconds = duration % 60
             duration_str = f"{minutes}m {seconds}s"
         
-        # Format the email
+        # Subject is a plain text field — Resend handles escaping.
         subject = f"New Call from {caller_name or caller_phone}"
-        
+
+        # Escape every caller-/ASR-supplied field before it lands in HTML.
+        # Transcripts are arbitrary user speech and can contain `<`, `>`, `&`,
+        # or even literal HTML/script fragments that most mail clients will
+        # render. Treat them all as untrusted.
+        safe_specialist = html.escape(specialist_name or "")
+        safe_caller = html.escape(caller_name or "Unknown")
+        safe_phone = html.escape(caller_phone or "")
+        safe_location = html.escape(caller_location or "Not specified")
+        safe_duration = html.escape(duration_str)
+        safe_time = html.escape(datetime.now().strftime("%Y-%m-%d %I:%M %p MT"))
+        safe_summary = html.escape(call_summary or "No transcript available")
+
         html_content = f"""
         <h2>New Call Received</h2>
-        <p><strong>Specialist:</strong> {specialist_name}</p>
+        <p><strong>Specialist:</strong> {safe_specialist}</p>
         <hr>
-        <p><strong>Caller:</strong> {caller_name or 'Unknown'}</p>
-        <p><strong>Phone:</strong> {caller_phone}</p>
-        <p><strong>Location:</strong> {caller_location or 'Not specified'}</p>
-        <p><strong>Duration:</strong> {duration_str}</p>
-        <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %I:%M %p MT')}</p>
+        <p><strong>Caller:</strong> {safe_caller}</p>
+        <p><strong>Phone:</strong> {safe_phone}</p>
+        <p><strong>Location:</strong> {safe_location}</p>
+        <p><strong>Duration:</strong> {safe_duration}</p>
+        <p><strong>Time:</strong> {safe_time}</p>
         <hr>
         <h3>Conversation:</h3>
-        <p style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 10px; border-radius: 5px;">{call_summary or 'No transcript available'}</p>
+        <p style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 10px; border-radius: 5px;">{safe_summary}</p>
         <hr>
         <p><small>This is an automated notification from Montana Feed Company voice system.</small></p>
         """
         
-        # Send via Resend API
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {RESEND_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "from": FROM_EMAIL,
-                    "to": [specialist_email],
-                    "subject": subject,
-                    "html": html_content
-                },
-                timeout=10.0
-            )
-            
-            if response.status_code == 200:
-                logger.info(f"✅ Email sent to {specialist_email}")
-                return True
-            else:
-                logger.error(f"❌ Email failed: {response.status_code} - {response.text}")
-                return False
+        # Send via Resend API using the persistent outbound client — avoids
+        # a TCP+TLS handshake on every send.
+        client = get_http_client()
+        if client is None:
+            logger.error("❌ Outbound HTTP client not initialized — email skipped")
+            return False
+
+        response = await client.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": FROM_EMAIL,
+                "to": [specialist_email],
+                "subject": subject,
+                "html": html_content,
+            },
+        )
+
+        if response.status_code == 200:
+            logger.info(f"✅ Email sent to {specialist_email}")
+            return True
+        else:
+            logger.error(f"❌ Email failed: {response.status_code} - {response.text}")
+            return False
                 
     except Exception as e:
         logger.error(f"❌ Email error: {e}", exc_info=True)
@@ -172,7 +210,9 @@ app = FastAPI(
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Public health check. Keep the payload to boolean feature flags and
+    static service metadata — do NOT leak runtime state like live call
+    counts here (use /debug/state behind the admin token for that)."""
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
@@ -182,8 +222,21 @@ async def health_check():
         "supabase_enabled": supabase is not None,
         "email_enabled": bool(RESEND_API_KEY),
         "persistent_client": get_zep_client() is not None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/debug/state")
+async def debug_state(request: Request):
+    """Admin-only runtime state (cache size, bg task count). Requires the
+    same X-Admin-Token used by /fix-zep-user and /set-user-location."""
+    if not verify_admin_token(request):
+        return forbidden_response()
+    from skills.memory import _background_tasks
+    return {
         "active_calls_cached": len(_call_cache),
-        "timestamp": datetime.utcnow().isoformat()
+        "background_tasks": len(_background_tasks),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -214,13 +267,14 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
             is_widget = not from_number
             caller_key = from_number or f"widget_{call_id}"
 
-            logger.info(f"Inbound: {caller_key} -> {to_number} (agent: {agent_id}, {'widget' if is_widget else 'phone'})")
+            logger.info(f"Inbound: {redact_phone(caller_key)} -> {redact_phone(to_number)} (agent: {agent_id}, {'widget' if is_widget else 'phone'})")
 
             # Check if we already cached this caller (call_inbound fires before call_started)
+            redacted_key = redact_phone(caller_key)
             cached = _cache_get(caller_key)
             if cached is not None:
                 memory_data = cached
-                logger.info(f"[CACHE HIT] Using cached Zep data for {caller_key}")
+                logger.info(f"[CACHE HIT] Using cached Zep data for {redacted_key}")
             elif is_widget:
                 # Widget caller — no Zep history possible, return new caller defaults
                 memory_data = {
@@ -230,12 +284,12 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                     "message": "Widget caller"
                 }
                 _cache_set(caller_key, memory_data)
-                logger.info(f"[WIDGET] New widget caller, cached as {caller_key}")
+                logger.info(f"[WIDGET] New widget caller, cached as {redacted_key}")
             else:
                 # First event for this call - do the Zep lookup and cache it
                 memory_data = await lookup_caller_fast(caller_key)
                 _cache_set(caller_key, memory_data)
-                logger.info(f"[CACHE MISS] Looked up Zep and cached for {caller_key}")
+                logger.info(f"[CACHE MISS] Looked up Zep and cached for {redacted_key}")
 
             caller_name = memory_data.get("caller_name")
             caller_location = memory_data.get("caller_location")
@@ -294,7 +348,7 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
             is_widget = not from_number
             caller_key = from_number or f"widget_{call_id}"
 
-            logger.info(f"[CALL_ENDED] {caller_key} ({'widget' if is_widget else 'phone'}), duration: {duration_seconds}s")
+            logger.info(f"[CALL_ENDED] {redact_phone(caller_key)} ({'widget' if is_widget else 'phone'}), duration: {duration_seconds}s")
 
             # Use cached memory data if available, otherwise fall back to Zep
             cached = _cache_get(caller_key)
@@ -456,7 +510,7 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
 
             # Clean up cache for this caller
             _call_cache.pop(caller_key, None)
-            logger.info(f"[CACHE] Cleaned up cache for {caller_key}")
+            logger.info(f"[CACHE] Cleaned up cache for {redact_phone(caller_key)}")
 
             return JSONResponse(content={
                 "call_id": call_id,
@@ -549,7 +603,9 @@ async def retell_webhook(request: Request):
 
 @app.post("/fix-zep-user")
 async def fix_zep_user(request: Request):
-    """Fix Zep user data."""
+    """Fix Zep user data. Admin-only — requires matching X-Admin-Token header."""
+    if not verify_admin_token(request):
+        return forbidden_response()
     try:
         body = await request.json()
         phone = body.get("phone", "")
@@ -583,7 +639,9 @@ async def fix_zep_user(request: Request):
 
 @app.post("/set-user-location")
 async def set_user_location(request: Request):
-    """Set user location safely by merging metadata."""
+    """Set user location by merging metadata. Admin-only — requires X-Admin-Token."""
+    if not verify_admin_token(request):
+        return forbidden_response()
     try:
         body = await request.json()
         phone = body.get("phone", "")
@@ -783,7 +841,8 @@ async def search_knowledge_base_endpoint(request: Request):
         return unauthorized_response()
     try:
         query = body.get("arguments", {}).get("query", "")
-        return JSONResponse(content={"result": search_knowledge_base(query), "success": True})
+        result = await search_knowledge_base(query)
+        return JSONResponse(content={"result": result, "success": True})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -980,7 +1039,7 @@ async def transfer_call_tool(request: Request):
         
         is_widget = not from_number
         caller_key = from_number or f"widget_{call_data.get('call_id', '')}"
-        logger.info(f"[TRANSFER] Transfer requested for caller: {caller_key}")
+        logger.info(f"[TRANSFER] Transfer requested for caller: {redact_phone(caller_key)}")
 
         # Try cache first for caller info, then fall back to Zep
         cached = _cache_get(caller_key)

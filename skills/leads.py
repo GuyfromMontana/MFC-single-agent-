@@ -46,7 +46,14 @@ async def get_caller_name_from_leads(phone: str) -> Optional[str]:
 
 
 async def update_lead_with_name(phone: str, first_name: str, last_name: str = "") -> bool:
-    """Update or create a lead record with the caller's name."""
+    """Update or create a lead record with the caller's name.
+
+    TODO(perf): collapse SELECT + UPDATE/INSERT into a single `upsert(
+    on_conflict="phone")` once a UNIQUE constraint on `leads.phone` is
+    confirmed. Without the constraint, Postgres raises
+    `ON CONFLICT specification` errors — safer to keep the two-query path
+    until the schema is verified.
+    """
     if not supabase:
         return False
     try:

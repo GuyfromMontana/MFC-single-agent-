@@ -17,17 +17,16 @@ Supabase (DB) + OpenAI embeddings + Resend (email).
 
 ```
 mfcagent/
-├── main.py                 # FastAPI app + Retell webhooks (~1000 lines)
-├── retell_handlers.py      # Separate Retell router (signature verify, etc.)
-├── config.py               # env loading, Supabase client, Zep httpx pool
+├── main.py                 # FastAPI app + Retell webhooks (~1050 lines)
+├── retell_auth.py          # HMAC signature verify + admin-token guard
+├── config.py               # env loading, Supabase client, httpx pools, PII redact
 ├── env.template            # All required env vars (keep in sync with code)
 ├── skills/
 │   ├── memory.py           # Zep V3 caller lookup + transcript save
 │   ├── leads.py            # `leads` + `callbacks` table writes (async)
 │   ├── specialists.py      # 7 LPS lookup by name or town/county (async)
-│   └── knowledge.py        # RAG search over knowledge base
-├── supabase/               # SQL migrations
-├── supabase-functions/     # Edge functions
+│   └── knowledge.py        # RAG search over knowledge base (async)
+├── supabase/               # local CLI workspace (no migrations committed yet)
 ├── backfill_embeddings.py  # one-off Python embedding backfill
 └── regenerate-embeddings.js # one-off Node embedding regen
 ```
@@ -61,6 +60,20 @@ mfcagent/
 
 ## Done (recent)
 
+- **2026-04-24** — Code review round 1–3 (12 fixes + 6 cleanups).
+  - **Correctness:** Zep metadata merge (stopped wiping `specialist` on every
+    call), HTML-escaped specialist email, sanitized PostgREST filter tokens,
+    async knowledge base, fixed deprecated `utcnow()`.
+  - **Security:** Admin endpoints (`/fix-zep-user`, `/set-user-location`,
+    `/debug/state`) now require `X-Admin-Token` header and fail closed.
+    Stricter `RETELL_SIGNATURE_ENFORCE` parsing; warns when disabled.
+  - **Performance:** Deferred Zep auto-save to fire-and-forget background
+    task (faster `call_inbound`); persistent outbound httpx client for
+    Resend; cache sweep rate-limited; pinned `--workers 1` in Procfile.
+  - **Quality:** PII redaction in logs (`redact_phone`), WY towns added to
+    location extractor, fixed `.title()` name mangling, added `tqdm` to
+    requirements.txt, aligned `SUPABASE_SERVICE_ROLE_KEY` naming.
+
 - **2026-04-15** — Webhook security + async refactor. Commit `46bacb6`.
   - Re-enabled Retell HMAC signature verification (`RETELL_SIGNATURE_ENFORCE`
     env toggle, fails closed when `RETELL_API_KEY` is set).
@@ -90,6 +103,8 @@ See `env.template` for the full set. Critical ones:
 | `RETELL_SIGNATURE_ENFORCE` | Set `false` only for local dev |
 | `RESEND_API_KEY` + `FROM_EMAIL` | Specialist notification emails |
 | `OPENAI_API_KEY` | Embeddings backfill scripts |
+| `ADMIN_API_TOKEN` | Required to call `/fix-zep-user`, `/set-user-location`, `/debug/state` (pass as `X-Admin-Token` header). Leave unset to disable those endpoints. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Used by one-off scripts; same value as `SUPABASE_KEY`. |
 
 ---
 

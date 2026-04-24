@@ -3,22 +3,30 @@ Montana Feed Company - Knowledge Base Skills
 Semantic search over company Q&A entries
 """
 
+import asyncio
+
 from config import supabase, logger
 
 
-def search_knowledge_base(query: str, top_k: int = 3) -> str:
+async def search_knowledge_base(query: str, top_k: int = 3) -> str:
     """Search knowledge base using semantic similarity.
-    
+
     The Supabase RPC handles OpenAI embedding generation internally
     via the http extension, so no OpenAI client is needed here.
+
+    The RPC call is synchronous in the Supabase Python client, so it's
+    offloaded to a worker thread to keep the FastAPI event loop responsive
+    under concurrent voice calls.
     """
     if not supabase:
         return "Knowledge base unavailable."
     try:
-        result = supabase.rpc(
-            "match_knowledge_base",
-            {"query_text": query, "match_threshold": 0.7, "match_count": top_k}
-        ).execute()
+        result = await asyncio.to_thread(
+            lambda: supabase.rpc(
+                "match_knowledge_base",
+                {"query_text": query, "match_threshold": 0.7, "match_count": top_k},
+            ).execute()
+        )
 
         if result.data:
             return "\n".join([
