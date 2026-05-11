@@ -733,21 +733,35 @@ async def schedule_callback(request: Request):
         caller_phone = args.get("phone") or call_data.get("from_number", "")
         reason = (args.get("reason") or "callback").strip().lower()
         callback_time = args.get("callback_time", "")
+        callback_date = args.get("callback_date", "")
+        callback_timeframe = args.get("callback_timeframe", "")
+        territory_id = args.get("territory_id", "")
         message_content = args.get("message_content") or args.get("notes", "")
 
         specialist_id = args.get("specialist_id")
         specialist_name = args.get("specialist_name")
         specialist_email = args.get("specialist_email")
 
-        # Compose the notes field: either the message body or the callback timeframe
+        # Compose a human-readable "when" line out of whatever date/time/timeframe
+        # fragments Retell supplied. Any combination is valid.
+        when_parts = [p for p in (callback_date, callback_time, callback_timeframe) if p]
+        when_str = " ".join(when_parts).strip()
+
+        # Compose the notes field: message body + any timing info we have so the
+        # specialist sees the full request in their email.
         if reason == "message" and message_content:
             notes = message_content
-        elif callback_time:
-            notes = f"Requested callback time: {callback_time}"
+            if when_str:
+                notes += f"\n\nRequested callback: {when_str}"
+        elif when_str:
+            notes = f"Requested callback: {when_str}"
             if message_content:
                 notes += f"\n\n{message_content}"
         else:
             notes = message_content or "(no details provided)"
+
+        if territory_id:
+            notes += f"\n\n(territory_id: {territory_id})"
 
         # Write to callbacks table via the skill function
         callback_id = await create_message_for_specialist(
@@ -794,12 +808,10 @@ async def schedule_callback(request: Request):
                 f"{' by email' if email_sent else ''}. "
                 f"They'll reach out to you at the number you called from."
             )
-        elif callback_time and specialist_name:
-            spoken = (
-                f"Scheduled a callback from {specialist_name} for {callback_time}."
-            )
-        elif callback_time:
-            spoken = f"Scheduled your callback for {callback_time}."
+        elif when_str and specialist_name:
+            spoken = f"Scheduled a callback from {specialist_name} for {when_str}."
+        elif when_str:
+            spoken = f"Scheduled your callback for {when_str}."
         else:
             spoken = "Your request has been noted and the team will follow up."
 
@@ -816,17 +828,48 @@ async def schedule_callback(request: Request):
 
 @app.post("/retell/functions/create_lead")
 async def create_lead_endpoint(request: Request):
-    """Create a new lead record."""
+    """Create a new lead record.
+
+    Accepts both the historical shape (`name`, `phone`, `location`, `interests`)
+    and the richer shape promised by retell_mfc_config.json (`first_name`,
+    `last_name`, `email`, `ranch_name`, `county`, `zip_code`, `livestock_type`,
+    `herd_size`, `primary_interest`, `specialist_name`). Either is allowed —
+    extras are folded into the lead's `primary_interest` notes so the
+    specialist sees the full picture.
+    """
     ok, _raw, body = await read_and_verify(request)
     if not ok:
         return unauthorized_response()
     try:
         args = body.get("arguments", {})
-        name = args.get("name", "")
-        phone_num = args.get("phone", body.get("call", {}).get("from_number", ""))
 
-        success = await capture_lead(name, phone_num, args.get("location", ""), args.get("interests", ""))
-        result = f"Saved your info, {name}." if success else "Noted your information."
+        first_name = (args.get("first_name") or "").strip()
+        last_name = (args.get("last_name") or "").strip()
+        name = (args.get("name") or "").strip()
+        if not first_name and name:
+            parts = name.split(None, 1)
+            first_name = parts[0]
+            last_name = last_name or (parts[1] if len(parts) > 1 else "")
+        display_name = f"{first_name} {last_name}".strip() or name or "Caller"
+
+        phone_num = args.get("phone") or body.get("call", {}).get("from_number", "")
+        location = args.get("location") or args.get("county", "")
+        primary_interest = args.get("primary_interest") or args.get("interests", "")
+
+        # Compose extras (ranch_name, herd, livestock, email, etc.) into the
+        # interest field so we don't lose them — the leads table doesn't have
+        # dedicated columns for these and we'd rather have the data in notes
+        # than discarded entirely.
+        extras = []
+        for key in ("ranch_name", "herd_size", "livestock_type", "zip_code", "email", "specialist_name"):
+            val = args.get(key)
+            if val:
+                extras.append(f"{key}={val}")
+        if extras:
+            primary_interest = (primary_interest + " | " if primary_interest else "") + " ".join(extras)
+
+        success = await capture_lead(display_name, phone_num, location, primary_interest)
+        result = f"Saved your info, {display_name}." if success else "Noted your information."
 
         return JSONResponse(content={"result": result, "success": success})
     except Exception as e:

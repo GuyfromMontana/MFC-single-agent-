@@ -33,8 +33,19 @@ def _sanitize_name(value: str) -> str:
 # CORRECTED MONTANA TOWN → COUNTY RESOLUTION (7 LPS)
 # ============================================================================
 
+#
+# IMPORTANT (2026-04-22 reassignments — keep in sync with Supabase
+# `specialists.counties`, which is the actual routing source of truth):
+#   - Isabell Gilleard moved Miles City → Columbus area (medium herds)
+#   - Hannah Imer is the Columbus lead (large herds + feedlots)
+#   - Kaylee Klaahsen now covers Miles City in addition to S-Central MT + WY
+#   - NW MT (Missoula/Bitterroot/Flathead/Lincoln) is owned by Sheryl Shea
+#     — she is NOT an LPS, so calls from those counties go to message-only,
+#     not live transfer
+# The section headers below describe geography, not current ownership.
+
 MONTANA_TOWN_TO_COUNTY = {
-    # SOUTHWEST MONTANA - Taylor Staudenmeyer (YELLOW + BROWN - took over Danielle's territory)
+    # SOUTHWEST MONTANA — Taylor Staudenmeyer
     "dillon": "Beaverhead County",
     "lima": "Beaverhead County",
     "dell": "Beaverhead County",
@@ -59,8 +70,8 @@ MONTANA_TOWN_TO_COUNTY = {
     "superior": "Mineral County",
     "alberton": "Mineral County",
     
-    # WESTERN MONTANA - Isabell Gilleard (DULL ORANGE)
-    # Missoula, Ravalli, Lake, Flathead
+    # WESTERN MONTANA — Sheryl Shea (operations manager, message-only — NOT live-transfer)
+    # Isabell Gilleard was reassigned away from this region on 2026-04-22.
     "missoula": "Missoula County",
     "lolo": "Missoula County",
     "frenchtown": "Missoula County",
@@ -89,7 +100,7 @@ MONTANA_TOWN_TO_COUNTY = {
     "eureka": "Lincoln County",
     "fortine": "Lincoln County",
     
-    # NORTH-CENTRAL MONTANA - Brady Johnson (DARK GREEN)
+    # NORTH-CENTRAL MONTANA — Brady Johnson
     "great falls": "Cascade County",
     "belt": "Cascade County",
     "neihart": "Cascade County",
@@ -112,7 +123,7 @@ MONTANA_TOWN_TO_COUNTY = {
     "shelby": "Toole County",
     "chester": "Liberty County",
     
-    # NORTHEAST MONTANA - Austin Buzanowski (RED)
+    # NORTHEAST MONTANA — Austin Buzanowski
     "glasgow": "Valley County",
     "nashua": "Valley County",
     "malta": "Phillips County",
@@ -126,7 +137,9 @@ MONTANA_TOWN_TO_COUNTY = {
     "chinook": "Blaine County",
     "harlem": "Blaine County",
     
-    # CENTRAL MONTANA - Hannah Imer (BLUE)
+    # CENTRAL MONTANA — Brady Johnson services Lewistown area as of 2026-04-22
+    # (Hannah Imer reassigned to Columbus lead). Routing follows Supabase
+    # `specialists.counties` regardless of this comment.
     "lewistown": "Fergus County",
     "roy": "Fergus County",
     "grass range": "Fergus County",
@@ -143,7 +156,9 @@ MONTANA_TOWN_TO_COUNTY = {
     "roundup": "Musselshell County",
     "melstone": "Musselshell County",
     
-    # SOUTHERN MONTANA/WYOMING - Kaylee Klaahsen (LIGHT GREEN/LIME)
+    # SOUTHERN MONTANA + WYOMING — Kaylee Klaahsen
+    # Stillwater County (Columbus, Absarokee, Nye) is co-served by Hannah Imer
+    # + Isabell Gilleard per 2026-04-22 reassignment.
     "billings": "Yellowstone County",
     "laurel": "Yellowstone County",
     "shepherd": "Yellowstone County",
@@ -174,9 +189,18 @@ MONTANA_TOWN_TO_COUNTY = {
     "hysham": "Treasure County",
     "miles city": "Custer County",
     "ismay": "Custer County",
+    # Wyoming towns served from Riverton store
     "riverton": "Wyoming",
-    
-    # EASTERN MONTANA - Caitlin Lapicki (PURPLE)
+    "lander": "Wyoming",
+    "dubois": "Wyoming",
+    "thermopolis": "Wyoming",
+    "worland": "Wyoming",
+    "shoshoni": "Wyoming",
+    "hudson": "Wyoming",
+    "pavillion": "Wyoming",
+    "buffalo": "Wyoming",
+
+    # EASTERN MONTANA — Caitlin Lapicki
     "jordan": "Garfield County",
     "circle": "McCone County",
     "glendive": "Dawson County",
