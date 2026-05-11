@@ -3,7 +3,9 @@ import hmac
 import json
 import logging
 import os
-from typing import Tuple
+import re
+import time
+from typing import Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -13,6 +15,12 @@ _logger = logging.getLogger(__name__)
 # Values that disable Retell signature enforcement. Anything outside this set
 # (including typos, unexpected casing) is treated as "enforce" — fail-safe.
 _DISABLED_VALUES = {"false", "0", "no", "off"}
+
+# Retell signs webhooks Stripe-style: `v={timestamp_ms},d={hex_hmac_sha256}`.
+# The HMAC input is `body_string + str(timestamp_ms)`, not just the body.
+# See RetellAI/retell-python-sdk src/retell/lib/webhook_auth.py.
+_SIG_RE = re.compile(r"v=(\d+),d=(.*)")
+_FIVE_MINUTES_MS = 5 * 60 * 1000
 
 
 def _enforce_enabled() -> bool:
@@ -37,7 +45,14 @@ def forbidden_response() -> JSONResponse:
     return JSONResponse(status_code=403, content={"error": "forbidden"})
 
 
-def _verify(body: bytes, signature: str) -> bool:
+def _verify(body: bytes, signature: str, *, now_ms: Optional[int] = None) -> bool:
+    """Verify a Retell webhook signature.
+
+    Retell's format is `v={timestamp_ms},d={hex_hmac_sha256}` (Stripe-style).
+    The HMAC is computed over `body_string + str(timestamp_ms)` using the
+    Retell API key as the symmetric secret, and the signature is rejected
+    if the timestamp is more than 5 minutes off wall-clock (replay window).
+    """
     api_key = os.getenv("RETELL_API_KEY", "").strip()
     enforce = _enforce_enabled()
 
@@ -54,13 +69,30 @@ def _verify(body: bytes, signature: str) -> bool:
         return False
 
     try:
-        expected = hmac.new(
-            api_key.encode("utf-8"),
-            body,
-            hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(expected, signature)
-    except Exception:
+        match = _SIG_RE.search(signature)
+        if not match:
+            _logger.warning("Retell signature did not match expected v=...,d=... format")
+            return False
+
+        poststamp = int(match.group(1))
+        post_digest = match.group(2)
+
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        if abs(now_ms - poststamp) > _FIVE_MINUTES_MS:
+            _logger.warning(
+                "Retell signature timestamp outside 5-minute window "
+                f"(drift={(now_ms - poststamp) / 1000:.1f}s)"
+            )
+            return False
+
+        body_str = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else body
+        message = (body_str + str(poststamp)).encode("utf-8")
+        expected = hmac.new(api_key.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+        return hmac.compare_digest(expected, post_digest)
+    except Exception as e:
+        _logger.warning(f"Retell signature verification raised: {e}")
         return False
 
 
