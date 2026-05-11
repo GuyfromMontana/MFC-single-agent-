@@ -731,6 +731,16 @@ async def schedule_callback(request: Request):
 
         caller_name = args.get("caller_name") or args.get("name", "")
         caller_phone = args.get("phone") or call_data.get("from_number", "")
+
+        # Fallback: the agent occasionally forgets to pass caller_name even
+        # when it has it as {{name}}. Reach into the per-call cache populated
+        # at call_inbound (Zep lookup) so messages don't end up labeled
+        # "unknown" when we already know who's calling.
+        if not caller_name and caller_phone:
+            cached = _cache_get(caller_phone)
+            if cached:
+                caller_name = cached.get("caller_name") or ""
+
         reason = (args.get("reason") or "callback").strip().lower()
         callback_time = args.get("callback_time", "")
         callback_date = args.get("callback_date", "")
@@ -855,6 +865,19 @@ async def create_lead_endpoint(request: Request):
         phone_num = args.get("phone") or body.get("call", {}).get("from_number", "")
         location = args.get("location") or args.get("county", "")
         primary_interest = args.get("primary_interest") or args.get("interests", "")
+
+        # Same call-cache fallback as schedule_callback — if the agent didn't
+        # pass any name fields but Zep already knew the caller, use that.
+        if display_name == "Caller" and phone_num:
+            cached = _cache_get(phone_num)
+            if cached:
+                cached_name = cached.get("caller_name")
+                if cached_name:
+                    display_name = cached_name
+                    if not first_name:
+                        parts = cached_name.split(None, 1)
+                        first_name = parts[0]
+                        last_name = last_name or (parts[1] if len(parts) > 1 else "")
 
         # Compose extras (ranch_name, herd, livestock, email, etc.) into the
         # interest field so we don't lose them — the leads table doesn't have
