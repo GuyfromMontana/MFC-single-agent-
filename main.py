@@ -690,13 +690,36 @@ async def lookup_town(request: Request):
                 "location": specialist.get("territory", town)
             })
 
-            result = f"{specialist['specialist_name']} handles {town}. Reach them at {specialist['specialist_phone']}."
-            logger.info(f"[LOOKUP_TOWN] Found: {specialist['specialist_name']}, saved to Zep")
+            # Tell the agent whether this specialist is live-transfer eligible so it
+            # can pick between transfer_call_tool and schedule_callback. Non-LPS
+            # staff (managers, operations) should never be live-transferred.
+            if specialist.get("is_lps"):
+                result = (
+                    f"{specialist['specialist_name']} handles {town}. "
+                    f"They take live transfers — offer the caller a transfer or a message."
+                )
+            else:
+                role_phrase = f" ({specialist.get('role')})" if specialist.get("role") else ""
+                result = (
+                    f"{specialist['specialist_name']}{role_phrase} covers {town}, "
+                    f"but they don't take live calls — offer to take a message and email it to them."
+                )
+            logger.info(
+                f"[LOOKUP_TOWN] Found: {specialist['specialist_name']} "
+                f"(is_lps={specialist.get('is_lps')}), saved to Zep"
+            )
         else:
             result = f"No specialist found for {town}. Contact our main office at {MFC_MAIN_OFFICE_PHONE}."
             logger.info(f"[LOOKUP_TOWN] No match for '{town}'")
 
-        return JSONResponse(content={"result": result, "success": bool(specialist)})
+        return JSONResponse(content={
+            "result": result,
+            "success": bool(specialist),
+            "is_lps": bool(specialist and specialist.get("is_lps")),
+            "specialist_id": specialist.get("id") if specialist else None,
+            "specialist_name": specialist.get("specialist_name") if specialist else None,
+            "specialist_email": specialist.get("specialist_email") if specialist else None,
+        })
     except Exception as e:
         logger.error(f"[LOOKUP_TOWN] Error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -1123,13 +1146,38 @@ async def transfer_call_tool(request: Request):
         logger.info(f"[TRANSFER] Caller location: {caller_location}, Specialist: {specialist_name}")
         
         specialist = await lookup_specialist_by_town(caller_location or "")
-        
+
+        # Refuse to live-transfer non-LPS staff (managers, operations, warehouse).
+        # The agent's prompt covers this for name-based lookups, but the
+        # transfer tool itself is the last line of defense — if a Missoula
+        # caller is routed to Sheryl Shea here and we'd happily dial her
+        # number, she'd get a live call she's not staffed to take.
+        if specialist and not specialist.get("is_lps"):
+            logger.warning(
+                f"[TRANSFER] REFUSED — {specialist.get('specialist_name')} "
+                f"(role={specialist.get('role')}) is not an LPS. "
+                f"Agent should take a message via schedule_callback instead."
+            )
+            return JSONResponse(content={
+                "phone_number": MFC_MAIN_OFFICE_E164,
+                "specialist_name": "main office",
+                "success": False,
+                "reason": "non_lps_specialist",
+                "specialist_id": specialist.get("id"),
+                "specialist_name_assigned": specialist.get("specialist_name"),
+                "specialist_email": specialist.get("specialist_email"),
+                "hint": (
+                    f"{specialist.get('specialist_name')} doesn't take live calls. "
+                    f"Use schedule_callback with reason='message' to leave a note instead."
+                ),
+            })
+
         if specialist and specialist.get("specialist_phone"):
             phone_number = specialist["specialist_phone"]
             specialist_name = specialist.get("specialist_name", "your specialist")
-            
+
             logger.info(f"[TRANSFER] Transferring to {specialist_name} at {phone_number}")
-            
+
             return JSONResponse(content={
                 "phone_number": phone_number,
                 "specialist_name": specialist_name,

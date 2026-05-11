@@ -345,7 +345,12 @@ async def lookup_staff_by_name(name: str) -> list:
 
 
 async def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
-    """Look up specialist by town/county name with automatic town→county resolution."""
+    """Look up specialist by town/county name with automatic town→county resolution.
+
+    Returns a dict including `is_lps`, which callers should check before
+    attempting a live transfer — non-LPS staff (e.g. Sheryl Shea covering
+    NW MT) are message-only.
+    """
     if not supabase:
         logger.warning("[SPECIALIST] Supabase not configured")
         return None
@@ -354,32 +359,17 @@ async def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         if not town_name or not town_name.strip():
             return None
 
-        # Resolve town to county
         county_name = resolve_town_to_county(town_name.strip())
         logger.info(f"[SPECIALIST] Looking up: '{town_name}' → '{county_name}'")
 
-        # Try RPC with resolved county name
-        try:
-            result = await asyncio.to_thread(
-                lambda: supabase.rpc('find_specialist_by_county', {'county_name': county_name}).execute()
-            )
-            if result.data and len(result.data) > 0:
-                s = result.data[0]
-                specialist_info = {
-                    "specialist_name": f"{s.get('first_name', '')} {s.get('last_name', '')}".strip(),
-                    "specialist_phone": s.get("phone", ""),
-                    "specialist_email": s.get("email", ""),
-                    "territory": county_name
-                }
-                logger.info(f"[SPECIALIST] Found via RPC: {specialist_info['specialist_name']}")
-                return specialist_info
-        except Exception as e:
-            logger.warning(f"[SPECIALIST] RPC failed: {e}")
-
-        # Fallback: table scan - NOW INCLUDING EMAIL
+        # Table scan — needed so we can read `role` and `is_active` to compute
+        # is_lps. The RPC `find_specialist_by_county` doesn't return those
+        # fields, so a non-LPS like Sheryl Shea would silently look like an LPS
+        # via the RPC path and the agent would try to live-transfer her. With
+        # ~13 specialists this scan is cheap.
         result = await asyncio.to_thread(
             lambda: supabase.table("specialists")
-                .select("first_name, last_name, phone, email, counties")
+                .select("id, first_name, last_name, phone, email, role, specialties, counties, is_active")
                 .eq("is_active", True)
                 .execute()
         )
@@ -387,20 +377,27 @@ async def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         if result.data:
             for s in result.data:
                 counties = s.get("counties", []) or []
-                # Try both original and resolved names
                 if any(town_name.lower() in c.lower() or county_name.lower() in c.lower() for c in counties):
+                    full_name = f"{s.get('first_name', '')} {s.get('last_name', '')}".strip()
                     specialist_info = {
-                        "specialist_name": f"{s.get('first_name', '')} {s.get('last_name', '')}".strip(),
+                        "id": s.get("id"),
+                        "specialist_name": full_name,
                         "specialist_phone": s.get("phone", ""),
                         "specialist_email": s.get("email", ""),
-                        "territory": county_name
+                        "role": s.get("role", ""),
+                        "specialties": s.get("specialties") or [],
+                        "territory": county_name,
+                        "is_lps": is_lps(s),
                     }
-                    logger.info(f"[SPECIALIST] Found via table: {specialist_info['specialist_name']}")
+                    logger.info(
+                        f"[SPECIALIST] Found: {full_name} "
+                        f"(role={s.get('role')}, is_lps={specialist_info['is_lps']})"
+                    )
                     return specialist_info
 
         logger.info(f"[SPECIALIST] No match for: '{town_name}' or '{county_name}'")
         return None
-        
+
     except Exception as e:
         logger.error(f"[SPECIALIST] Error: {e}")
         return None
