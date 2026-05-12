@@ -14,6 +14,21 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+# Initialize Sentry as early as possible so it captures import-time errors and
+# all subsequent webhook activity. PII (phone numbers) is intentionally NOT
+# sent — this codebase already routes phones through redact_phone() for logs.
+import sentry_sdk
+
+_sentry_dsn = os.getenv("SENTRY_DSN")
+if _sentry_dsn:
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        traces_sample_rate=0.1,
+        send_default_pii=False,
+        environment=os.getenv("RAILWAY_ENVIRONMENT", "production"),
+        release=os.getenv("RAILWAY_DEPLOYMENT_ID"),
+    )
+
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
