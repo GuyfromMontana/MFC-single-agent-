@@ -34,6 +34,10 @@ from .leads import (
     create_message_for_specialist,
 )
 
+from .customers import (
+    lookup_customer_by_phone,
+)
+
 __all__ = [
     # Memory
     "lookup_caller_fast",
@@ -58,4 +62,6 @@ __all__ = [
     "update_lead_with_name",
     "capture_lead",
     "create_message_for_specialist",
+    # Customers
+    "lookup_customer_by_phone",
 ]

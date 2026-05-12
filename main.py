@@ -70,6 +70,8 @@ from skills import (
     capture_lead,
     update_lead_with_name,
     create_message_for_specialist,
+    # Customers (Phase 1: caller_contacts phone -> customer + warehouse)
+    lookup_customer_by_phone,
 )
 
 # Main office fallback number for the voice agent. Single source of truth —
@@ -289,40 +291,90 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
             cached = _cache_get(caller_key)
             if cached is not None:
                 memory_data = cached
-                logger.info(f"[CACHE HIT] Using cached Zep data for {redacted_key}")
+                logger.info(f"[CACHE HIT] Using cached caller data for {redacted_key}")
             elif is_widget:
                 # Widget caller — no Zep history possible, return new caller defaults
                 memory_data = {
                     "found": False, "user_id": f"widget_{call_id}",
                     "caller_name": None, "caller_location": None,
                     "caller_specialist": None, "conversation_history": "",
-                    "message": "Widget caller"
+                    "message": "Widget caller",
+                    "customer_id": "", "primary_warehouse": "",
+                    "is_existing_customer": False,
                 }
                 _cache_set(caller_key, memory_data)
                 logger.info(f"[WIDGET] New widget caller, cached as {redacted_key}")
             else:
-                # First event for this call - do the Zep lookup and cache it
-                memory_data = await lookup_caller_fast(caller_key)
+                # First event for this call — Zep lookup + customer_contacts lookup
+                # in parallel, then merge. Customer data trumps "Caller"/"Unknown"
+                # name placeholders from Zep but doesn't override a real Zep name
+                # (a caller may have introduced themselves differently than the
+                # billing record knows them).
+                memory_data, customer_data = await asyncio.gather(
+                    lookup_caller_fast(caller_key),
+                    lookup_customer_by_phone(caller_key),
+                )
+
+                if customer_data:
+                    # Prefer Zep name when set + non-placeholder; otherwise use
+                    # customer name from caller_contacts.
+                    zep_name = (memory_data.get("caller_name") or "").strip()
+                    placeholder = zep_name.lower() in {"", "caller", "unknown", "new caller"}
+                    if placeholder and customer_data.get("customer_name"):
+                        memory_data["caller_name"] = customer_data["customer_name"]
+                        logger.info(
+                            f"[CUSTOMER] Filled caller_name from caller_contacts: "
+                            f"{customer_data['customer_name']}"
+                        )
+
+                    # Always copy the operational fields the agent needs even when
+                    # Zep already had a name.
+                    memory_data["customer_id"] = customer_data.get("customer_id") or ""
+                    memory_data["primary_warehouse"] = customer_data.get("primary_warehouse") or ""
+                    memory_data["is_existing_customer"] = bool(customer_data.get("is_existing_customer"))
+                    memory_data["customer_city"] = customer_data.get("city") or ""
+                    memory_data["customer_last_purchase"] = customer_data.get("last_purchase") or ""
+                else:
+                    # Zero out the customer fields so downstream code can rely on
+                    # them being present regardless of match status.
+                    memory_data["customer_id"] = ""
+                    memory_data["primary_warehouse"] = ""
+                    memory_data["is_existing_customer"] = False
+                    memory_data["customer_city"] = ""
+                    memory_data["customer_last_purchase"] = ""
+
                 _cache_set(caller_key, memory_data)
-                logger.info(f"[CACHE MISS] Looked up Zep and cached for {redacted_key}")
+                logger.info(f"[CACHE MISS] Looked up Zep+customer_contacts, cached for {redacted_key}")
 
             caller_name = memory_data.get("caller_name")
             caller_location = memory_data.get("caller_location")
             caller_specialist = memory_data.get("caller_specialist")
             conversation_history = memory_data.get("conversation_history", "")
+            primary_warehouse = memory_data.get("primary_warehouse", "")
+            is_existing_customer = memory_data.get("is_existing_customer", False)
 
-            # Always include all variables as strings (no None values)
+            # Always include all variables as strings (no None values). Booleans
+            # become "true"/"false" so the agent prompt can compare them cleanly.
             dynamic_vars = {
                 "name": caller_name if caller_name else "New caller",
                 "is_returning": "true" if caller_name else "false",
                 "conversation_history": conversation_history or "",
                 "location": caller_location or "",
                 "specialist": caller_specialist or "",
+                # Phase 1 customer-aware routing additions
+                "warehouse": primary_warehouse or "",
+                "is_customer": "true" if is_existing_customer else "false",
+                "customer_city": memory_data.get("customer_city", "") or "",
+                "last_purchase": memory_data.get("customer_last_purchase", "") or "",
             }
 
-            logger.info(f"[INBOUND] Dynamic vars: name={dynamic_vars['name']}, "
-                       f"location={dynamic_vars['location'] or 'None'}, "
-                       f"specialist={dynamic_vars['specialist'] or 'None'}")
+            logger.info(
+                f"[INBOUND] Dynamic vars: name={dynamic_vars['name']}, "
+                f"location={dynamic_vars['location'] or 'None'}, "
+                f"specialist={dynamic_vars['specialist'] or 'None'}, "
+                f"warehouse={dynamic_vars['warehouse'] or 'None'}, "
+                f"is_customer={dynamic_vars['is_customer']}"
+            )
             
             if conversation_history:
                 logger.info(f"[INBOUND] Context: {conversation_history[:100]}")
