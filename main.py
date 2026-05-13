@@ -158,6 +158,32 @@ def _stash_recent_specialist(caller_key: str, *,
     entry["ts"] = time.time()
 
 
+def _extract_args(body: dict) -> dict:
+    """Retell has changed its tool-call body shape multiple times. Today
+    (2026-05-13) the actual arguments arrive under `body["args"]` with the
+    tool's own name as a top-level `body["name"]` field. Earlier versions
+    used `body["arguments"]`. Some very early versions sent args flat at
+    the top level.
+
+    Read from whichever is present, in order of preference:
+        1. body["args"]       (current Retell, 2026-05-13+)
+        2. body["arguments"]  (prior Retell)
+        3. body itself        (fallback for unwrapped legacy)
+
+    Real production failure that prompted this: on 2026-05-13, every
+    lookup_staff_by_name call was hitting the endpoint with shape #1, but
+    the code only knew about #2. The endpoint was reading body["name"]
+    (which holds the TOOL NAME, e.g., "lookup_staff_by_name") as the
+    search query and finding 0 matches. Sheryl Shea was three feet away
+    in the specialists table the whole time.
+    """
+    if isinstance(body.get("args"), dict):
+        return body["args"]
+    if isinstance(body.get("arguments"), dict):
+        return body["arguments"]
+    return body
+
+
 def _get_recent_specialist(caller_key: str) -> dict | None:
     """Pull the most-recent specialist context cached for this caller, or
     None if nothing recorded this call. The cache entry's `data` dict is
@@ -1008,7 +1034,7 @@ async def lookup_town(request: Request):
     if not ok:
         return unauthorized_response()
     try:
-        args = body.get("arguments", {})
+        args = _extract_args(body)
         town = args.get("town", "") or args.get("location", "") or args.get("city", "")
         
         call_data = body.get("call", {})
@@ -1097,7 +1123,7 @@ async def schedule_callback(request: Request):
     if not ok:
         return unauthorized_response()
     try:
-        args = body.get("arguments", {})
+        args = _extract_args(body)
         call_data = body.get("call", {}) or {}
 
         caller_name = args.get("caller_name") or args.get("name", "")
@@ -1277,7 +1303,7 @@ async def create_lead_endpoint(request: Request):
     if not ok:
         return unauthorized_response()
     try:
-        args = body.get("arguments", {})
+        args = _extract_args(body)
 
         first_name = (args.get("first_name") or "").strip()
         last_name = (args.get("last_name") or "").strip()
@@ -1332,7 +1358,7 @@ async def search_knowledge_base_endpoint(request: Request):
     if not ok:
         return unauthorized_response()
     try:
-        query = body.get("arguments", {}).get("query", "")
+        query = _extract_args(body).get("query", "")
         result = await search_knowledge_base(query)
         return JSONResponse(content={"result": result, "success": True})
     except Exception as e:
@@ -1361,7 +1387,7 @@ async def lookup_staff(request: Request):
     if not ok:
         return unauthorized_response()
     try:
-        location = body.get("arguments", {}).get("location", "")
+        location = _extract_args(body).get("location", "")
         phone = body.get("call", {}).get("from_number", "")
 
         specialist = await lookup_specialist_by_town(location)
@@ -1422,10 +1448,7 @@ async def lookup_staff_by_name_endpoint(request: Request):
         # Defensive arg parsing: Retell sends function arguments as the top-level
         # body (with an `execution_message` field alongside), NOT wrapped in an
         # `arguments` key. Fall back to both to be robust against either format.
-        if "arguments" in body and isinstance(body["arguments"], dict):
-            args = body["arguments"]
-        else:
-            args = body
+        args = _extract_args(body)
         name_query = (args.get("name") or "").strip()
 
         # Always log the raw body at INFO so we can diagnose future failures
