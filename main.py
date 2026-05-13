@@ -877,6 +877,31 @@ async def set_user_location(request: Request):
         return {"error": str(e)}
 
 
+@app.post("/debug/staff-lookup")
+async def debug_staff_lookup(request: Request):
+    """Admin-only — run lookup_staff_by_name with arbitrary input and see
+    raw results. Lets us debug ASR/matcher issues without making real calls.
+
+    Body: {"name": "Sheryl Shea"}
+    """
+    if not verify_admin_token(request):
+        return forbidden_response()
+    try:
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        if not name:
+            return {"error": "Provide a `name` field in the body"}
+        matches = await lookup_staff_by_name(name)
+        return {
+            "name_query": name,
+            "match_count": len(matches),
+            "matches": matches,
+        }
+    except Exception as e:
+        logger.error(f"[DEBUG_STAFF_LOOKUP] error: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
 @app.post("/clear-zep-metadata")
 async def clear_zep_metadata(request: Request):
     """Strip one or more keys from a Zep user's metadata. Admin-only.
