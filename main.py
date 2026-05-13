@@ -729,6 +729,88 @@ async def set_user_location(request: Request):
         return {"error": str(e)}
 
 
+@app.post("/clear-zep-metadata")
+async def clear_zep_metadata(request: Request):
+    """Strip one or more keys from a Zep user's metadata. Admin-only.
+
+    Body shape:
+        {"phone": "+14062402889", "keys": ["specialist", "location"]}
+
+    Why this exists: `zep_update_user_metadata` only MERGES new values into
+    existing metadata — it can't remove a key. Stale fields (e.g. a
+    specialist assignment from a previous territory map) get stuck and keep
+    flowing into dynamic vars on every call. This endpoint fetches the
+    user, drops the named keys, and PATCHes the trimmed metadata back.
+    """
+    if not verify_admin_token(request):
+        return forbidden_response()
+    try:
+        body = await request.json()
+        phone = (body.get("phone") or "").strip()
+        keys = body.get("keys") or []
+
+        if not phone or not isinstance(keys, list) or not keys:
+            return {"error": "Provide phone and a non-empty keys list"}
+
+        user_id = f"caller_{normalize_phone(phone)}"
+
+        _zep_client = get_zep_client()
+        if not _zep_client:
+            return {"error": "Zep client not available"}
+
+        # Fetch current user metadata
+        get_resp = await _zep_client.get(
+            f"{ZEP_BASE_URL}/users/{user_id}", headers=ZEP_HEADERS
+        )
+        if get_resp.status_code != 200:
+            return {
+                "success": False,
+                "error": f"Zep GET failed: {get_resp.status_code} {get_resp.text}",
+            }
+        user = get_resp.json()
+        md_before = user.get("metadata") or {}
+
+        # Compute trimmed metadata
+        removed_keys = [k for k in keys if k in md_before]
+        md_after = {k: v for k, v in md_before.items() if k not in keys}
+
+        if not removed_keys:
+            return {
+                "success": True,
+                "message": f"No-op — none of {keys} present in metadata",
+                "user_id": user_id,
+                "metadata": md_before,
+            }
+
+        # PATCH wholesale — Zep replaces metadata with whatever we send.
+        patch_resp = await _zep_client.patch(
+            f"{ZEP_BASE_URL}/users/{user_id}",
+            headers=ZEP_HEADERS,
+            json={"metadata": md_after},
+        )
+        if patch_resp.status_code != 200:
+            return {
+                "success": False,
+                "error": f"Zep PATCH failed: {patch_resp.status_code} {patch_resp.text}",
+            }
+
+        # Invalidate the per-call cache for this caller so an in-flight call
+        # picks up the fresh metadata. Safe no-op if not cached.
+        for k in (phone, user_id, f"+{normalize_phone(phone)}"):
+            _call_cache.pop(k, None)
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "removed": removed_keys,
+            "metadata_after": md_after,
+        }
+
+    except Exception as e:
+        logger.error(f"[CLEAR_ZEP_METADATA] error: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
 # ============================================================================
 # FUNCTION ENDPOINTS (Called directly by Retell)
 # ============================================================================
