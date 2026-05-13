@@ -126,6 +126,52 @@ def _cache_evict_expired() -> None:
     for k in expired:
         _call_cache.pop(k, None)
 
+
+def _stash_recent_specialist(caller_key: str, *,
+                              specialist_id, specialist_name, specialist_email,
+                              is_lps=None, source: str = "") -> None:
+    """Save the most recent specialist resolution for this caller into the
+    per-call cache. Used by `schedule_callback` to fill in arguments when
+    the agent calls the tool without specialist info (which happens when
+    the LLM forgets to copy values from the prior tool's response).
+
+    Source is a free-form tag (e.g. "lookup_town", "lookup_staff_by_name")
+    so log lines can show which path filled the gap.
+    """
+    if not caller_key:
+        return
+    entry = _call_cache.get(caller_key)
+    if not entry:
+        entry = {"data": {}, "ts": time.time()}
+        _call_cache[caller_key] = entry
+    elif not isinstance(entry.get("data"), dict):
+        entry["data"] = {}
+    entry["data"]["recent_specialist"] = {
+        "id": specialist_id,
+        "name": specialist_name,
+        "email": specialist_email,
+        "is_lps": bool(is_lps),
+        "source": source,
+        "ts": time.time(),
+    }
+    entry["ts"] = time.time()
+
+
+def _get_recent_specialist(caller_key: str) -> dict | None:
+    """Pull the most-recent specialist context cached for this caller, or
+    None if nothing recorded this call. The cache entry's `data` dict is
+    set up by call_inbound — `recent_specialist` is the slot maintained by
+    `_stash_recent_specialist` above."""
+    if not caller_key:
+        return None
+    entry = _call_cache.get(caller_key)
+    if not entry:
+        return None
+    data = entry.get("data") or {}
+    if not isinstance(data, dict):
+        return None
+    return data.get("recent_specialist")
+
 # ============================================================================
 # EMAIL CONFIGURATION
 # ============================================================================
@@ -861,6 +907,19 @@ async def lookup_town(request: Request):
                 "location": specialist.get("territory", town)
             })
 
+            # Stash for schedule_callback's fallback. If the caller later
+            # says "leave a message" without the agent passing specialist
+            # info, schedule_callback pulls from here so the email actually
+            # routes to the right person.
+            _stash_recent_specialist(
+                phone,
+                specialist_id=specialist.get("id"),
+                specialist_name=specialist.get("specialist_name"),
+                specialist_email=specialist.get("specialist_email"),
+                is_lps=specialist.get("is_lps"),
+                source="lookup_town",
+            )
+
             # Tell the agent whether this specialist is live-transfer eligible so it
             # can pick between transfer_call_tool and schedule_callback. Non-LPS
             # staff (managers, operations) should never be live-transferred.
@@ -946,21 +1005,36 @@ async def schedule_callback(request: Request):
         specialist_name = args.get("specialist_name")
         specialist_email = args.get("specialist_email")
 
-        # === Server-side defense: messages must never go to /dev/null. ===
-        # The agent regularly calls schedule_callback without specialist info —
-        # because ASR misheard the requested name, or because it fumbled after a
-        # zero-match lookup_staff_by_name and just dumped a generic callback.
-        # When that happens, route the message to a catch-all inbox so a human
-        # at MFC can triage. CATCHALL_MESSAGE_EMAIL env var lets ops override
-        # the default (FROM_EMAIL) without a code change.
+        # === Layer 1 — fill missing specialist info from the per-call cache. ===
+        # The agent frequently calls schedule_callback without specialist info,
+        # even right after lookup_town or lookup_staff_by_name returned a
+        # single matching specialist. Recover by reading the cached
+        # `recent_specialist` slot we wrote during those earlier tool calls.
+        if not specialist_email and caller_phone:
+            recent = _get_recent_specialist(caller_phone)
+            if recent:
+                specialist_id = specialist_id or recent.get("id")
+                specialist_name = specialist_name or recent.get("name")
+                specialist_email = specialist_email or recent.get("email")
+                if specialist_email:
+                    logger.info(
+                        f"[SCHEDULE_CALLBACK] Filled specialist from cached "
+                        f"{recent.get('source')} lookup: "
+                        f"{specialist_name} <{specialist_email}>"
+                    )
+
+        # === Layer 2 — catch-all so messages never reach /dev/null. ===
+        # If neither the agent's args nor the cache yielded a specialist,
+        # route to CATCHALL_MESSAGE_EMAIL (default FROM_EMAIL). Logged
+        # WARNING so ops can spot misroutes that need follow-up.
         if not specialist_email:
             catchall = os.getenv("CATCHALL_MESSAGE_EMAIL", FROM_EMAIL).strip()
             if catchall:
                 specialist_email = catchall
                 specialist_name = specialist_name or "Montana Feed Team"
                 logger.warning(
-                    f"[SCHEDULE_CALLBACK] No specialist resolved — routing to "
-                    f"catchall {catchall} so the message doesn't vanish"
+                    f"[SCHEDULE_CALLBACK] No specialist resolved (args empty, "
+                    f"cache empty) — routing to catchall {catchall}"
                 )
 
         # Compose a human-readable "when" line out of whatever date/time/timeframe
@@ -1265,6 +1339,27 @@ async def lookup_staff_by_name_endpoint(request: Request):
             })
 
         count = len(cleaned)
+
+        # Stash a single, unambiguous match into the per-call cache so
+        # schedule_callback can fill missing args from it if the agent
+        # later fires the tool without specialist info. We deliberately
+        # do NOT stash when count != 1: zero matches means "we don't
+        # know who they want" and 2+ means "agent should clarify with
+        # the caller" — auto-picking from those would route messages
+        # to the wrong person.
+        call_data = body.get("call", {}) or {}
+        caller_phone_for_cache = call_data.get("from_number", "")
+        if count == 1 and caller_phone_for_cache:
+            m = cleaned[0]
+            _stash_recent_specialist(
+                caller_phone_for_cache,
+                specialist_id=m.get("id"),
+                specialist_name=m.get("full_name"),
+                specialist_email=m.get("email"),
+                is_lps=m.get("is_lps"),
+                source=f"lookup_staff_by_name('{name_query}')",
+            )
+
         if count == 0:
             spoken = (
                 f"I can't find anyone matching '{name_query}' in our directory. "
