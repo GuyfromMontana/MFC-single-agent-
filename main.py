@@ -793,13 +793,18 @@ async def clear_zep_metadata(request: Request):
 
         # IMPORTANT: Zep's PATCH /users/{id} body {"metadata": {...}} MERGES
         # the new metadata into existing — it does NOT replace wholesale.
-        # (Empirically verified 2026-05-13: sending a metadata dict that omits
-        # `specialist` left `specialist` in place rather than deleting it.)
-        # To remove a key, send it explicitly with a null value alongside the
-        # rest of the desired state.
+        # Empirical findings (2026-05-13):
+        #   - Sending a dict that OMITS the key: key stays in place.
+        #   - Sending the key with `null` value: key stays in place (null is
+        #     treated as "no change" by Zep's PATCH).
+        #   - Sending the key with `""` (empty string): the value updates to
+        #     an empty string. Downstream `caller_specialist or ""` evaluates
+        #     to empty, which is what we want for "no specialist".
+        # So "deleting" a metadata key on Zep = setting it to "". The
+        # `caller_specialist` consumer treats falsy/empty as missing.
         merge_payload = dict(md_after)
         for k in removed_keys:
-            merge_payload[k] = None
+            merge_payload[k] = ""
         patch_resp = await _zep_client.patch(
             f"{ZEP_BASE_URL}/users/{user_id}",
             headers=ZEP_HEADERS,
