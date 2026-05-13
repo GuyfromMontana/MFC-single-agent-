@@ -522,56 +522,65 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                     logger.error(f"❌ Failed to save to Supabase: {e}", exc_info=True)
 
             # ====================================================================
-            # SEND EMAIL TO SPECIALIST (lookup by name, not town)
+            # SEND EMAIL — to the assigned specialist if known, else catch-all
             # ====================================================================
-            if specialist_name and RESEND_API_KEY:
-                specialist_email = None
+            specialist_email = None
+            if specialist_name and supabase:
+                try:
+                    # Sanity-cap inputs before sending to ilike()
+                    name_parts = specialist_name.split(None, 1)
+                    first_name = name_parts[0][:50]
+                    last_name = (name_parts[1] if len(name_parts) > 1 else "")[:50]
 
-                if supabase:
-                    try:
-                        # Sanity-cap inputs before sending to ilike()
-                        name_parts = specialist_name.split(None, 1)
-                        first_name = name_parts[0][:50]
-                        last_name = (name_parts[1] if len(name_parts) > 1 else "")[:50]
+                    logger.info(f"[EMAIL] Looking up email for: {first_name} {last_name}")
 
-                        logger.info(f"[EMAIL] Looking up email for: {first_name} {last_name}")
-
-                        result = await asyncio.to_thread(
-                            lambda: supabase.table("specialists")
-                                .select("email, first_name, last_name")
-                                .ilike("first_name", first_name)
-                                .ilike("last_name", last_name)
-                                .eq("is_active", True)
-                                .execute()
-                        )
-
-                        if result.data and len(result.data) > 0:
-                            specialist_email = result.data[0].get("email")
-                            logger.info(f"[EMAIL] Found email: {specialist_email}")
-                        else:
-                            logger.warning(f"[EMAIL] No specialist found matching: {first_name} {last_name}")
-
-                    except Exception as e:
-                        logger.error(f"[EMAIL] Specialist lookup error: {e}")
-
-                if specialist_email:
-                    # Fire email in the background so the webhook can return immediately.
-                    background_tasks.add_task(
-                        send_specialist_email,
-                        specialist_email=specialist_email,
-                        specialist_name=specialist_name,
-                        caller_name=caller_name or "Unknown Caller",
-                        caller_phone=from_number,
-                        caller_location=caller_location or "Unknown",
-                        call_summary=call_summary or "No transcript available",
-                        duration=duration_seconds,
+                    result = await asyncio.to_thread(
+                        lambda: supabase.table("specialists")
+                            .select("email, first_name, last_name")
+                            .ilike("first_name", first_name)
+                            .ilike("last_name", last_name)
+                            .eq("is_active", True)
+                            .execute()
                     )
-                    logger.info("[EMAIL] Queued specialist notification email (background)")
-                else:
-                    logger.warning(f"[EMAIL] No email found for specialist: {specialist_name}")
+
+                    if result.data and len(result.data) > 0:
+                        specialist_email = result.data[0].get("email")
+                        logger.info(f"[EMAIL] Found email: {specialist_email}")
+                    else:
+                        logger.warning(f"[EMAIL] No specialist found matching: {first_name} {last_name}")
+
+                except Exception as e:
+                    logger.error(f"[EMAIL] Specialist lookup error: {e}")
+
+            # Catch-all: if no specialist could be resolved, send the
+            # full-transcript email to a triage inbox instead of dropping it.
+            # Configurable via CATCHALL_MESSAGE_EMAIL env var.
+            if not specialist_email and RESEND_API_KEY:
+                catchall = os.getenv("CATCHALL_MESSAGE_EMAIL", FROM_EMAIL).strip()
+                if catchall:
+                    specialist_email = catchall
+                    specialist_name = specialist_name or "Montana Feed Team (catch-all)"
+                    logger.warning(
+                        f"[EMAIL] No specialist identified for this call — "
+                        f"routing transcript to catch-all {catchall}"
+                    )
+
+            if specialist_email and RESEND_API_KEY:
+                # Fire email in the background so the webhook can return immediately.
+                background_tasks.add_task(
+                    send_specialist_email,
+                    specialist_email=specialist_email,
+                    specialist_name=specialist_name,
+                    caller_name=caller_name or "Unknown Caller",
+                    caller_phone=from_number,
+                    caller_location=caller_location or "Unknown",
+                    call_summary=call_summary or "No transcript available",
+                    duration=duration_seconds,
+                )
+                logger.info(f"[EMAIL] Queued notification email to {specialist_email} ({specialist_name})")
             else:
-                if not specialist_name:
-                    logger.warning("[EMAIL] No specialist assigned to caller")
+                if not specialist_email:
+                    logger.warning("[EMAIL] No email recipient resolved (catch-all also empty?)")
                 if not RESEND_API_KEY:
                     logger.warning("[EMAIL] RESEND_API_KEY not configured")
 
@@ -782,11 +791,19 @@ async def clear_zep_metadata(request: Request):
                 "metadata": md_before,
             }
 
-        # PATCH wholesale — Zep replaces metadata with whatever we send.
+        # IMPORTANT: Zep's PATCH /users/{id} body {"metadata": {...}} MERGES
+        # the new metadata into existing — it does NOT replace wholesale.
+        # (Empirically verified 2026-05-13: sending a metadata dict that omits
+        # `specialist` left `specialist` in place rather than deleting it.)
+        # To remove a key, send it explicitly with a null value alongside the
+        # rest of the desired state.
+        merge_payload = dict(md_after)
+        for k in removed_keys:
+            merge_payload[k] = None
         patch_resp = await _zep_client.patch(
             f"{ZEP_BASE_URL}/users/{user_id}",
             headers=ZEP_HEADERS,
-            json={"metadata": md_after},
+            json={"metadata": merge_payload},
         )
         if patch_resp.status_code != 200:
             return {
@@ -923,6 +940,23 @@ async def schedule_callback(request: Request):
         specialist_id = args.get("specialist_id")
         specialist_name = args.get("specialist_name")
         specialist_email = args.get("specialist_email")
+
+        # === Server-side defense: messages must never go to /dev/null. ===
+        # The agent regularly calls schedule_callback without specialist info —
+        # because ASR misheard the requested name, or because it fumbled after a
+        # zero-match lookup_staff_by_name and just dumped a generic callback.
+        # When that happens, route the message to a catch-all inbox so a human
+        # at MFC can triage. CATCHALL_MESSAGE_EMAIL env var lets ops override
+        # the default (FROM_EMAIL) without a code change.
+        if not specialist_email:
+            catchall = os.getenv("CATCHALL_MESSAGE_EMAIL", FROM_EMAIL).strip()
+            if catchall:
+                specialist_email = catchall
+                specialist_name = specialist_name or "Montana Feed Team"
+                logger.warning(
+                    f"[SCHEDULE_CALLBACK] No specialist resolved — routing to "
+                    f"catchall {catchall} so the message doesn't vanish"
+                )
 
         # Compose a human-readable "when" line out of whatever date/time/timeframe
         # fragments Retell supplied. Any combination is valid.
