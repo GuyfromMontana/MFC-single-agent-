@@ -10,6 +10,7 @@ Version 3.0.9 - WIDGET CALL SUPPORT
 import asyncio
 import html
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -171,6 +172,98 @@ def _get_recent_specialist(caller_key: str) -> dict | None:
     if not isinstance(data, dict):
         return None
     return data.get("recent_specialist")
+
+
+# Capitalized words 3+ chars long. Used to mine `message_content`/`reason`
+# for staff names when the agent fires schedule_callback without specialist
+# info. Real-world example that prompted this: caller said "leave a message
+# for Sheryl Shea about X" → agent set message_content="Caller asking about
+# her mother's health, requesting confirmation" + reason="message" but
+# never called lookup_staff_by_name, so the row landed with NULL specialist
+# and the email went to catch-all instead of Sheryl. We extract "Sheryl"
+# and "Shea" from the args, look each up, and if a single staff member
+# matches across all candidates we fill in the missing args.
+_NAME_TOKEN_RE = re.compile(r"\b[A-Z][a-zA-Z]{2,}\b")
+
+# Don't search for these — common English capitalized words that aren't names.
+_NAME_STOPWORDS = frozenset({
+    "Alright", "And", "Anything", "Are", "Bye", "Can", "Caller", "Day",
+    "Did", "Does", "Done", "Friday", "Good", "Got", "Have", "Hello", "Hey",
+    "Honestly", "I'm", "Just", "Let", "Look", "Looking", "Maybe",
+    "Message", "Mom", "Mother", "Monday", "Montana", "Need", "No", "Not",
+    "Okay", "Pleased", "Question", "Right", "Saturday", "She", "Sir",
+    "Sunday", "Sure", "Take", "Thank", "Thanks", "That", "The", "This",
+    "Thursday", "Today", "Tomorrow", "Tuesday", "Wednesday", "Well",
+    "What", "When", "Where", "Who", "Why", "Will", "Yeah", "Yes",
+    "You", "Your", "MFC", "AI", "Wind", "Rain", "Feed", "Company",
+})
+
+
+async def _scan_args_for_specialist(args: dict, caller_name: str | None) -> dict | None:
+    """Mine the agent's tool-call args for a named specialist when the agent
+    forgot to pass specialist_id/email. Returns the matched specialist dict
+    or None.
+
+    Strategy: extract Capitalized 3+-char tokens from `message_content`,
+    `reason`, and any other free-text fields; look each one up against the
+    specialists table; succeed only if a SINGLE specialist matches across
+    all candidates. Multi-match results are intentionally ignored — sending
+    to the wrong specialist is worse than catch-all.
+    """
+    haystacks = []
+    for key in ("message_content", "notes", "reason", "name"):
+        v = args.get(key)
+        if v and isinstance(v, str):
+            haystacks.append(v)
+    if not haystacks:
+        return None
+
+    # Exclude the caller's own name so a caller named "Brady" doesn't
+    # accidentally route their own message to Brady Johnson.
+    excluded = set(_NAME_STOPWORDS)
+    if caller_name:
+        for tok in caller_name.split():
+            excluded.add(tok.title())
+
+    candidates: set[str] = set()
+    for hay in haystacks:
+        for m in _NAME_TOKEN_RE.findall(hay):
+            if m in excluded:
+                continue
+            candidates.add(m)
+
+    if not candidates:
+        return None
+
+    logger.info(f"[SCHEDULE_CALLBACK] Layer 1.5 scanning candidates: {sorted(candidates)}")
+
+    # Run each candidate through the existing fuzzy matcher. Collect unique
+    # specialists across all candidates (keyed by id to dedupe matches that
+    # the same person triggered via both first and last name).
+    matched: dict[str, dict] = {}
+    for cand in candidates:
+        try:
+            for r in await lookup_staff_by_name(cand):
+                rid = r.get("id")
+                if rid and rid not in matched:
+                    matched[rid] = r
+        except Exception as e:
+            logger.warning(f"[SCHEDULE_CALLBACK] Layer 1.5 lookup error for '{cand}': {e}")
+
+    if len(matched) == 1:
+        spec = next(iter(matched.values()))
+        logger.info(
+            f"[SCHEDULE_CALLBACK] Layer 1.5 extracted {spec.get('full_name')} "
+            f"<{spec.get('email')}> from args"
+        )
+        return spec
+    elif len(matched) > 1:
+        logger.warning(
+            f"[SCHEDULE_CALLBACK] Layer 1.5 found multiple specialists "
+            f"({[s.get('full_name') for s in matched.values()]}) — not "
+            f"auto-picking, falling through to catch-all"
+        )
+    return None
 
 # ============================================================================
 # EMAIL CONFIGURATION
@@ -1021,6 +1114,29 @@ async def schedule_callback(request: Request):
                         f"[SCHEDULE_CALLBACK] Filled specialist from cached "
                         f"{recent.get('source')} lookup: "
                         f"{specialist_name} <{specialist_email}>"
+                    )
+
+        # === Layer 1.5 — scan the args for a named specialist. ===
+        # Even when no prior tool call cached a specialist, the message body
+        # itself often names one ("leave a message for Sheryl about X").
+        # Mine the args for capitalized name tokens and look each up. If a
+        # single unambiguous specialist matches, fill in the args from that
+        # match before falling through to catch-all.
+        if not specialist_email:
+            scanned = await _scan_args_for_specialist(args, caller_name)
+            if scanned:
+                specialist_id = specialist_id or scanned.get("id")
+                specialist_name = specialist_name or scanned.get("full_name")
+                specialist_email = scanned.get("email")
+                # Stash for future tool calls in this same call session
+                if caller_phone:
+                    _stash_recent_specialist(
+                        caller_phone,
+                        specialist_id=scanned.get("id"),
+                        specialist_name=scanned.get("full_name"),
+                        specialist_email=scanned.get("email"),
+                        is_lps=scanned.get("is_lps"),
+                        source="schedule_callback_scan",
                     )
 
         # === Layer 2 — catch-all so messages never reach /dev/null. ===
