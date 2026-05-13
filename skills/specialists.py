@@ -258,14 +258,21 @@ async def lookup_staff_by_name(name: str) -> list:
     """
     Fuzzy-match active staff in the `specialists` table by name.
 
-    Matches against first_name, last_name, and the concatenated full name
-    using case-insensitive ILIKE. Returns a list of matches (0, 1, or many).
-
     Accepts single names ("Sheryl"), full names ("Sheryl Shea"), or partials
-    ("shea"). Inactive staff are excluded.
+    ("shea"). Inactive staff are excluded. Returns 0, 1, or many matches.
 
     Each result is a dict with: id, first_name, last_name, full_name, email,
     phone, role, specialties, counties, is_lps (live-transfer eligible).
+
+    Implementation: pulls ALL active specialists in one query (~13 rows) and
+    does case-insensitive substring matching in Python. This is intentional:
+    earlier PostgREST `or_()` filters with `%name%` patterns and nested
+    `and(...)` clauses were unreliable for multi-word queries (the embedded
+    space in "Sheryl Shea" + nested commas confused PostgREST URL parsing
+    and caused real production misses where ASR-correct names returned 0
+    matches even though the row clearly existed). With ~13 rows the
+    table-scan + python-filter is fast, easy to reason about, and never
+    silently fails on edge cases.
     """
     if not supabase:
         logger.warning("[STAFF] Supabase not configured")
@@ -274,73 +281,87 @@ async def lookup_staff_by_name(name: str) -> list:
     if not name or not name.strip():
         return []
 
-    # Sanitize BEFORE anything else. Any caller-supplied character that isn't
-    # part of a plausible name is stripped so it can't alter PostgREST filter
-    # syntax (`,`, `(`, `)`, `.`) or become an ILIKE wildcard (`%`, `*`).
+    # Sanitize: strip anything that isn't a plausible name character so
+    # ASR garbage or punctuation can't sneak past.
     query = _sanitize_name(name)
     if not query:
         logger.warning(f"[STAFF] Name sanitized to empty — original: {name!r}")
         return []
 
-    # Uppercase & lowercase variants both work — PostgREST ilike is case-insensitive.
-    # Supabase Python client uses `%` wildcards and `or_` for disjunction.
     logger.info(f"[STAFF] Looking up by name: '{query}'")
 
     try:
-        # Split into tokens so "Sheryl Shea" matches even if columns differ.
-        # Tokens are re-sanitized defensively in case the split leaves edge chars.
-        tokens = [_sanitize_name(t) for t in query.split()]
-        tokens = [t for t in tokens if t]
-
+        # Pull everything active in one shot. ~13 rows; trivial.
         def _run_query():
-            q = supabase.table("specialists") \
-                .select("id, first_name, last_name, email, phone, role, specialties, counties, is_active") \
+            return (
+                supabase.table("specialists")
+                .select("id, first_name, last_name, email, phone, role, specialties, counties, is_active")
                 .eq("is_active", True)
-
-            if len(tokens) >= 2:
-                first_tok, last_tok = tokens[0], tokens[-1]
-                or_filter = (
-                    f"and(first_name.ilike.%{first_tok}%,last_name.ilike.%{last_tok}%),"
-                    f"and(first_name.ilike.%{last_tok}%,last_name.ilike.%{first_tok}%),"
-                    f"first_name.ilike.%{query}%,"
-                    f"last_name.ilike.%{query}%"
-                )
-                q = q.or_(or_filter)
-            else:
-                tok = tokens[0]
-                or_filter = (
-                    f"first_name.ilike.%{tok}%,"
-                    f"last_name.ilike.%{tok}%"
-                )
-                q = q.or_(or_filter)
-
-            return q.execute()
+                .execute()
+            )
 
         result = await asyncio.to_thread(_run_query)
         rows = result.data or []
 
-        # Normalize output for the voice agent
+        # Tokens for matching. Most callers say "first last" but we also
+        # handle single names ("Sheryl") and partials ("shea").
+        tokens = [_sanitize_name(t).lower() for t in query.split() if _sanitize_name(t)]
+        if not tokens:
+            return []
+
+        query_lower = query.lower()
         matches = []
         for s in rows:
-            full_name = f"{s.get('first_name','')} {s.get('last_name','')}".strip()
-            matches.append({
-                "id": s.get("id"),
-                "first_name": s.get("first_name"),
-                "last_name": s.get("last_name"),
-                "full_name": full_name,
-                "email": s.get("email"),
-                "phone": s.get("phone"),
-                "role": s.get("role"),
-                "specialties": s.get("specialties") or [],
-                "counties": s.get("counties") or [],
-                "is_lps": is_lps(s),
-            })
+            first = (s.get("first_name") or "").strip()
+            last = (s.get("last_name") or "").strip()
+            first_lower = first.lower()
+            last_lower = last.lower()
+            full_lower = f"{first_lower} {last_lower}".strip()
 
-        logger.info(f"[STAFF] Found {len(matches)} match(es) for '{query}'")
+            # Match conditions (any one wins):
+            # 1. Full query substring of full name (the natural case for
+            #    "Sheryl Shea" being asked about "Sheryl Shea").
+            # 2. Each token matches first OR last (handles ASR mishears
+            #    where one of two tokens is wrong — e.g. "Cheryl Shea":
+            #    "Cheryl" matches nothing, "Shea" matches Sheryl Shea's
+            #    last name, so we count it).
+            # 3. Single-token query that matches first or last name.
+            matched = False
+            if query_lower and query_lower in full_lower:
+                matched = True
+            else:
+                token_hits = sum(
+                    1 for t in tokens
+                    if (t in first_lower) or (t in last_lower)
+                )
+                if len(tokens) == 1 and token_hits >= 1:
+                    matched = True
+                elif len(tokens) >= 2 and token_hits >= 1:
+                    # At least one token of a multi-word query matched —
+                    # forgiving of ASR errors. Caller can disambiguate
+                    # downstream if multiple specialists match.
+                    matched = True
+
+            if matched:
+                matches.append({
+                    "id": s.get("id"),
+                    "first_name": s.get("first_name"),
+                    "last_name": s.get("last_name"),
+                    "full_name": f"{first} {last}".strip(),
+                    "email": s.get("email"),
+                    "phone": s.get("phone"),
+                    "role": s.get("role"),
+                    "specialties": s.get("specialties") or [],
+                    "counties": s.get("counties") or [],
+                    "is_lps": is_lps(s),
+                })
+
+        logger.info(f"[STAFF] Found {len(matches)} match(es) for '{query}': "
+                    f"{[m['full_name'] for m in matches]}")
         return matches
 
     except Exception as e:
-        logger.error(f"[STAFF] lookup_staff_by_name error: {e}")
+        logger.error(f"[STAFF] lookup_staff_by_name error: {e}", exc_info=True)
         return []
 
 
