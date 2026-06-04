@@ -8,7 +8,7 @@ import asyncio
 from config import supabase, logger
 
 
-async def search_knowledge_base(query: str, top_k: int = 3) -> str:
+async def search_knowledge_base(query: str, top_k: int = 5) -> str:
     """Search knowledge base using semantic similarity.
 
     The Supabase RPC handles OpenAI embedding generation internally
@@ -24,7 +24,10 @@ async def search_knowledge_base(query: str, top_k: int = 3) -> str:
         result = await asyncio.to_thread(
             lambda: supabase.rpc(
                 "match_knowledge_base",
-                {"query_text": query, "match_threshold": 0.7, "match_count": top_k},
+                # text-embedding-3-small: strong matches top out ~0.65-0.70,
+                # so 0.7 filtered out nearly everything (drought best = 0.691).
+                # 0.4 admits relevant content while still rejecting true noise.
+                {"query_text": query, "match_threshold": 0.4, "match_count": top_k},
             ).execute()
         )
 
