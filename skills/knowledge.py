@@ -20,6 +20,8 @@ async def search_knowledge_base(query: str, top_k: int = 5) -> str:
     """
     if not supabase:
         return "Knowledge base unavailable."
+
+    logger.info(f"[KB_SEARCH] query={query!r}")
     try:
         result = await asyncio.to_thread(
             lambda: supabase.rpc(
@@ -32,12 +34,27 @@ async def search_knowledge_base(query: str, top_k: int = 5) -> str:
         )
 
         if result.data:
+            # Log what matched + how strongly, so retrieval quality is
+            # visible in Railway logs without a live test call.
+            hits = ", ".join(
+                f"{item['question'][:40]!r}={item.get('similarity', 0):.3f}"
+                for item in result.data
+            )
+            logger.info(f"[KB_SEARCH] {len(result.data)} hits: {hits}")
             return "\n".join([
                 f"• Q: {item['question']}\n  A: {item['answer'][:500]}"
                 for item in result.data
             ])
 
-        return "No relevant information found."
+        # Nothing cleared the threshold. Return an explicit instruction the
+        # model will read so it does NOT improvise a generic answer.
+        logger.info("[KB_SEARCH] 0 hits")
+        return (
+            "NO_MATCH: The knowledge base has no entry covering this question. "
+            "Do not guess or answer from general knowledge. Tell the caller you "
+            "don't have that detail on hand and offer to have a livestock "
+            "specialist follow up."
+        )
     except Exception as e:
         logger.error(f"Knowledge base search error: {e}")
         return "I'll connect you with a specialist who can help."
