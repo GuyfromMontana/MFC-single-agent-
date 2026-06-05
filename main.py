@@ -73,6 +73,11 @@ from skills import (
     create_message_for_specialist,
     # Customers (Phase 1: caller_contacts phone -> customer + warehouse)
     lookup_customer_by_phone,
+    # Warehouses (get_warehouse tool — moved off Vercel to Railway 2026-06-05)
+    lookup_warehouse,
+    # Products (search_products + get_recommendations — moved off Vercel)
+    search_products,
+    recommend_products,
 )
 
 # Main office fallback number for the voice agent. Single source of truth —
@@ -1362,6 +1367,207 @@ async def search_knowledge_base_endpoint(request: Request):
         result = await search_knowledge_base(query)
         return JSONResponse(content={"result": result, "success": True})
     except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/retell/functions/get_warehouse")
+async def get_warehouse_endpoint(request: Request):
+    """Look up a Montana Feed store/warehouse and report its hours + address.
+
+    Moved off Vercel (mfcagent.vercel.app/api/get-warehouse) to Railway on
+    2026-06-05 — the Vercel JS version read args from the top level of the
+    body and never saw Retell's nested `args`, so it always answered
+    "what city?" Reads args via `_extract_args` like every other Railway tool.
+
+    Accepts whichever location hint the caller gives: city, warehouse_code,
+    region, county, town, or a generic `location`/`query`. Matches flexibly.
+    """
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
+    try:
+        args = _extract_args(body)
+        terms = []
+        for key in ("city", "warehouse_code", "region", "county",
+                    "location", "town", "name", "query", "store"):
+            v = args.get(key)
+            if v and isinstance(v, str):
+                terms.append(v)
+
+        logger.info(f"[GET_WAREHOUSE] terms={terms}")
+
+        if not terms:
+            return JSONResponse(content={
+                "result": (
+                    "We have five locations — Dillon, Miles City, Lewistown, "
+                    "Columbus, and Riverton. Which one would you like the hours "
+                    "or address for?"
+                ),
+                "success": False,
+            })
+
+        w = await lookup_warehouse(terms)
+
+        if not w:
+            return JSONResponse(content={
+                "result": (
+                    f"I couldn't match that to one of our stores. We have "
+                    f"locations in Dillon, Miles City, Lewistown, Columbus, and "
+                    f"Riverton. You can also reach our main office at "
+                    f"{MFC_MAIN_OFFICE_PHONE}."
+                ),
+                "success": False,
+            })
+
+        city = w.get("city") or w.get("warehouse_name") or "that location"
+        hours = w.get("operating_hours") or "by appointment — call ahead"
+        spoken = f"Our {city} store is open {hours}."
+        if w.get("address"):
+            spoken += f" It's located at {w['address']}."
+        if w.get("phone"):
+            spoken += f" You can reach it at {w['phone']}."
+        if w.get("service_area_description"):
+            spoken += f" {w['service_area_description']}"
+
+        logger.info(f"[GET_WAREHOUSE] matched {w.get('warehouse_name')}")
+        return JSONResponse(content={
+            "result": spoken,
+            "success": True,
+            "warehouse_name": w.get("warehouse_name"),
+            "warehouse_code": w.get("warehouse_code"),
+            "city": w.get("city"),
+            "operating_hours": w.get("operating_hours"),
+            "address": w.get("address"),
+            "phone": w.get("phone"),
+        })
+    except Exception as e:
+        logger.error(f"[GET_WAREHOUSE] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/retell/functions/search_products")
+async def search_products_endpoint(request: Request):
+    """Search the product catalog by name / category / livestock type.
+
+    Moved off Vercel to Railway 2026-06-05 (same nested-args bug). Reads args
+    via `_extract_args`.
+    """
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
+    try:
+        args = _extract_args(body)
+        query = (args.get("query") or args.get("product") or args.get("search") or "").strip()
+        category = (args.get("category") or "").strip()
+        livestock_type = (args.get("livestock_type") or args.get("animal") or "").strip()
+
+        logger.info(
+            f"[SEARCH_PRODUCTS] query={query!r} category={category!r} "
+            f"livestock_type={livestock_type!r}"
+        )
+
+        results = await search_products(
+            query=query, category=category, livestock_type=livestock_type
+        )
+
+        if not results:
+            return JSONResponse(content={
+                "result": (
+                    "I didn't find a match for that in our catalog. We carry "
+                    "Purina and Montana Feed Company minerals, protein "
+                    "supplements, range cubes, complete feeds, grains, and "
+                    "supplement tubs — want me to have a specialist follow up?"
+                ),
+                "success": False,
+                "match_count": 0,
+            })
+
+        from skills.products import _format_product
+        lines = [_format_product(p) for p in results]
+        if len(lines) == 1:
+            spoken = f"We carry {lines[0]}."
+        else:
+            spoken = "Here's what we carry that fits: " + "; ".join(lines) + "."
+
+        return JSONResponse(content={
+            "result": spoken,
+            "success": True,
+            "match_count": len(results),
+            "products": [
+                {
+                    "product_name": p.get("product_name"),
+                    "product_code": p.get("product_code"),
+                    "brand": p.get("brand"),
+                    "category": p.get("category"),
+                    "protein_percentage": p.get("protein_percentage"),
+                    "unit_type": p.get("unit_type"),
+                    "in_stock": p.get("in_stock"),
+                }
+                for p in results
+            ],
+        })
+    except Exception as e:
+        logger.error(f"[SEARCH_PRODUCTS] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/retell/functions/get_recommendations")
+async def get_recommendations_endpoint(request: Request):
+    """Recommend products for a described need (winter feeding, breeding
+    minerals, fly control, weaning stress, etc.).
+
+    Moved off Vercel to Railway 2026-06-05 (same nested-args bug). Reads args
+    via `_extract_args`.
+    """
+    ok, _raw, body = await read_and_verify(request)
+    if not ok:
+        return unauthorized_response()
+    try:
+        args = _extract_args(body)
+        livestock_type = (args.get("livestock_type") or args.get("animal") or "").strip()
+        need = (args.get("need") or args.get("goal") or args.get("query")
+                or args.get("interest") or "").strip()
+
+        logger.info(f"[GET_RECOMMENDATIONS] livestock_type={livestock_type!r} need={need!r}")
+
+        results = await recommend_products(livestock_type=livestock_type, need=need)
+
+        if not results:
+            return JSONResponse(content={
+                "result": (
+                    "I'd want a livestock specialist to point you to the right "
+                    "product for that. Can I take your info and have one reach "
+                    "out, or is there a specific category you're after — minerals, "
+                    "protein supplements, or complete feeds?"
+                ),
+                "success": False,
+                "match_count": 0,
+            })
+
+        from skills.products import _format_product
+        lines = [_format_product(p) for p in results]
+        if len(lines) == 1:
+            spoken = f"For that, I'd suggest {lines[0]}."
+        else:
+            spoken = "A few good options for that: " + "; ".join(lines) + "."
+
+        return JSONResponse(content={
+            "result": spoken,
+            "success": True,
+            "match_count": len(results),
+            "products": [
+                {
+                    "product_name": p.get("product_name"),
+                    "product_code": p.get("product_code"),
+                    "category": p.get("category"),
+                    "protein_percentage": p.get("protein_percentage"),
+                    "unit_type": p.get("unit_type"),
+                }
+                for p in results
+            ],
+        })
+    except Exception as e:
+        logger.error(f"[GET_RECOMMENDATIONS] Error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 

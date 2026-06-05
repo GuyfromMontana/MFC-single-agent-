@@ -38,6 +38,15 @@ from .customers import (
     lookup_customer_by_phone,
 )
 
+from .warehouses import (
+    lookup_warehouse,
+)
+
+from .products import (
+    search_products,
+    recommend_products,
+)
+
 __all__ = [
     # Memory
     "lookup_caller_fast",
@@ -64,4 +73,9 @@ __all__ = [
     "create_message_for_specialist",
     # Customers
     "lookup_customer_by_phone",
+    # Warehouses
+    "lookup_warehouse",
+    # Products
+    "search_products",
+    "recommend_products",
 ]
