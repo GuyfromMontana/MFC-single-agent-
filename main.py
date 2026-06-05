@@ -1426,6 +1426,8 @@ async def get_warehouse_endpoint(request: Request):
             spoken += f" It's located at {w['address']}."
         if w.get("phone"):
             spoken += f" You can reach it at {w['phone']}."
+        if w.get("manager_name"):
+            spoken += f" The store manager is {w['manager_name']}."
         if w.get("service_area_description"):
             spoken += f" {w['service_area_description']}"
 
@@ -1439,6 +1441,7 @@ async def get_warehouse_endpoint(request: Request):
             "operating_hours": w.get("operating_hours"),
             "address": w.get("address"),
             "phone": w.get("phone"),
+            "manager_name": w.get("manager_name"),
         })
     except Exception as e:
         logger.error(f"[GET_WAREHOUSE] Error: {e}", exc_info=True)

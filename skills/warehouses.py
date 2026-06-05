@@ -92,7 +92,8 @@ async def lookup_warehouse(terms: List[str]) -> Optional[Dict]:
         result = await asyncio.to_thread(
             lambda: supabase.table("warehouses")
                 .select("warehouse_name, warehouse_code, city, region, address, "
-                        "phone, operating_hours, service_area_description, is_active")
+                        "phone, manager_name, operating_hours, "
+                        "service_area_description, is_active")
                 .eq("is_active", True)
                 .execute()
         )
