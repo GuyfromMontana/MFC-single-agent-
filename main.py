@@ -1040,8 +1040,12 @@ async def lookup_town(request: Request):
         return unauthorized_response()
     try:
         args = _extract_args(body)
-        town = args.get("town", "") or args.get("location", "") or args.get("city", "")
-        
+        # `town_name` is the parameter name in the Retell tool schema (see
+        # retell_mfc_config.json + the v11 prompt's tool table); the rest are
+        # accepted defensively in case the dashboard config drifts.
+        town = (args.get("town_name", "") or args.get("town", "")
+                or args.get("location", "") or args.get("city", ""))
+
         call_data = body.get("call", {})
         phone = call_data.get("from_number", "")
 
