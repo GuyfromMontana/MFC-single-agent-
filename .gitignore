@@ -25,3 +25,15 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local one-off ops scripts (not deployed; some carry inline keys)
+backfill_embeddings.py
+run_backfill.py
+verify_kb.py
+cleanup_orphans.py
+ingest_ranch_consultation.py
+deploy_retell_config.py
+regenerate-embeddings.js
+
+# Supabase local project state / edge functions (managed separately)
+supabase/
