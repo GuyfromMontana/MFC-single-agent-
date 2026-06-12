@@ -2,7 +2,8 @@ fastapi==0.128.0
 uvicorn[standard]==0.40.0
 httpx==0.28.1
 supabase==2.24.0
-openai==1.109.1
-zep-cloud==3.10.0
-tqdm==4.66.5
 sentry-sdk[fastapi]>=2.20.0,<3.0.0
+# NOTE: openai/tqdm are deliberately NOT here — they're only used by local
+# ops scripts (backfill_embeddings.py). OpenAI is unreachable from Railway's
+# network (see 2026-04-04 incident); keep it out of the deployed image so a
+# stray import fails fast in dev instead of crash-looping prod.
