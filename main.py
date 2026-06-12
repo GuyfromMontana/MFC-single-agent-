@@ -1,10 +1,11 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.0.9 - WIDGET CALL SUPPORT
-- Widget calls (no phone number) now handled gracefully with call_id fallback
-- Widget conversations saved to Supabase (skips Zep which needs phone-based IDs)
-- Cache, transfer, and agent webhook all support widget callers
-- Previous: v3.0.8 call cache + email by name
+Version 3.1.0 - 2026-06-12 review fixes
+- lookup_town accepts town_name (the documented Retell tool param)
+- Zep transcript saves deduped across the two call_ended webhooks
+- Function endpoints use widget-aware cache keys (widget_{call_id})
+- transfer_call_tool honors name-based lookups before territorial routing
+- Previous: v3.0.9 widget call support
 """
 
 import asyncio
@@ -432,8 +433,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.0.9",
-        "lps_count": 7,
+        "version": "3.1.0",
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
         "email_enabled": bool(RESEND_API_KEY),
@@ -793,7 +793,7 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                 "call_id": call_id,
                 "conversation_id": conversation_id,
                 "messages_saved": len(transcript_object) if transcript_object else 0,
-                "email_sent": bool(specialist_name and RESEND_API_KEY)
+                "email_sent": bool(specialist_email and RESEND_API_KEY)
             })
 
         # ========================================================================
@@ -1145,8 +1145,8 @@ async def lookup_town(request: Request):
             "specialist_email": specialist.get("specialist_email") if specialist else None,
         })
     except Exception as e:
-        logger.error(f"[LOOKUP_TOWN] Error: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.error(f"[LOOKUP_TOWN] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/schedule_callback")
@@ -1344,7 +1344,7 @@ async def schedule_callback(request: Request):
         })
     except Exception as e:
         logger.error(f"[SCHEDULE_CALLBACK] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/create_lead")
@@ -1412,7 +1412,8 @@ async def create_lead_endpoint(request: Request):
 
         return JSONResponse(content={"result": result, "success": success})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.error(f"[CREATE_LEAD] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/search_knowledge_base")
@@ -1422,11 +1423,15 @@ async def search_knowledge_base_endpoint(request: Request):
     if not ok:
         return unauthorized_response()
     try:
-        query = _extract_args(body).get("query", "")
+        args = _extract_args(body)
+        # `query` per the v11 prompt; `question` was the old query_knowledge
+        # tool's param name — accept both so a stale dashboard config still works.
+        query = args.get("query", "") or args.get("question", "")
         result = await search_knowledge_base(query)
         return JSONResponse(content={"result": result, "success": True})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.error(f"[KB_SEARCH] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/get_warehouse")
@@ -1504,7 +1509,7 @@ async def get_warehouse_endpoint(request: Request):
         })
     except Exception as e:
         logger.error(f"[GET_WAREHOUSE] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/search_products")
@@ -1570,7 +1575,7 @@ async def search_products_endpoint(request: Request):
         })
     except Exception as e:
         logger.error(f"[SEARCH_PRODUCTS] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/get_recommendations")
@@ -1630,7 +1635,7 @@ async def get_recommendations_endpoint(request: Request):
         })
     except Exception as e:
         logger.error(f"[GET_RECOMMENDATIONS] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/end_call")
@@ -1672,7 +1677,8 @@ async def lookup_staff(request: Request):
 
         return JSONResponse(content={"result": result, "success": bool(specialist)})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.error(f"[LOOKUP_STAFF] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/lookup_staff_by_name")
@@ -1833,7 +1839,7 @@ async def lookup_staff_by_name_endpoint(request: Request):
         })
     except Exception as e:
         logger.error(f"[LOOKUP_STAFF_BY_NAME] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 @app.post("/retell/functions/transfer_call_tool")
@@ -1951,7 +1957,7 @@ async def transfer_call_tool(request: Request):
         
     except Exception as e:
         logger.error(f"[TRANSFER] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
 # ============================================================================

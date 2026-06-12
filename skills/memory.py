@@ -82,9 +82,12 @@ async def zep_create_or_update_user(user_id: str, phone: str, first_name: str = 
             logger.info(f"Created Zep user: {user_id} with name: {first_name}")
             return response.json()
         elif response.status_code == 400 and "already exists" in response.text:
-            # Update name only — metadata is MERGED separately below to avoid
-            # wiping existing fields like `specialist`, `last_topic`, etc.
-            # Zep PATCH replaces metadata wholesale; we must merge by hand.
+            # Update name only — metadata goes through zep_update_user_metadata
+            # below, which pre-merges with the existing metadata. Empirical
+            # (2026-05-13): Zep's PATCH MERGES metadata keys (it does not
+            # replace wholesale), and a `null` value is a no-op rather than a
+            # delete — so pre-merging locally keeps the behavior explicit and
+            # lets callers "clear" fields by sending "".
             response = await _zep_client.patch(
                 f"{ZEP_BASE_URL}/users/{user_id}",
                 headers=ZEP_HEADERS,
