@@ -163,6 +163,31 @@ def _stash_recent_specialist(caller_key: str, *,
     entry["ts"] = time.time()
 
 
+# Both /retell-inbound-webhook and /retell-webhook receive call_ended (when
+# both are registered in the Retell dashboard) and both used to save the
+# transcript to Zep — appending every message to the same call_{call_id}
+# thread twice and polluting returning-caller memory. Whichever webhook
+# arrives first claims the call_id here; the other skips the save.
+# Process-local like _call_cache (Procfile pins --workers 1).
+_ZEP_SAVE_TTL_SECONDS = 60 * 60
+_zep_saved_calls: dict[str, float] = {}
+
+
+def _claim_zep_save(call_id: str) -> bool:
+    """Return True if this call_id has not been saved to Zep yet (and mark
+    it claimed). Return False if another webhook already saved it."""
+    if not call_id:
+        return True  # can't dedupe without an id — let the save proceed
+    now = time.time()
+    expired = [k for k, ts in _zep_saved_calls.items() if now - ts > _ZEP_SAVE_TTL_SECONDS]
+    for k in expired:
+        _zep_saved_calls.pop(k, None)
+    if call_id in _zep_saved_calls:
+        return False
+    _zep_saved_calls[call_id] = now
+    return True
+
+
 def _extract_args(body: dict) -> dict:
     """Retell has changed its tool-call body shape multiple times. Today
     (2026-05-13) the actual arguments arrive under `body["args"]` with the
@@ -612,11 +637,13 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
 
             # Save transcript to Zep if available (use phone for Zep, skip for widget)
             if transcript_object and len(transcript_object) > 0:
-                if not is_widget:
+                if is_widget:
+                    logger.info(f"[WIDGET] Skipping Zep save (no phone number for memory)")
+                elif not _claim_zep_save(call_id):
+                    logger.info(f"[SAVE] Zep save for {call_id} already handled by the other webhook — skipping")
+                else:
                     logger.info(f"[SAVE] Saving {len(transcript_object)} messages to Zep")
                     await save_call_to_zep(from_number, transcript_object, call_id, caller_name)
-                else:
-                    logger.info(f"[WIDGET] Skipping Zep save (no phone number for memory)")
 
             # Create a formatted summary from transcript
             call_summary = ""
@@ -827,6 +854,9 @@ async def retell_webhook(request: Request):
             if is_widget:
                 logger.info(f"[WIDGET] Skipping Zep save for widget call {call_id}")
                 save_result = {"success": True, "message": "Widget call - no Zep save"}
+            elif not _claim_zep_save(call_id):
+                logger.info(f"[SAVE] Zep save for {call_id} already handled by the other webhook — skipping")
+                save_result = {"success": True, "message": "Already saved by other webhook"}
             else:
                 save_result = await save_call_to_zep(phone, transcript, call_id, caller_name)
 
