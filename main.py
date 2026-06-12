@@ -1078,24 +1078,30 @@ async def lookup_town(request: Request):
 
         call_data = body.get("call", {})
         phone = call_data.get("from_number", "")
+        call_id = call_data.get("call_id", "")
+        # Mirror the webhooks' cache keying so widget calls (no from_number)
+        # still get per-call specialist recovery in schedule_callback.
+        caller_key = phone or (f"widget_{call_id}" if call_id else "")
 
         logger.info(f"[LOOKUP_TOWN] Searching for: '{town}'")
 
         specialist = await lookup_specialist_by_town(town)
 
-        if specialist and phone:
-            user_id = f"caller_{normalize_phone(phone)}"
-            await zep_update_user_metadata(user_id, {
-                "specialist": specialist["specialist_name"],
-                "location": specialist.get("territory", town)
-            })
+        if specialist:
+            # Zep memory is phone-keyed — widget callers have no Zep record.
+            if phone:
+                user_id = f"caller_{normalize_phone(phone)}"
+                await zep_update_user_metadata(user_id, {
+                    "specialist": specialist["specialist_name"],
+                    "location": specialist.get("territory", town)
+                })
 
             # Stash for schedule_callback's fallback. If the caller later
             # says "leave a message" without the agent passing specialist
             # info, schedule_callback pulls from here so the email actually
             # routes to the right person.
             _stash_recent_specialist(
-                phone,
+                caller_key,
                 specialist_id=specialist.get("id"),
                 specialist_name=specialist.get("specialist_name"),
                 specialist_email=specialist.get("specialist_email"),
@@ -1168,12 +1174,20 @@ async def schedule_callback(request: Request):
         caller_name = args.get("caller_name") or args.get("name", "")
         caller_phone = args.get("phone") or call_data.get("from_number", "")
 
+        # Cache key mirrors the webhooks' keying (from_number, or
+        # widget_{call_id} for widget calls). Deliberately NOT caller_phone:
+        # the agent may pass a different number in args (e.g. the caller
+        # dictated their cell), but the per-call cache is keyed by what
+        # Retell put on the wire at call_inbound.
+        call_id = call_data.get("call_id", "")
+        caller_key = call_data.get("from_number", "") or (f"widget_{call_id}" if call_id else "")
+
         # Fallback: the agent occasionally forgets to pass caller_name even
         # when it has it as {{name}}. Reach into the per-call cache populated
         # at call_inbound (Zep lookup) so messages don't end up labeled
         # "unknown" when we already know who's calling.
-        if not caller_name and caller_phone:
-            cached = _cache_get(caller_phone)
+        if not caller_name and caller_key:
+            cached = _cache_get(caller_key)
             if cached:
                 caller_name = cached.get("caller_name") or ""
 
@@ -1193,8 +1207,8 @@ async def schedule_callback(request: Request):
         # even right after lookup_town or lookup_staff_by_name returned a
         # single matching specialist. Recover by reading the cached
         # `recent_specialist` slot we wrote during those earlier tool calls.
-        if not specialist_email and caller_phone:
-            recent = _get_recent_specialist(caller_phone)
+        if not specialist_email and caller_key:
+            recent = _get_recent_specialist(caller_key)
             if recent:
                 specialist_id = specialist_id or recent.get("id")
                 specialist_name = specialist_name or recent.get("name")
@@ -1219,9 +1233,9 @@ async def schedule_callback(request: Request):
                 specialist_name = specialist_name or scanned.get("full_name")
                 specialist_email = scanned.get("email")
                 # Stash for future tool calls in this same call session
-                if caller_phone:
+                if caller_key:
                     _stash_recent_specialist(
-                        caller_phone,
+                        caller_key,
                         specialist_id=scanned.get("id"),
                         specialist_name=scanned.get("full_name"),
                         specialist_email=scanned.get("email"),
@@ -1353,14 +1367,19 @@ async def create_lead_endpoint(request: Request):
             last_name = last_name or (parts[1] if len(parts) > 1 else "")
         display_name = f"{first_name} {last_name}".strip() or name or "Caller"
 
-        phone_num = args.get("phone") or body.get("call", {}).get("from_number", "")
+        call_data = body.get("call", {}) or {}
+        phone_num = args.get("phone") or call_data.get("from_number", "")
         location = args.get("location") or args.get("county", "")
         primary_interest = args.get("primary_interest") or args.get("interests", "")
 
+        # Cache key mirrors the webhooks' keying so widget calls hit too.
+        lead_call_id = call_data.get("call_id", "")
+        caller_key = call_data.get("from_number", "") or (f"widget_{lead_call_id}" if lead_call_id else "")
+
         # Same call-cache fallback as schedule_callback — if the agent didn't
         # pass any name fields but Zep already knew the caller, use that.
-        if display_name == "Caller" and phone_num:
-            cached = _cache_get(phone_num)
+        if display_name == "Caller" and caller_key:
+            cached = _cache_get(caller_key)
             if cached:
                 cached_name = cached.get("caller_name")
                 if cached_name:
@@ -1755,11 +1774,15 @@ async def lookup_staff_by_name_endpoint(request: Request):
         # the caller" — auto-picking from those would route messages
         # to the wrong person.
         call_data = body.get("call", {}) or {}
-        caller_phone_for_cache = call_data.get("from_number", "")
-        if count == 1 and caller_phone_for_cache:
+        staff_call_id = call_data.get("call_id", "")
+        # Mirror the webhooks' cache keying so widget calls stash too.
+        caller_key_for_cache = call_data.get("from_number", "") or (
+            f"widget_{staff_call_id}" if staff_call_id else ""
+        )
+        if count == 1 and caller_key_for_cache:
             m = cleaned[0]
             _stash_recent_specialist(
-                caller_phone_for_cache,
+                caller_key_for_cache,
                 specialist_id=m.get("id"),
                 specialist_name=m.get("full_name"),
                 specialist_email=m.get("email"),
