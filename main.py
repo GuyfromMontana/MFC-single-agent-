@@ -135,11 +135,14 @@ def _cache_evict_expired() -> None:
 
 def _stash_recent_specialist(caller_key: str, *,
                               specialist_id, specialist_name, specialist_email,
-                              is_lps=None, source: str = "") -> None:
+                              specialist_phone=None, is_lps=None,
+                              source: str = "") -> None:
     """Save the most recent specialist resolution for this caller into the
     per-call cache. Used by `schedule_callback` to fill in arguments when
     the agent calls the tool without specialist info (which happens when
-    the LLM forgets to copy values from the prior tool's response).
+    the LLM forgets to copy values from the prior tool's response), and by
+    `transfer_call_tool` so a name-based lookup transfers to the person the
+    caller actually asked for instead of re-deriving by territory.
 
     Source is a free-form tag (e.g. "lookup_town", "lookup_staff_by_name")
     so log lines can show which path filled the gap.
@@ -156,6 +159,7 @@ def _stash_recent_specialist(caller_key: str, *,
         "id": specialist_id,
         "name": specialist_name,
         "email": specialist_email,
+        "phone": specialist_phone,
         "is_lps": bool(is_lps),
         "source": source,
         "ts": time.time(),
@@ -1105,6 +1109,7 @@ async def lookup_town(request: Request):
                 specialist_id=specialist.get("id"),
                 specialist_name=specialist.get("specialist_name"),
                 specialist_email=specialist.get("specialist_email"),
+                specialist_phone=specialist.get("specialist_phone"),
                 is_lps=specialist.get("is_lps"),
                 source="lookup_town",
             )
@@ -1239,6 +1244,7 @@ async def schedule_callback(request: Request):
                         specialist_id=scanned.get("id"),
                         specialist_name=scanned.get("full_name"),
                         specialist_email=scanned.get("email"),
+                        specialist_phone=scanned.get("phone"),
                         is_lps=scanned.get("is_lps"),
                         source="schedule_callback_scan",
                     )
@@ -1786,6 +1792,7 @@ async def lookup_staff_by_name_endpoint(request: Request):
                 specialist_id=m.get("id"),
                 specialist_name=m.get("full_name"),
                 specialist_email=m.get("email"),
+                specialist_phone=m.get("phone"),
                 is_lps=m.get("is_lps"),
                 source=f"lookup_staff_by_name('{name_query}')",
             )
@@ -1843,6 +1850,44 @@ async def transfer_call_tool(request: Request):
         caller_key = from_number or f"widget_{call_data.get('call_id', '')}"
         logger.info(f"[TRANSFER] Transfer requested for caller: {redact_phone(caller_key)}")
 
+        # FIRST: honor a name-based lookup from earlier in this call. If the
+        # caller asked for someone by name and lookup_staff_by_name (or
+        # lookup_town) resolved exactly one person, transfer to THAT person —
+        # not whoever a fresh territory lookup happens to return. Without
+        # this, "connect me to Brady" from a caller in Kaylee's territory
+        # would dial Kaylee.
+        recent = _get_recent_specialist(caller_key)
+        if recent and recent.get("phone"):
+            if not recent.get("is_lps"):
+                logger.warning(
+                    f"[TRANSFER] REFUSED — {recent.get('name')} (from "
+                    f"{recent.get('source')}) is not an LPS. "
+                    f"Agent should take a message via schedule_callback instead."
+                )
+                return JSONResponse(content={
+                    "phone_number": MFC_MAIN_OFFICE_E164,
+                    "specialist_name": "main office",
+                    "success": False,
+                    "reason": "non_lps_specialist",
+                    "specialist_id": recent.get("id"),
+                    "specialist_name_assigned": recent.get("name"),
+                    "specialist_email": recent.get("email"),
+                    "hint": (
+                        f"{recent.get('name')} doesn't take live calls. "
+                        f"Use schedule_callback with reason='message' to leave a note instead."
+                    ),
+                })
+            logger.info(
+                f"[TRANSFER] Transferring to {recent.get('name')} at "
+                f"{recent.get('phone')} (resolved earlier via {recent.get('source')})"
+            )
+            return JSONResponse(content={
+                "phone_number": recent["phone"],
+                "specialist_name": recent.get("name") or "your specialist",
+                "success": True,
+            })
+
+        # FALLBACK: territorial routing from the caller's remembered location.
         # Try cache first for caller info, then fall back to Zep
         cached = _cache_get(caller_key)
         if cached is not None:
@@ -1852,12 +1897,12 @@ async def transfer_call_tool(request: Request):
             memory_data = await lookup_caller_fast(from_number)
         else:
             memory_data = {"caller_location": None, "caller_specialist": None}
-        
+
         caller_location = memory_data.get("caller_location")
         specialist_name = memory_data.get("caller_specialist")
-        
+
         logger.info(f"[TRANSFER] Caller location: {caller_location}, Specialist: {specialist_name}")
-        
+
         specialist = await lookup_specialist_by_town(caller_location or "")
 
         # Refuse to live-transfer non-LPS staff (managers, operations, warehouse).
