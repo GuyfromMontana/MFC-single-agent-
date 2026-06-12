@@ -184,22 +184,22 @@
     },
     {
       "type": "custom",
-      "name": "query_knowledge",
-      "description": "Searches Supabase knowledge base for technical cattle nutrition, breeding, health, and ranch management answers. Use when caller asks how-to questions or needs expert advice.",
-      "url": "https://mfcagent.vercel.app/api/query-knowledge",
+      "name": "search_knowledge_base",
+      "description": "Searches the Supabase knowledge base for technical cattle nutrition, breeding, health, and ranch management answers. ALWAYS call this before answering any cattle/feed/product question — never answer from general knowledge. Use a focused topic query; break compound questions into separate searches. If it returns NO_MATCH, do not guess — offer a specialist follow-up.",
+      "url": "https://MFC-single-agent-production.up.railway.app/retell/functions/search_knowledge_base",
       "speak_during_execution": true,
       "speak_after_execution": false,
       "execution_message_description": "Let me check our ranch consultation guides",
       "parameters": {
         "type": "object",
         "properties": {
-          "question": {
+          "query": {
             "type": "string",
-            "description": "The caller's question about cattle management"
+            "description": "Focused topic query about cattle management (e.g. 'drought management cattle feeding strategy'), not the caller's filler words"
           }
         },
         "required": [
-          "question"
+          "query"
         ]
       }
     },
@@ -207,7 +207,7 @@
       "type": "custom",
       "name": "search_products",
       "description": "Searches Purina product catalog for specific products or details",
-      "url": "https://mfcagent.vercel.app/api/search-products",
+      "url": "https://MFC-single-agent-production.up.railway.app/retell/functions/search_products",
       "speak_during_execution": true,
       "speak_after_execution": false,
       "execution_message_description": "Searching our product catalog",
@@ -234,7 +234,7 @@
       "type": "custom",
       "name": "get_recommendations",
       "description": "Provides personalized Purina product recommendations",
-      "url": "https://mfcagent.vercel.app/api/get-recommendations",
+      "url": "https://MFC-single-agent-production.up.railway.app/retell/functions/get_recommendations",
       "speak_during_execution": true,
       "speak_after_execution": false,
       "execution_message_description": "Finding the best recommendations for you",
@@ -245,13 +245,9 @@
             "type": "string",
             "description": "Type of livestock like beef cattle, dairy cattle, horses"
           },
-          "herd_size": {
-            "type": "string",
-            "description": "Number of animals"
-          },
           "need": {
             "type": "string",
-            "description": "Specific need like winter feeding, minerals, protein supplement"
+            "description": "Specific need like winter feeding, minerals, protein supplement, fly control, weaning stress"
           }
         },
         "required": []
@@ -261,7 +257,7 @@
       "type": "custom",
       "name": "get_warehouse",
       "description": "Gets warehouse locations, hours, and addresses",
-      "url": "https://mfcagent.vercel.app/api/get-warehouse",
+      "url": "https://MFC-single-agent-production.up.railway.app/retell/functions/get_warehouse",
       "speak_during_execution": false,
       "speak_after_execution": false,
       "parameters": {
@@ -305,5 +301,5 @@
       }
     }
   ],
-  "_note": "REFERENCE FILE \u2014 Retell agent config is managed in the Retell dashboard. Keep this file in sync as the source-of-truth reference for tool schemas, descriptions, and transfer destinations. Any changes here MUST be copied into the Retell dashboard manually (or via the Retell API) to take effect. Last updated 2026-04-09."
+  "_note": "REFERENCE FILE \u2014 Retell agent config is managed in the Retell dashboard. Keep this file in sync as the source-of-truth reference for tool schemas, descriptions, and transfer destinations. Any changes here MUST be copied into the Retell dashboard manually (or via the Retell API) to take effect. Last updated 2026-06-12: all tools now point at Railway (the Vercel endpoints were abandoned 2026-06-05 \u2014 they never saw Retell's nested args); query_knowledge(question) replaced by search_knowledge_base(query) to match the v11 prompt. VERIFY the dashboard matches: tool URLs, the lookup_town param name (town_name), and that Danielle Peterson is NOT in transfer destinations."
 }
