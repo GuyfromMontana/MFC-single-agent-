@@ -365,6 +365,47 @@ async def lookup_staff_by_name(name: str) -> list:
         return []
 
 
+async def get_specialist_by_email(email: str) -> Optional[Dict]:
+    """Return the active specialist whose email matches (case-insensitive),
+    or None.
+
+    Exists so endpoints can VALIDATE an email address that arrived in LLM
+    tool args before sending mail to it — the model's args are caller-
+    influenced text, and an unvalidated address would let a caller social-
+    engineer outbound email from our domain to anywhere. Same table-scan
+    pattern as the other lookups (~13 rows).
+    """
+    if not supabase:
+        logger.warning("[STAFF] Supabase not configured")
+        return None
+    target = (email or "").strip().lower()
+    if not target or "@" not in target:
+        return None
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("specialists")
+                .select("id, first_name, last_name, email, phone, role, specialties, is_active")
+                .eq("is_active", True)
+                .execute()
+        )
+        for s in result.data or []:
+            if (s.get("email") or "").strip().lower() == target:
+                first = (s.get("first_name") or "").strip()
+                last = (s.get("last_name") or "").strip()
+                return {
+                    "id": s.get("id"),
+                    "full_name": f"{first} {last}".strip(),
+                    "email": s.get("email"),
+                    "phone": s.get("phone"),
+                    "role": s.get("role"),
+                    "is_lps": is_lps(s),
+                }
+        return None
+    except Exception as e:
+        logger.error(f"[STAFF] get_specialist_by_email error: {e}", exc_info=True)
+        return None
+
+
 async def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
     """Look up specialist by town/county name with automatic town→county resolution.
 

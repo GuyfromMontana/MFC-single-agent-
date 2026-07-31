@@ -1,11 +1,16 @@
 """
 Montana Feed Company - Retell AI Webhook with Zep Memory Integration
-Version 3.1.0 - 2026-06-12 review fixes
-- lookup_town accepts town_name (the documented Retell tool param)
-- Zep transcript saves deduped across the two call_ended webhooks
-- Function endpoints use widget-aware cache keys (widget_{call_id})
-- transfer_call_tool honors name-based lookups before territorial routing
-- Previous: v3.0.9 widget call support
+Version 3.1.1 - 2026-07-31 deep review fixes
+- schedule_callback resolves a passed specialist_name against the DB before
+  borrowing the cached specialist's email (wrong-recipient fix)
+- specialist_email from tool args is validated against the specialists table
+  (never email an address the LLM invented)
+- transfer numbers normalized to E.164; non-LPS phones omitted from
+  lookup_staff_by_name structured output (inferred-transfer guard)
+- Zep save claim released when the save fails (other webhook can retry)
+- stale recent_specialist dropped at call start; per-slot TTL enforced
+- lookup_town Zep save + schedule_callback email are fire-and-forget
+- Previous: v3.1.0 2026-06-12 review fixes
 """
 
 import asyncio
@@ -80,12 +85,33 @@ from skills import (
     search_products,
     recommend_products,
 )
+from skills.memory import _fire_and_forget
+from skills.specialists import get_specialist_by_email
 
 # Main office fallback number for the voice agent. Single source of truth —
 # used by lookup_staff, lookup_staff_by_name, and schedule_callback when a
 # request can't be routed to a specific person.
 MFC_MAIN_OFFICE_PHONE = "406-728-7020"
 MFC_MAIN_OFFICE_E164 = "+1" + MFC_MAIN_OFFICE_PHONE.replace("-", "")
+
+
+def _to_e164(phone) -> str | None:
+    """Normalize a US/Canada number to E.164 (+1XXXXXXXXXX).
+
+    The `specialists.phone` column holds mixed formats (bare 10-digit,
+    dashed, one row with +1). Retell's transfer flow only dials E.164, so
+    anything we hand back as a transfer destination MUST go through here.
+    Returns None when the value can't be normalized — callers should fall
+    back to the main office rather than passing garbage to the dialer.
+    """
+    if not phone:
+        return None
+    digits = "".join(c for c in str(phone) if c.isdigit())
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return None
 
 # ============================================================================
 # CALL CACHE - Store Zep lookups from call_started for reuse at call_ended
@@ -193,6 +219,15 @@ def _claim_zep_save(call_id: str) -> bool:
     return True
 
 
+def _release_zep_save(call_id: str) -> None:
+    """Un-claim a call_id after a FAILED Zep save so the other webhook's
+    call_ended (which usually arrives within seconds) can retry instead of
+    skipping — otherwise a transient Zep error permanently loses the
+    transcript from caller memory."""
+    if call_id:
+        _zep_saved_calls.pop(call_id, None)
+
+
 def _extract_args(body: dict) -> dict:
     """Retell has changed its tool-call body shape multiple times. Today
     (2026-05-13) the actual arguments arrive under `body["args"]` with the
@@ -203,7 +238,9 @@ def _extract_args(body: dict) -> dict:
     Read from whichever is present, in order of preference:
         1. body["args"]       (current Retell, 2026-05-13+)
         2. body["arguments"]  (prior Retell)
-        3. body itself        (fallback for unwrapped legacy)
+        3. body itself        (fallback for unwrapped legacy) — with the
+           envelope keys stripped, so `body["name"]` (the TOOL name) can
+           never masquerade as a caller_name/search arg again.
 
     Real production failure that prompted this: on 2026-05-13, every
     lookup_staff_by_name call was hitting the endpoint with shape #1, but
@@ -216,7 +253,13 @@ def _extract_args(body: dict) -> dict:
         return body["args"]
     if isinstance(body.get("arguments"), dict):
         return body["arguments"]
-    return body
+    return {k: v for k, v in body.items() if k not in _ENVELOPE_KEYS}
+
+
+# Retell envelope fields that are never tool arguments. Stripped from the
+# legacy flat-body fallback in _extract_args so a future Retell shape change
+# fails loudly (missing arg) instead of silently searching for a tool's name.
+_ENVELOPE_KEYS = frozenset({"name", "call", "execution_message", "args", "arguments"})
 
 
 def _get_recent_specialist(caller_key: str) -> dict | None:
@@ -232,7 +275,16 @@ def _get_recent_specialist(caller_key: str) -> dict | None:
     data = entry.get("data") or {}
     if not isinstance(data, dict):
         return None
-    return data.get("recent_specialist")
+    recent = data.get("recent_specialist")
+    # Per-slot staleness check: if call_ended never fired for a previous
+    # call (crash, missed webhook), the cache entry survives and a later
+    # call from the same phone would inherit the old call's specialist.
+    # call_inbound also strips this slot on cache hit — this is the
+    # belt-and-suspenders for paths that read it directly.
+    if recent and time.time() - recent.get("ts", 0) > CALL_CACHE_TTL_SECONDS:
+        data.pop("recent_specialist", None)
+        return None
+    return recent
 
 
 # Capitalized words 3+ chars long. Used to mine `message_content`/`reason`
@@ -272,7 +324,7 @@ async def _scan_args_for_specialist(args: dict, caller_name: str | None) -> dict
     to the wrong specialist is worse than catch-all.
     """
     haystacks = []
-    for key in ("message_content", "notes", "reason", "name"):
+    for key in ("message_content", "notes", "reason", "name", "specialist_name"):
         v = args.get(key)
         if v and isinstance(v, str):
             haystacks.append(v)
@@ -433,7 +485,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "montana-feed-retell-webhook",
-        "version": "3.1.0",
+        "version": "3.1.1",
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
         "email_enabled": bool(RESEND_API_KEY),
@@ -490,6 +542,14 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
             cached = _cache_get(caller_key)
             if cached is not None:
                 memory_data = cached
+                # A new call is starting — any recent_specialist in the entry
+                # is left over from a previous call whose call_ended never
+                # cleaned up (crash/missed webhook). No tool call has run yet
+                # this call, so the slot can't legitimately exist here. Drop
+                # it so schedule_callback can't route this call's message to
+                # the LAST call's specialist.
+                if isinstance(memory_data, dict) and memory_data.pop("recent_specialist", None):
+                    logger.info(f"[CACHE HIT] Dropped stale recent_specialist for {redacted_key}")
                 logger.info(f"[CACHE HIT] Using cached caller data for {redacted_key}")
             elif is_widget:
                 # Widget caller — no Zep history possible, return new caller defaults
@@ -647,7 +707,10 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                     logger.info(f"[SAVE] Zep save for {call_id} already handled by the other webhook — skipping")
                 else:
                     logger.info(f"[SAVE] Saving {len(transcript_object)} messages to Zep")
-                    await save_call_to_zep(from_number, transcript_object, call_id, caller_name)
+                    save_result = await save_call_to_zep(from_number, transcript_object, call_id, caller_name)
+                    if not save_result.get("success"):
+                        _release_zep_save(call_id)
+                        logger.warning(f"[SAVE] Zep save failed for {call_id} — claim released for retry")
 
             # Create a formatted summary from transcript
             call_summary = ""
@@ -844,7 +907,10 @@ async def retell_webhook(request: Request):
         if event_type == "call_ended" and transcript and caller_key:
             logger.info(f"[SAVE] Saving {len(transcript)} messages ({'widget' if is_widget else 'phone'})")
 
-            caller_name = body.get("retell_llm_dynamic_variables", {}).get("caller_name")
+            # Dynamic vars live under call.retell_llm_dynamic_variables, and
+            # ours is named "name" (set by the call_inbound response above) —
+            # the old read (top-level body, key "caller_name") was always None.
+            caller_name = (call_data.get("retell_llm_dynamic_variables") or {}).get("name")
             if not caller_name or caller_name == "New caller":
                 # Try cache first, then Zep
                 cached = _cache_get(caller_key)
@@ -863,6 +929,9 @@ async def retell_webhook(request: Request):
                 save_result = {"success": True, "message": "Already saved by other webhook"}
             else:
                 save_result = await save_call_to_zep(phone, transcript, call_id, caller_name)
+                if not save_result.get("success"):
+                    _release_zep_save(call_id)
+                    logger.warning(f"[SAVE] Zep save failed for {call_id} — claim released for retry")
 
             if save_result.get("extracted_name"):
                 logger.info(f"[SAVE] Name extracted: {save_result['extracted_name']}")
@@ -1093,12 +1162,18 @@ async def lookup_town(request: Request):
 
         if specialist:
             # Zep memory is phone-keyed — widget callers have no Zep record.
+            # Fire-and-forget: the Zep GET+PATCH pair can take seconds on a
+            # slow Zep day, and the caller is sitting in silence waiting for
+            # this tool to answer. The save only benefits FUTURE calls.
             if phone:
                 user_id = f"caller_{normalize_phone(phone)}"
-                await zep_update_user_metadata(user_id, {
-                    "specialist": specialist["specialist_name"],
-                    "location": specialist.get("territory", town)
-                })
+                _fire_and_forget(
+                    zep_update_user_metadata(user_id, {
+                        "specialist": specialist["specialist_name"],
+                        "location": specialist.get("territory", town)
+                    }),
+                    label=f"lookup_town_zep_save({redact_phone(phone)})",
+                )
 
             # Stash for schedule_callback's fallback. If the caller later
             # says "leave a message" without the agent passing specialist
@@ -1207,23 +1282,77 @@ async def schedule_callback(request: Request):
         specialist_name = args.get("specialist_name")
         specialist_email = args.get("specialist_email")
 
+        # === Layer 0a — never trust an email address from the LLM's args. ===
+        # Everything in `args` is model output; a caller could talk the agent
+        # into "emailing the message" to an arbitrary outside address, which would
+        # go out from our verified domain. Only honor an arg-supplied email if
+        # it matches an active row in the specialists table — otherwise drop
+        # it and let the layers below resolve the recipient from the DB.
+        if specialist_email:
+            verified = await get_specialist_by_email(specialist_email)
+            if verified:
+                specialist_id = specialist_id or verified.get("id")
+                specialist_name = specialist_name or verified.get("full_name")
+                specialist_email = verified.get("email")
+            else:
+                logger.warning(
+                    f"[SCHEDULE_CALLBACK] Dropping arg-supplied email that "
+                    f"matches no active specialist: {specialist_email!r}"
+                )
+                specialist_email = None
+
+        # === Layer 0b — a name without an email gets resolved by NAME. ===
+        # The agent often passes specialist_name but forgets the email. The
+        # named person is who the caller asked for — look THEM up before
+        # falling back to whoever happens to be in the per-call cache
+        # (which may be a different person from an earlier lookup_town).
+        if specialist_name and not specialist_email:
+            named = await lookup_staff_by_name(specialist_name)
+            if len(named) == 1:
+                specialist_id = specialist_id or named[0].get("id")
+                specialist_name = named[0].get("full_name") or specialist_name
+                specialist_email = named[0].get("email")
+                logger.info(
+                    f"[SCHEDULE_CALLBACK] Resolved passed specialist_name to "
+                    f"{specialist_name} <{specialist_email}>"
+                )
+            elif len(named) > 1:
+                logger.warning(
+                    f"[SCHEDULE_CALLBACK] specialist_name {specialist_name!r} "
+                    f"matched {len(named)} people — not auto-picking"
+                )
+
         # === Layer 1 — fill missing specialist info from the per-call cache. ===
         # The agent frequently calls schedule_callback without specialist info,
         # even right after lookup_town or lookup_staff_by_name returned a
         # single matching specialist. Recover by reading the cached
         # `recent_specialist` slot we wrote during those earlier tool calls.
+        # GUARD: if the agent named someone, only borrow the cached person's
+        # email when the names agree — otherwise a message "for Sheryl" would
+        # be emailed to whoever an earlier lookup_town resolved.
         if not specialist_email and caller_key:
             recent = _get_recent_specialist(caller_key)
             if recent:
-                specialist_id = specialist_id or recent.get("id")
-                specialist_name = specialist_name or recent.get("name")
-                specialist_email = specialist_email or recent.get("email")
-                if specialist_email:
-                    logger.info(
-                        f"[SCHEDULE_CALLBACK] Filled specialist from cached "
-                        f"{recent.get('source')} lookup: "
-                        f"{specialist_name} <{specialist_email}>"
+                name_conflict = bool(
+                    specialist_name and recent.get("name")
+                    and specialist_name.strip().lower() != recent["name"].strip().lower()
+                )
+                if name_conflict:
+                    logger.warning(
+                        f"[SCHEDULE_CALLBACK] Cached specialist "
+                        f"{recent.get('name')!r} != requested "
+                        f"{specialist_name!r} — not borrowing cached email"
                     )
+                else:
+                    specialist_id = specialist_id or recent.get("id")
+                    specialist_name = specialist_name or recent.get("name")
+                    specialist_email = specialist_email or recent.get("email")
+                    if specialist_email:
+                        logger.info(
+                            f"[SCHEDULE_CALLBACK] Filled specialist from cached "
+                            f"{recent.get('source')} lookup: "
+                            f"{specialist_name} <{specialist_email}>"
+                        )
 
         # === Layer 1.5 — scan the args for a named specialist. ===
         # Even when no prior tool call cached a specialist, the message body
@@ -1306,11 +1435,15 @@ async def schedule_callback(request: Request):
                 "success": False,
             })
 
-        # If we have a specialist email, fire off an email notification right now
-        email_sent = False
+        # Queue the email in the background — the caller is on the line
+        # waiting for this tool to answer, and a slow Resend round-trip
+        # (up to the client's 10s timeout) is dead air. Failures are logged
+        # by _fire_and_forget; the callbacks row above is the durable record
+        # either way.
+        email_queued = False
         if specialist_email:
-            try:
-                email_sent = await send_specialist_email(
+            _fire_and_forget(
+                send_specialist_email(
                     specialist_email=specialist_email,
                     specialist_name=specialist_name or "Team",
                     caller_name=caller_name or "Unknown caller",
@@ -1318,16 +1451,22 @@ async def schedule_callback(request: Request):
                     caller_location="",
                     call_summary=notes,
                     duration=None,
-                )
-            except Exception as e:
-                logger.error(f"[SCHEDULE_CALLBACK] Email send failed: {e}")
+                ),
+                label=f"schedule_callback_email({specialist_email})",
+            )
+            email_queued = True
 
-        # Build a user-facing confirmation the voice agent can speak back
+        # Build a user-facing confirmation the voice agent can speak back.
+        # Widget callers have no "number you called from" — don't claim one.
+        reach_line = (
+            "They'll reach out to you at the number you called from."
+            if caller_phone else
+            "They'll reach out using the contact info you gave me."
+        )
         if reason == "message" and specialist_name:
             spoken = (
                 f"Got it. I'll make sure {specialist_name} gets your message"
-                f"{' by email' if email_sent else ''}. "
-                f"They'll reach out to you at the number you called from."
+                f"{' by email' if email_queued else ''}. {reach_line}"
             )
         elif when_str and specialist_name:
             spoken = f"Scheduled a callback from {specialist_name} for {when_str}."
@@ -1340,7 +1479,9 @@ async def schedule_callback(request: Request):
             "result": spoken,
             "success": True,
             "callback_id": callback_id,
-            "email_sent": email_sent,
+            # Kept as `email_sent` for any consumer parity — True means the
+            # send was dispatched to the background, not confirmed delivered.
+            "email_sent": email_queued,
         })
     except Exception as e:
         logger.error(f"[SCHEDULE_CALLBACK] Error: {e}", exc_info=True)
@@ -1764,15 +1905,23 @@ async def lookup_staff_by_name_endpoint(request: Request):
         # Trim / sanitize for the voice agent — don't ship phone/email in the
         # spoken summary by default, but DO include them in the structured data
         # so the agent can act on them.
+        #
+        # Phone policy: the live Retell transfer tool uses an INFERRED
+        # destination — the LLM picks the number from conversation context,
+        # i.e. from this response. So (a) phones must be E.164 or the dialer
+        # chokes, and (b) non-LPS staff get NO phone here at all: they are
+        # message-only, and omitting the number is the only server-side way
+        # to stop an inferred transfer from dialing their personal cell.
         cleaned = []
         for m in matches:
+            lps = bool(m.get("is_lps"))
             cleaned.append({
                 "id": m.get("id"),
                 "full_name": m.get("full_name"),
                 "role": m.get("role"),
                 "email": m.get("email"),
-                "phone": m.get("phone"),
-                "is_lps": bool(m.get("is_lps")),
+                "phone": _to_e164(m.get("phone")) if lps else None,
+                "is_lps": lps,
                 "specialties": m.get("specialties") or [],
             })
 
@@ -1883,15 +2032,22 @@ async def transfer_call_tool(request: Request):
                         f"Use schedule_callback with reason='message' to leave a note instead."
                     ),
                 })
-            logger.info(
-                f"[TRANSFER] Transferring to {recent.get('name')} at "
-                f"{recent.get('phone')} (resolved earlier via {recent.get('source')})"
+            dest = _to_e164(recent.get("phone"))
+            if dest:
+                logger.info(
+                    f"[TRANSFER] Transferring to {recent.get('name')} at "
+                    f"{dest} (resolved earlier via {recent.get('source')})"
+                )
+                return JSONResponse(content={
+                    "phone_number": dest,
+                    "specialist_name": recent.get("name") or "your specialist",
+                    "success": True,
+                })
+            logger.warning(
+                f"[TRANSFER] Cached specialist {recent.get('name')} has an "
+                f"un-normalizable phone {recent.get('phone')!r} — falling "
+                f"through to territorial routing"
             )
-            return JSONResponse(content={
-                "phone_number": recent["phone"],
-                "specialist_name": recent.get("name") or "your specialist",
-                "success": True,
-            })
 
         # FALLBACK: territorial routing from the caller's remembered location.
         # Try cache first for caller info, then fall back to Zep
@@ -1936,8 +2092,8 @@ async def transfer_call_tool(request: Request):
                 ),
             })
 
-        if specialist and specialist.get("specialist_phone"):
-            phone_number = specialist["specialist_phone"]
+        phone_number = _to_e164(specialist.get("specialist_phone")) if specialist else None
+        if phone_number:
             specialist_name = specialist.get("specialist_name", "your specialist")
 
             logger.info(f"[TRANSFER] Transferring to {specialist_name} at {phone_number}")
@@ -1948,7 +2104,14 @@ async def transfer_call_tool(request: Request):
                 "success": True
             })
         else:
-            logger.warning(f"[TRANSFER] No specialist found for location: {caller_location}")
+            if specialist:
+                logger.warning(
+                    f"[TRANSFER] {specialist.get('specialist_name')} matched but "
+                    f"phone {specialist.get('specialist_phone')!r} is not dialable — "
+                    f"routing to main office"
+                )
+            else:
+                logger.warning(f"[TRANSFER] No specialist found for location: {caller_location}")
             return JSONResponse(content={
                 "phone_number": MFC_MAIN_OFFICE_E164,
                 "specialist_name": "main office",

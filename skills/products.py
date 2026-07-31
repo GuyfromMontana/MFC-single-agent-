@@ -91,7 +91,10 @@ def _format_product(p: dict) -> str:
     parts = [p.get("product_name") or "Unknown product"]
     specs = []
     if p.get("protein_percentage"):
-        specs.append(f"{int(float(p['protein_percentage']))}% protein")
+        # :g keeps halves ("37.5% protein") but drops trailing zeros
+        # ("30% protein", not "30.0%"). int() truncated 37.5 -> 37, and
+        # spec numbers matter in sales conversations.
+        specs.append(f"{float(p['protein_percentage']):g}% protein")
     if p.get("unit_type"):
         specs.append(str(p["unit_type"]))
     if specs:

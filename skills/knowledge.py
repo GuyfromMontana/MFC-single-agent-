@@ -57,4 +57,11 @@ async def search_knowledge_base(query: str, top_k: int = 5) -> str:
         )
     except Exception as e:
         logger.error(f"Knowledge base search error: {e}")
-        return "I'll connect you with a specialist who can help."
+        # Same contract as NO_MATCH: an explicit instruction, not prose the
+        # agent might mistake for an answer and repeat to the caller.
+        return (
+            "SEARCH_ERROR: The knowledge base could not be searched right now. "
+            "Do not guess or answer from general knowledge. Tell the caller you "
+            "can't pull that detail up at the moment and offer to have a "
+            "livestock specialist follow up."
+        )

@@ -20,6 +20,7 @@ from .specialists import (
     resolve_town_to_county,
     lookup_specialist_by_town,
     lookup_staff_by_name,
+    get_specialist_by_email,
     is_lps,
 )
 
@@ -63,6 +64,7 @@ __all__ = [
     "resolve_town_to_county",
     "lookup_specialist_by_town",
     "lookup_staff_by_name",
+    "get_specialist_by_email",
     "is_lps",
     # Knowledge
     "search_knowledge_base",

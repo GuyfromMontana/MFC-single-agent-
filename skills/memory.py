@@ -244,9 +244,13 @@ def extract_name_from_transcript(transcript: List[Dict]) -> Optional[str]:
                     parts.pop()
                 name = " ".join(parts)
 
-                # Don't `.title()` — the regex already captures `[A-Z][a-z]+`,
-                # so internal capitalization ("McDonald", "O'Brien",
-                # "MacCready") is preserved. Title-casing would mangle them.
+                # The patterns are compiled with IGNORECASE (ASR often emits
+                # all-lowercase), so a fully-lowercase capture ("guy hanson")
+                # gets title-cased for storage/emails. Mixed-case captures
+                # ("McDonald", "O'Brien") are left alone — blanket .title()
+                # would mangle them.
+                if name == name.lower():
+                    name = name.title()
                 logger.info(f"Extracted name from transcript: {name}")
                 return name
 

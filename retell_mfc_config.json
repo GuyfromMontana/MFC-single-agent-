@@ -1,7 +1,7 @@
 {
   "agent_name": "Montana Feed Company Ranch Consultant",
   "language": "en-US",
-  "voice_id": "11labs-Adrian",
+  "voice_id": "11labs-Brian",
   "enable_call_transfer": true,
   "call_transfer_destinations": [
     {
@@ -301,5 +301,5 @@
       }
     }
   ],
-  "_note": "REFERENCE FILE \u2014 Retell agent config is managed in the Retell dashboard. Keep this file in sync as the source-of-truth reference for tool schemas, descriptions, and transfer destinations. Any changes here MUST be copied into the Retell dashboard manually (or via the Retell API) to take effect. Last updated 2026-06-12: all tools now point at Railway (the Vercel endpoints were abandoned 2026-06-05 \u2014 they never saw Retell's nested args); query_knowledge(question) replaced by search_knowledge_base(query) to match the v11 prompt. VERIFY the dashboard matches: tool URLs, the lookup_town param name (town_name), and that Danielle Peterson is NOT in transfer destinations."
+  "_note": "REFERENCE FILE \u2014 Retell agent config is managed in the Retell dashboard. Keep this file in sync as the source-of-truth reference for tool schemas, descriptions, and transfer destinations. Any changes here MUST be copied into the Retell dashboard manually (or via the Retell API) to take effect. Last verified against the live LLM via API 2026-07-31: voice is 11labs-Brian; the live transfer tool is Retell-native transfer_call with an INFERRED destination (NOT the predefined per-LPS list below, and NOT the Railway /retell/functions/transfer_call_tool endpoint \u2014 that endpoint is currently dormant). KNOWN LIVE DRIFT NEEDING DASHBOARD FIXES: (1) five tool URLs still use the uppercase host MFC-single-agent-... which intermittently 404s at Railway's edge \u2014 all should be lowercase mfc-single-agent-...; (2) the live search_products URL has a leading TAB character embedded before https \u2014 remove it; (3) consider re-pointing transfer to the Railway transfer_call_tool endpoint so the server-side non-LPS refusal guard actually runs."
 }
