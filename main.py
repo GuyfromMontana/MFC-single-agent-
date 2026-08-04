@@ -92,6 +92,7 @@ from skills import (
 )
 from skills.memory import _fire_and_forget
 from skills.specialists import get_specialist_by_email, lookup_staff_by_phone
+from skills.warehouses import lookup_warehouse_by_did
 
 # Main office fallback number for the voice agent. Single source of truth —
 # used by lookup_staff, lookup_staff_by_name, and schedule_callback when a
@@ -542,6 +543,12 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
 
             logger.info(f"Inbound: {redact_phone(caller_key)} -> {redact_phone(to_number)} (agent: {agent_id}, {'widget' if is_widget else 'phone'})")
 
+            # Per-store routing (Option B, 2026-08-04): which store line did
+            # they dial? Runs FRESH on every event — never from the caller
+            # cache, since the same caller can ring different store lines.
+            # Returns None for the shared/widget number (all vars stay "").
+            store = await lookup_warehouse_by_did(to_number) if to_number else None
+
             # Check if we already cached this caller (call_inbound fires before call_started)
             redacted_key = redact_phone(caller_key)
             cached = _cache_get(caller_key)
@@ -649,7 +656,23 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                 # matches an active row in `specialists`.
                 "is_staff": "true" if memory_data.get("staff_name") else "false",
                 "staff_role": memory_data.get("staff_role", "") or "",
+                # Per-store routing (2026-08-04): set when to_number matches a
+                # warehouses.retell_did. Empty on the shared/widget number.
+                "is_store_line": "true" if store else "false",
+                "store_name": (store.get("city") or "") if store else "",
+                "store_manager": (store.get("manager_name") or "") if store else "",
+                "store_hours": (store.get("operating_hours") or "") if store else "",
+                "store_phone": (store.get("phone") or "") if store else "",
             }
+
+            # Stash the store's routing info on the caller's cache entry so
+            # call_ended / schedule_callback can prefer the store manager over
+            # the global catch-all. Overwritten every call, so a caller who
+            # rings a different store next time gets the right routing.
+            memory_data["store_name"] = (store.get("city") or "") if store else ""
+            memory_data["store_manager"] = (store.get("manager_name") or "") if store else ""
+            memory_data["store_manager_email"] = (store.get("manager_email") or "") if store else ""
+            _cache_set(caller_key, memory_data)
 
             logger.info(
                 f"[INBOUND] Dynamic vars: name={dynamic_vars['name']}, "
@@ -839,6 +862,27 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
 
                 except Exception as e:
                     logger.error(f"[EMAIL] Specialist lookup error: {e}")
+
+            # Store-manager routing (2026-08-04): a call that came in on a
+            # store's dedicated line belongs to that store. If no specialist
+            # was resolved, the store manager gets the transcript — the
+            # global catch-all is only for the shared/widget number.
+            if not specialist_email and RESEND_API_KEY:
+                cached = _cache_get(caller_key) or {}
+                store_email = cached.get("store_manager_email") or ""
+                store_label = cached.get("store_name") or ""
+                if not store_email and to_number:
+                    store_row = await lookup_warehouse_by_did(to_number)
+                    if store_row:
+                        store_email = store_row.get("manager_email") or ""
+                        store_label = store_row.get("city") or ""
+                if store_email:
+                    specialist_email = store_email
+                    specialist_name = specialist_name or f"{store_label} store manager"
+                    logger.info(
+                        f"[EMAIL] No specialist identified — store-line call, "
+                        f"routing transcript to {store_label} manager"
+                    )
 
             # Catch-all: if no specialist could be resolved, send the
             # full-transcript email to a triage inbox instead of dropping it.
@@ -1401,6 +1445,26 @@ async def schedule_callback(request: Request):
                         is_lps=scanned.get("is_lps"),
                         source="schedule_callback_scan",
                     )
+
+        # === Layer 1.75 — store-line calls route to the store manager. ===
+        # A generic "have somebody call me" on a store's dedicated line
+        # belongs to that store's manager, not the global triage inbox.
+        if not specialist_email:
+            cached = _cache_get(caller_key) if caller_key else None
+            store_email = (cached or {}).get("store_manager_email") or ""
+            store_label = (cached or {}).get("store_name") or ""
+            if not store_email and call_data.get("to_number"):
+                store_row = await lookup_warehouse_by_did(call_data["to_number"])
+                if store_row:
+                    store_email = store_row.get("manager_email") or ""
+                    store_label = store_row.get("city") or ""
+            if store_email:
+                specialist_email = store_email
+                specialist_name = specialist_name or f"{store_label} store manager"
+                logger.info(
+                    f"[SCHEDULE_CALLBACK] No specialist resolved — store-line "
+                    f"call, routing message to {store_label} manager"
+                )
 
         # === Layer 2 — catch-all so messages never reach /dev/null. ===
         # If neither the agent's args nor the cache yielded a specialist,

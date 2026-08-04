@@ -73,6 +73,46 @@ def _score_warehouse(w: dict, terms: List[str]) -> int:
     return best
 
 
+async def lookup_warehouse_by_did(to_number: str) -> Optional[Dict]:
+    """Match an inbound call's `to_number` against `warehouses.retell_did`.
+
+    Backs per-store routing (Option B, built 2026-08-04): each store's
+    Verizon cell conditionally forwards to a dedicated Retell number, and
+    this lookup tells the agent WHICH store line the caller actually dialed
+    so the greeting, hours, and message routing can be store-specific.
+
+    Compares last 10 digits (DIDs may be stored with or without +1).
+    Returns the warehouse row or None (None = the shared/widget number).
+    """
+    if not supabase or not to_number:
+        return None
+
+    digits = "".join(c for c in to_number if c.isdigit())[-10:]
+    if len(digits) < 10:
+        return None
+
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("warehouses")
+                .select("warehouse_name, warehouse_code, city, region, address, "
+                        "phone, manager_name, manager_email, operating_hours, "
+                        "retell_did, is_active")
+                .eq("is_active", True)
+                .not_.is_("retell_did", "null")
+                .execute()
+        )
+        for w in result.data or []:
+            did_digits = "".join(c for c in (w.get("retell_did") or "") if c.isdigit())[-10:]
+            if did_digits and did_digits == digits:
+                logger.info(f"[WAREHOUSE] to_number matched store line: {w.get('warehouse_name')}")
+                return w
+        return None
+
+    except Exception as e:
+        logger.error(f"[WAREHOUSE] lookup_warehouse_by_did error: {e}", exc_info=True)
+        return None
+
+
 async def lookup_warehouse(terms: List[str]) -> Optional[Dict]:
     """Find the single best-matching active warehouse for the caller's
     search terms (city, code, region, county, or town). Returns the raw
