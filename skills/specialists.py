@@ -149,6 +149,7 @@ MONTANA_TOWN_TO_COUNTY = {
     "geyser": "Judith Basin County",
     "harlowton": "Wheatland County",
     "two dot": "Wheatland County",
+    "judith gap": "Wheatland County",
     "white sulphur springs": "Meagher County",
     "martinsdale": "Meagher County",
     "ryegate": "Golden Valley County",
