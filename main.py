@@ -20,6 +20,11 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+# Railway containers run UTC — anything shown to a human as "MT" must be
+# converted explicitly.
+MOUNTAIN_TZ = ZoneInfo("America/Denver")
 
 # Initialize Sentry as early as possible so it captures import-time errors and
 # all subsequent webhook activity. PII (phone numbers) is intentionally NOT
@@ -86,7 +91,7 @@ from skills import (
     recommend_products,
 )
 from skills.memory import _fire_and_forget
-from skills.specialists import get_specialist_by_email
+from skills.specialists import get_specialist_by_email, lookup_staff_by_phone
 
 # Main office fallback number for the voice agent. Single source of truth —
 # used by lookup_staff, lookup_staff_by_name, and schedule_callback when a
@@ -413,7 +418,7 @@ async def send_specialist_email(specialist_email: str, specialist_name: str, cal
         safe_phone = html.escape(caller_phone or "")
         safe_location = html.escape(caller_location or "Not specified")
         safe_duration = html.escape(duration_str)
-        safe_time = html.escape(datetime.now().strftime("%Y-%m-%d %I:%M %p MT"))
+        safe_time = html.escape(datetime.now(MOUNTAIN_TZ).strftime("%Y-%m-%d %I:%M %p MT"))
         safe_summary = html.escape(call_summary or "No transcript available")
 
         html_content = f"""
@@ -560,6 +565,7 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                     "message": "Widget caller",
                     "customer_id": "", "primary_warehouse": "",
                     "is_existing_customer": False,
+                    "staff_name": "", "staff_role": "",
                 }
                 _cache_set(caller_key, memory_data)
                 logger.info(f"[WIDGET] New widget caller, cached as {redacted_key}")
@@ -569,10 +575,24 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                 # name placeholders from Zep but doesn't override a real Zep name
                 # (a caller may have introduced themselves differently than the
                 # billing record knows them).
-                memory_data, customer_data = await asyncio.gather(
+                memory_data, customer_data, staff_match = await asyncio.gather(
                     lookup_caller_fast(caller_key),
                     lookup_customer_by_phone(caller_key),
+                    lookup_staff_by_phone(caller_key),
                 )
+
+                # Staff recognition: if the caller's number belongs to an active
+                # employee in `specialists`, surface that to the agent. Their
+                # name from the staff table beats a Zep placeholder.
+                if staff_match:
+                    memory_data["staff_name"] = staff_match["full_name"]
+                    memory_data["staff_role"] = staff_match.get("role") or ""
+                    zep_name = (memory_data.get("caller_name") or "").strip()
+                    if zep_name.lower() in {"", "caller", "unknown", "new caller"}:
+                        memory_data["caller_name"] = staff_match["full_name"]
+                else:
+                    memory_data["staff_name"] = ""
+                    memory_data["staff_role"] = ""
 
                 if customer_data:
                     # Prefer Zep name when set + non-placeholder; otherwise use
@@ -625,6 +645,10 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                 "is_customer": "true" if is_existing_customer else "false",
                 "customer_city": memory_data.get("customer_city", "") or "",
                 "last_purchase": memory_data.get("customer_last_purchase", "") or "",
+                # Staff recognition (2026-08-04): set when the caller's number
+                # matches an active row in `specialists`.
+                "is_staff": "true" if memory_data.get("staff_name") else "false",
+                "staff_role": memory_data.get("staff_role", "") or "",
             }
 
             logger.info(

@@ -5,19 +5,9 @@
   "enable_call_transfer": true,
   "call_transfer_destinations": [
     {
-      "number": "+14066487033",
-      "name": "Brady Johnson",
-      "description": "Brady Johnson - North-Central MT: Great Falls, Helena, Fort Benton, Choteau, Conrad, Cut Bank, Shelby, Havre area"
-    },
-    {
-      "number": "+14069253394",
-      "name": "Taylor Staudenmeyer",
-      "description": "Taylor Staudenmeyer - Southwest MT: Dillon, Butte, Anaconda, Deer Lodge, Ennis, Hamilton, Bitterroot Valley"
-    },
-    {
-      "number": "+14066970366",
-      "name": "Hannah Imer",
-      "description": "Hannah Imer - Columbus area large herds and feedlots (lead specialist)"
+      "number": "+14068391255",
+      "name": "Austin Buzanowski",
+      "description": "Austin Buzanowski - Northeast MT: Glasgow, Malta, Scobey, Plentywood, Wolf Point, Havre, Chinook"
     },
     {
       "number": "+14063700907",
@@ -25,19 +15,34 @@
       "description": "Isabell Gilleard - Columbus area medium-sized herds (supports Hannah; reassigned from Miles City 2026-04-22)"
     },
     {
-      "number": "+14068518749",
-      "name": "Caitlin Lapicki",
-      "description": "Caitlin Lapicki - Eastern MT: Jordan, Circle, Glendive, Sidney, Terry, Baker, Ekalaka"
+      "number": "+14066970366",
+      "name": "Hannah Imer",
+      "description": "Hannah Imer - Columbus area large herds and feedlots (lead specialist)"
     },
     {
-      "number": "+14068391255",
-      "name": "Austin Buzanowski",
-      "description": "Austin Buzanowski - Northeast MT: Glasgow, Malta, Scobey, Plentywood, Wolf Point, Havre, Chinook"
+      "number": "+14066487033",
+      "name": "Brady Johnson",
+      "description": "Brady Johnson - North-Central MT: Great Falls, Helena, Fort Benton, Choteau, Conrad, Cut Bank, Shelby, Havre area"
     },
     {
       "number": "+13078511393",
       "name": "Kaylee Klaahsen",
       "description": "Kaylee Klaahsen - Southern MT + Wyoming: Billings, Bozeman, Livingston, Red Lodge, Hardin, Miles City, Riverton WY"
+    },
+    {
+      "number": "+14068518749",
+      "name": "Caitlin Lapicki",
+      "description": "Caitlin Lapicki - Eastern MT: Jordan, Circle, Glendive, Sidney, Terry, Baker, Ekalaka"
+    },
+    {
+      "number": "+14069253394",
+      "name": "Taylor Staudenmeyer",
+      "description": "Taylor Staudenmeyer - Southwest MT: Dillon, Butte, Anaconda, Deer Lodge, Ennis, Hamilton, Bitterroot Valley"
+    },
+    {
+      "number": "+14063664668",
+      "name": "Mike Vanek",
+      "description": "Mike Vanek - Central MT (newly hired 2026): Petroleum, Garfield, parts of Phillips; shares the Lewistown area with Brady Johnson"
     }
   ],
   "tools": [
@@ -282,7 +287,7 @@
     {
       "type": "custom",
       "name": "lookup_staff_by_name",
-      "description": "Look up a Montana Feed Company staff member BY NAME. Use this when a caller asks for someone by name \u2014 e.g., 'I need Sheryl Shea', 'Can I talk to Brady', 'Is Austin there?'. Do NOT use this for territorial routing (use lookup_town for that). Returns match_count (0, 1, or many) and a list of matches with their id, full_name, role, email, phone, and is_lps flag. When match_count is 1 and is_lps is true, offer the caller BOTH a live transfer (via transfer_call_tool) AND the option to leave a message (via schedule_callback with reason='message'). When is_lps is false (managers, warehouse, corporate staff like Sheryl), only offer to leave a message \u2014 they don't take live transfers. When match_count is 0, offer the main office at 406-728-7020.",
+      "description": "Look up a Montana Feed Company staff member BY NAME. Use this when a caller asks for someone by name — e.g., 'I need Sheryl Shea', 'Can I talk to Brady', 'Is Austin there?'. Do NOT use this for territorial routing (use lookup_town for that). Returns match_count (0, 1, or many) and a list of matches with their id, full_name, role, email, phone, and is_lps flag. When match_count is 1 and is_lps is true, offer the caller BOTH a live transfer (via transfer_call_tool) AND the option to leave a message (via schedule_callback with reason='message'). When is_lps is false (managers, warehouse, corporate staff like Sheryl), only offer to leave a message — they don't take live transfers. When match_count is 0, offer the main office at 406-728-7020.",
       "url": "https://mfc-single-agent-production.up.railway.app/retell/functions/lookup_staff_by_name",
       "speak_during_execution": true,
       "speak_after_execution": true,
@@ -301,5 +306,5 @@
       }
     }
   ],
-  "_note": "REFERENCE FILE \u2014 Retell agent config is managed in the Retell dashboard. Keep this file in sync as the source-of-truth reference for tool schemas, descriptions, and transfer destinations. Any changes here MUST be copied into the Retell dashboard manually (or via the Retell API) to take effect. Last verified against the live LLM via API 2026-07-31: voice is 11labs-Brian; the live transfer tool is Retell-native transfer_call with an INFERRED destination (NOT the predefined per-LPS list below, and NOT the Railway /retell/functions/transfer_call_tool endpoint \u2014 that endpoint is currently dormant). KNOWN LIVE DRIFT NEEDING DASHBOARD FIXES: (1) five tool URLs still use the uppercase host MFC-single-agent-... which intermittently 404s at Railway's edge \u2014 all should be lowercase mfc-single-agent-...; (2) the live search_products URL has a leading TAB character embedded before https \u2014 remove it; (3) consider re-pointing transfer to the Railway transfer_call_tool endpoint so the server-side non-LPS refusal guard actually runs."
+  "_note": "REFERENCE FILE — Retell agent config is managed in the Retell dashboard, EXCEPT call_transfer_destinations, which is now generated: deploy_retell_config.py reads active LPSs from the Supabase specialists table and regenerates BOTH this file's call_transfer_destinations AND the live transfer_call tool's inferred-destination prompt (dry-run by default; --apply pushes via create-agent-version -> update-retell-llm -> publish-agent-version, since direct PATCH of a published LLM 400s). Do not hand-edit names/numbers here — fix the specialists table and re-run; hand-editing the description text IS supported (the script preserves it, matched by full name). Other tool schemas below still must be mirrored to the dashboard manually. Last verified against the live LLM via API 2026-07-31 (agent v55, 'fix-tool-urls'): voice is 11labs-Brian; tool URL drift (uppercase host, search_products tab) is FIXED; the live transfer tool is Retell-native transfer_call with an INFERRED destination (the Railway /retell/functions/transfer_call_tool endpoint remains dormant)."
 }

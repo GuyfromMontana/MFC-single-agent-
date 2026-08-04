@@ -366,6 +366,62 @@ async def lookup_staff_by_name(name: str) -> list:
         return []
 
 
+async def lookup_staff_by_phone(phone: str) -> Optional[Dict]:
+    """
+    Match a caller's phone number against active staff in `specialists`.
+
+    Used by the call_inbound handler so employees calling the agent are
+    recognized as staff instead of being treated as anonymous callers
+    (found in Brady Johnson's 2026-08-04 test call: the agent told an
+    active LPS he was "flagged like a regular caller").
+
+    Comparison is on the last 10 digits, since the table stores phones
+    in mixed formats ("4066487033", "406-855-9929") and Retell sends
+    E.164 ("+14066487033"). Returns the matched row dict (same shape as
+    lookup_staff_by_name results) or None.
+    """
+    if not supabase or not phone:
+        return None
+
+    digits = "".join(c for c in phone if c.isdigit())[-10:]
+    if len(digits) < 10:
+        return None
+
+    try:
+        def _run_query():
+            return (
+                supabase.table("specialists")
+                .select("id, first_name, last_name, email, phone, role, specialties, counties, is_active")
+                .eq("is_active", True)
+                .execute()
+            )
+
+        result = await asyncio.to_thread(_run_query)
+        for s in result.data or []:
+            row_digits = "".join(c for c in (s.get("phone") or "") if c.isdigit())[-10:]
+            if row_digits and row_digits == digits:
+                first = (s.get("first_name") or "").strip()
+                last = (s.get("last_name") or "").strip()
+                logger.info(f"[STAFF] Caller phone matched staff: {first} {last}")
+                return {
+                    "id": s.get("id"),
+                    "first_name": s.get("first_name"),
+                    "last_name": s.get("last_name"),
+                    "full_name": f"{first} {last}".strip(),
+                    "email": s.get("email"),
+                    "phone": s.get("phone"),
+                    "role": s.get("role"),
+                    "specialties": s.get("specialties") or [],
+                    "counties": s.get("counties") or [],
+                    "is_lps": is_lps(s),
+                }
+        return None
+
+    except Exception as e:
+        logger.error(f"[STAFF] lookup_staff_by_phone error: {e}", exc_info=True)
+        return None
+
+
 async def get_specialist_by_email(email: str) -> Optional[Dict]:
     """Return the active specialist whose email matches (case-insensitive),
     or None.

@@ -34,7 +34,8 @@ mfcagent/
 │   ├── leads.py            # `leads` + `callbacks` table writes (async)
 │   ├── specialists.py      # LPS lookup by name or town/county (async)
 │   └── knowledge.py        # RAG search over knowledge base (async)
-├── retell_mfc_config.json  # Reference Retell agent config — NOT auto-synced to Retell dashboard
+├── retell_mfc_config.json  # Reference Retell agent config — transfer destinations script-synced, rest manual
+├── deploy_retell_config.py # LPS roster sync: Supabase specialists -> live transfer prompt + config JSON
 ├── retell_system_prompt_v{7,8,9,11}.md  # Versioned system prompts (v11 is current)
 ├── supabase/               # local CLI workspace
 ├── backfill_embeddings.py  # one-off Python embedding backfill
@@ -88,9 +89,16 @@ Zep's PATCH `/users/{id}` body `{"metadata": {key: null}}` preserves the existin
 
 `CATCHALL_MESSAGE_EMAIL` (env var) receives the full transcript when `schedule_callback` or `call_ended` can't resolve a specialist. Without it, messages vanish — the agent says "Sheryl will get it" and Sheryl gets nothing. The `_call_cache` Layer 1 + catch-all Layer 2 pair is the reason production message routing finally worked end-to-end.
 
-### `retell_mfc_config.json` is reference-only
+### `retell_mfc_config.json` is reference-only — EXCEPT transfer destinations
 
-The live Retell agent config lives in Retell's dashboard. The JSON file in this repo documents intended state but **is not auto-synced**. Edits to the JSON do nothing in production until manually mirrored in the dashboard. Tooling to push automatically would need a Retell API key + a sync script.
+The live Retell agent config lives in Retell's dashboard. The JSON file in this repo documents intended state but **is not auto-synced** — with one exception: `call_transfer_destinations` and the live transfer_call tool's inferred-destination prompt are regenerated from the Supabase `specialists` table by `deploy_retell_config.py` (2026-07-31 rewrite). Run it after ANY specialists-table change:
+
+```
+py deploy_retell_config.py            # dry run, shows diffs
+py deploy_retell_config.py --apply    # rewrites JSON + drafts/patches/publishes the agent
+```
+
+Roster names/numbers come from Supabase (`is_lps()` rows, phones via the same `_to_e164` rules as main.py); hand-written territory descriptions in the JSON are preserved by full-name match. Direct PATCH of a published LLM returns 400 — the script uses create-agent-version → update-retell-llm (draft) → publish-agent-version. The agent's SYSTEM prompt territory sections are NOT script-managed; the script prints a reminder to review them manually when roster membership changed. All other tool schemas in the JSON still require manual dashboard mirroring.
 
 ---
 
@@ -115,6 +123,7 @@ The live Retell agent config lives in Retell's dashboard. The JSON file in this 
 
 ## Done (recent)
 
+- **2026-07-31** — LPS-list drift fix: rewrote `deploy_retell_config.py` as a Supabase→Retell roster sync (old version's assumptions were dead: destinations are now INFERRED not predefined, and published LLMs reject direct PATCH). Reads active LPSs from `specialists`, regenerates the transfer prompt + `retell_mfc_config.json` destinations, pushes via draft→patch→publish, verifies post-publish. Dry-run verified against live agent v55; not yet applied (pending diffs are cosmetic: alphabetical ordering + generic non-LPS refusal line replacing the Sheryl-by-name one).
 - **2026-05-13 PM** — Found and fixed the bug. Retell body shape change (`body["args"]` vs `body["arguments"]`) was silently breaking every tool call. Sheryl finally received an email at `sheryl@axmen.com` end-to-end. Fix: `46b0b93`. Same session: Zep `null`-is-noop discovery + `""` fix (`691cd63`); pure-Python `lookup_staff_by_name` rewrite (`0089586`); per-call specialist cache + catch-all email layer (`e4f5471`, `55c152e`); `/clear-zep-metadata` and `/debug/staff-lookup` admin endpoints (`124fd8b`, `31febc2`).
 - **2026-05-13 AM** — Phase 1 wired (`f69f4de`): `caller_contacts` → `{{warehouse}}` + `{{is_customer}}` + `{{customer_city}}` + `{{last_purchase}}` dynamic vars. v8 prompt published with NW MT Hwy 93 special-case handling.
 - **2026-05-11** — Specialist routing audit: cleared Sheryl Shea's counties (floating helper, not territorial); identified Danielle Peterson stale row; planned Mike Vanek insert. Eagle salesperson discovery via pymysql confirmed only 220 / 15,277 customers have `cr_salesman_no` populated.

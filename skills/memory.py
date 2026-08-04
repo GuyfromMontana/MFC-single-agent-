@@ -257,6 +257,18 @@ def extract_name_from_transcript(transcript: List[Dict]) -> Optional[str]:
     return None
 
 
+# Words the loose regex fallback below is prone to capturing out of filler
+# speech ("I'm in the truck", "calling from my house"). A capture made up
+# entirely of these is ASR junk, not a town — a literal "In The" got saved
+# as a caller's location and read back to him on 2026-08-04.
+_LOCATION_STOPWORDS = {
+    "the", "a", "an", "that", "there", "here", "this", "my", "our", "your",
+    "his", "her", "their", "town", "state", "county", "area", "middle",
+    "montana", "wyoming", "truck", "tractor", "pickup", "house", "barn",
+    "field", "pasture", "road", "way", "morning", "afternoon", "evening",
+}
+
+
 def extract_location_from_transcript(transcript: List[Dict]) -> Optional[str]:
     """Extract location from conversation transcript."""
     if not transcript:
@@ -300,6 +312,9 @@ def extract_location_from_transcript(transcript: List[Dict]) -> Optional[str]:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
                 potential_location = match.group(1).strip()
+                words = potential_location.lower().split()
+                if words and all(w in _LOCATION_STOPWORDS for w in words):
+                    continue  # filler speech, not a place name
                 if len(potential_location) >= 3:
                     logger.info(f"Extracted location from transcript: {potential_location}")
                     return potential_location.title()
