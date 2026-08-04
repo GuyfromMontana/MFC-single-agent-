@@ -156,6 +156,14 @@ MONTANA_TOWN_TO_COUNTY = {
     "lavina": "Golden Valley County",
     "roundup": "Musselshell County",
     "melstone": "Musselshell County",
+    # Petroleum + Garfield — Mike Vanek as of 2026-08-04 ("jordan" is in the
+    # EASTERN MONTANA block below but maps to Garfield County → Mike)
+    "winnett": "Petroleum County",
+    "flatwillow": "Petroleum County",
+    "teigen": "Petroleum County",
+    "cohagen": "Garfield County",
+    "brusett": "Garfield County",
+    "sand springs": "Garfield County",
     
     # SOUTHERN MONTANA + WYOMING — Kaylee Klaahsen
     # Stillwater County (Columbus, Absarokee, Nye) is co-served by Hannah Imer
