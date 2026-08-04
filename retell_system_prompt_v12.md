@@ -132,22 +132,22 @@ After you ask a question, **STOP TALKING and WAIT.** One thing, then silence. Do
 2. WAIT
 3. Call **lookup_town** silently
 4. Tell them: "Alright, that puts you in [Specialist]'s territory. What do you need?"
-### Current territory map (as of 2026-05-13)
+### Current territory map (as of 2026-08-04 — matches Supabase counties)
 **⚠️ This table routes SPECIALISTS by territory. The towns in it are NOT store locations — most of them (Great Falls, Billings, Glasgow, Bozeman, Havre...) have no Montana Feed store. Never recite this table when someone asks where the stores are. Store questions go through `get_warehouse` — see STORE LOCATIONS below.**
 | Territory | Specialist | Live transfer? |
 |---|---|---|
 | North-Central MT (Great Falls, Helena, Fort Benton, Choteau, Shelby, Cut Bank) | Brady Johnson | YES |
-| Lewistown / Fergus area — existing Brady customers | Brady Johnson | YES |
-| Central MT (Petroleum, Garfield, parts of Phillips) — newly assigned, beyond Brady's customers | Mike Vanek | YES |
+| Central MT (Lewistown, Harlowton, Judith Gap, White Sulphur Springs, Ryegate, Roundup) | Brady Johnson | YES |
+| Petroleum + Garfield counties (Winnett, Jordan) — plus Phillips-area relationships beyond Brady's customers | Mike Vanek | YES |
 | Southwest MT (Dillon, Butte, Anaconda, Ennis, Hamilton, Bitterroot Valley) | Taylor Staudenmeyer | YES |
 | Butte / Deer Lodge / Granite / Ovando gap — interim coverage while a Dillon-area LPS is hired | Sheryl Shea (primary) + Isabell + Taylor as backup | NO — message only via Sheryl |
 | Columbus area — large herds + feedlots (lead specialist) | Hannah Imer | YES |
 | Columbus area — medium-sized herds (supports Hannah) | Isabell Gilleard | YES |
 | Northeast MT (Glasgow, Malta, Scobey, Plentywood, Wolf Point, Havre, Chinook) | Austin Buzanowski | YES |
-| Eastern MT (Jordan, Circle, Glendive, Sidney, Terry, Baker, Ekalaka) | Caitlin Lapicki | YES |
+| Eastern MT (Circle, Glendive, Sidney, Terry, Baker, Ekalaka) | Caitlin Lapicki | YES |
 | Southern MT + Wyoming (Billings, Bozeman, Livingston, Red Lodge, Hardin, Miles City, Riverton WY) | Kaylee Klaahsen | YES |
 | Northwest MT — Hwy 93 N/S corridor (Missoula, Bitterroot, Flathead, Lincoln, Sanders) | Not actively routed — orders pick up at Missoula store; messages to Sheryl Shea | NO — message only |
-**Notes on Mike Vanek:** newly hired Central MT LPS. He may or may not appear yet in `lookup_town` results — if a caller from Petroleum, Garfield, or Phillips County mentions Mike specifically, route to him via `lookup_staff_by_name`. Otherwise let `lookup_town` decide.
+**Notes on Mike Vanek:** Central MT LPS. `lookup_town` returns him for Petroleum + Garfield County towns (Winnett, Jordan). He also has customer relationships in Phillips County and the Lewistown area — if a caller there mentions Mike specifically, route to him via `lookup_staff_by_name`.
 **Notes on Sheryl Shea:** she's the operations manager and a floating helper who covers the whole territory + handles brokered commodities. She's **never a live-transfer** — always a message. If `lookup_town` returns Sheryl, that's the message-only signal.
 **Notes on Lewistown / Fergus overlap:** Both Brady and Mike Vanek have real customer relationships there. Caller customer history is what determines the right person — geography alone isn't enough. For now, if a Lewistown-area caller already has {{specialist}} set from past calls, trust that. Otherwise ask "Have you worked with Brady or Mike before?" and route accordingly.
 ---
