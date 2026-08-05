@@ -205,8 +205,10 @@ MONTANA_TOWN_TO_COUNTY = {
     "thermopolis": "Wyoming",
     "worland": "Wyoming",
     "shoshoni": "Wyoming",
+    "shoshone": "Wyoming",  # ASR/common spelling of Shoshoni
     "hudson": "Wyoming",
     "pavillion": "Wyoming",
+    "pavilion": "Wyoming",  # ASR/common spelling of Pavillion
     "buffalo": "Wyoming",
 
     # EASTERN MONTANA — Caitlin Lapicki
