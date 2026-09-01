@@ -36,8 +36,9 @@ def _sanitize_name(value: str) -> str:
 #
 # IMPORTANT (2026-04-22 reassignments — keep in sync with Supabase
 # `specialists.counties`, which is the actual routing source of truth):
-#   - Isabell Gilleard moved Miles City → Columbus area (medium herds)
-#   - Hannah Imer is the Columbus lead (large herds + feedlots)
+#   - Isabell Gilleard RESIGNED 2026-08-11 (is_active=false in Supabase);
+#     Hannah Imer absorbed her Columbus medium-herd coverage
+#   - Hannah Imer is the Columbus lead (all herd sizes + feedlots)
 #   - Kaylee Klaahsen now covers Miles City in addition to S-Central MT + WY
 #   - NW MT (Missoula/Bitterroot/Flathead/Lincoln) is owned by Sheryl Shea
 #     — she is NOT an LPS, so calls from those counties go to message-only,
@@ -166,8 +167,8 @@ MONTANA_TOWN_TO_COUNTY = {
     "sand springs": "Garfield County",
     
     # SOUTHERN MONTANA + WYOMING — Kaylee Klaahsen
-    # Stillwater County (Columbus, Absarokee, Nye) is co-served by Hannah Imer
-    # + Isabell Gilleard per 2026-04-22 reassignment.
+    # Stillwater County (Columbus, Absarokee, Nye) is served by Hannah Imer
+    # (Isabell Gilleard co-served until she resigned 2026-08-11).
     "billings": "Yellowstone County",
     "laurel": "Yellowstone County",
     "shepherd": "Yellowstone County",
