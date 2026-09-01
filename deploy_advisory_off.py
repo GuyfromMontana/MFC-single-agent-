@@ -78,9 +78,20 @@ def get_json(client, path, api_key):
 
 
 def post_json(client, path, body, api_key):
+    """POST and return the parsed body, or {} when there isn't one.
+
+    /publish-agent-version answers 200 with an EMPTY body — blindly calling
+    .json() on it raises JSONDecodeError *after* the publish has already
+    succeeded, which reads like a failed deploy when it wasn't.
+    """
     r = client.post(f"{API_BASE}{path}", headers=headers(api_key), json=body, timeout=30)
     r.raise_for_status()
-    return r.json()
+    if not r.content:
+        return {}
+    try:
+        return r.json()
+    except ValueError:
+        return {}
 
 
 def build_tools(live_tools):
