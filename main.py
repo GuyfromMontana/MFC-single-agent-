@@ -496,6 +496,9 @@ async def health_check():
         "memory_enabled": bool(ZEP_API_KEY),
         "supabase_enabled": supabase is not None,
         "email_enabled": bool(RESEND_API_KEY),
+        # Boolean feature flag, same as the others — lets a deploy be verified
+        # as advisory-off without placing a test call.
+        "advisory_enabled": ADVISORY_ENABLED,
         "persistent_client": get_zep_client() is not None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
