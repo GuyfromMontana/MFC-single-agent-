@@ -64,6 +64,7 @@ from config import (
     redact_phone,
     lifespan,
     logger,
+    ADVISORY_ENABLED,
 )
 
 # Import skills
@@ -1741,6 +1742,17 @@ async def get_warehouse_endpoint(request: Request):
         return JSONResponse(status_code=500, content={"error": "internal error"})
 
 
+# Spoken back to the caller when the product advisor is off (ADVISORY_MODE
+# unset or "off"). Deliberately a complete, in-voice sentence: whatever this
+# returns is what the agent says, so it has to land as an answer, not as an
+# error. See config.ADVISORY_MODE for how to turn the advisor back on.
+ADVISORY_OFF_PRODUCT_RESULT = (
+    "That's one for your livestock specialist — they'll match the product to "
+    "your cattle and your country, which is more than I can do from a phone. "
+    "Want me to take your info and have them give you a call?"
+)
+
+
 @app.post("/retell/functions/search_products")
 async def search_products_endpoint(request: Request):
     """Search the product catalog by name / category / livestock type.
@@ -1751,6 +1763,13 @@ async def search_products_endpoint(request: Request):
     ok, _raw, body = await read_and_verify(request)
     if not ok:
         return unauthorized_response()
+    if not ADVISORY_ENABLED:
+        logger.info("[SEARCH_PRODUCTS] advisory OFF - deferring to specialist")
+        return JSONResponse(content={
+            "result": ADVISORY_OFF_PRODUCT_RESULT,
+            "success": False,
+            "advisory_disabled": True,
+        })
     try:
         args = _extract_args(body)
         query = (args.get("query") or args.get("product") or args.get("search") or "").strip()
@@ -1818,6 +1837,13 @@ async def get_recommendations_endpoint(request: Request):
     ok, _raw, body = await read_and_verify(request)
     if not ok:
         return unauthorized_response()
+    if not ADVISORY_ENABLED:
+        logger.info("[GET_RECOMMENDATIONS] advisory OFF - deferring to specialist")
+        return JSONResponse(content={
+            "result": ADVISORY_OFF_PRODUCT_RESULT,
+            "success": False,
+            "advisory_disabled": True,
+        })
     try:
         args = _extract_args(body)
         livestock_type = (args.get("livestock_type") or args.get("animal") or "").strip()

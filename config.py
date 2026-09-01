@@ -26,6 +26,44 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ZEP_API_KEY = os.getenv("ZEP_API_KEY", "").strip()
 
+# ---------------------------------------------------------------------------
+# ADVISORY MODE (2026-09-01)
+# ---------------------------------------------------------------------------
+# MFC staff were not comfortable with the agent giving nutrition / product
+# advice on live calls, so the advisor is switched OFF for the initial
+# deployment while every other feature (routing, messages, callbacks, leads,
+# store info, transfers) ships.
+#
+# OFF (the default — a fresh deploy with no env var set fails CLOSED):
+#   - search_knowledge_base is restricted to KB_NON_ADVISORY_CATEGORIES
+#   - search_products / get_recommendations return a "defer to the LPS" string
+#
+# To restore the full advisor: set ADVISORY_MODE=on on the Railway service
+# and republish the Retell agent version that carries the v13 system prompt.
+ADVISORY_MODE = os.getenv("ADVISORY_MODE", "off").strip().lower()
+ADVISORY_ENABLED = ADVISORY_MODE in {"on", "true", "1", "yes", "enabled"}
+
+# Consulted only while the advisor is off. Case-SENSITIVE on purpose:
+# lowercase `products` (3 rows — "what do you sell", custom mixes, commodity
+# loads) is catalog fact and stays; capital-P `Products` (112 rows) is the
+# Purina recommendation catalog, complete with pricing, and does not. This
+# allowlist also happens to fence off the ~40 internal business-analytics
+# rows filed under `Ranch Consultation` (margin analysis, lapsed-customer
+# reports, SKU rationalization), which callers could otherwise reach.
+KB_NON_ADVISORY_CATEGORIES = frozenset({
+    "company_info",
+    "stores",
+    "locations",
+    "operations",
+    "specialists",
+    "products",
+})
+
+logger.info(
+    "ADVISORY_MODE=%s (nutrition/product advice %s)",
+    ADVISORY_MODE, "ENABLED" if ADVISORY_ENABLED else "DISABLED",
+)
+
 # Validate critical env vars
 if not SUPABASE_URL or not SUPABASE_KEY:
     logger.warning("Supabase not configured; lead features will be limited")

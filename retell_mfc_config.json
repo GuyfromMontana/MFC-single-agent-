@@ -10,14 +10,9 @@
       "description": "Austin Buzanowski - Northeast MT: Glasgow, Malta, Scobey, Plentywood, Wolf Point, Havre, Chinook"
     },
     {
-      "number": "+14063700907",
-      "name": "Isabell Gilleard",
-      "description": "Isabell Gilleard - Columbus area medium-sized herds (supports Hannah; reassigned from Miles City 2026-04-22)"
-    },
-    {
       "number": "+14066970366",
       "name": "Hannah Imer",
-      "description": "Hannah Imer - Columbus area large herds and feedlots (lead specialist)"
+      "description": "Hannah Imer - Columbus area: all herd sizes and feedlots (lead specialist; absorbed medium-herd coverage when Isabell Gilleard resigned 2026-08-11)"
     },
     {
       "number": "+14066487033",
@@ -190,11 +185,11 @@
     {
       "type": "custom",
       "name": "search_knowledge_base",
-      "description": "Searches the Supabase knowledge base for technical cattle nutrition, breeding, health, and ranch management answers. ALWAYS call this before answering any cattle/feed/product question — never answer from general knowledge. Use a focused topic query; break compound questions into separate searches. If it returns NO_MATCH, do not guess — offer a specialist follow-up.",
+      "description": "Searches the knowledge base for COMPANY facts only — who owns Montana Feed Company, history, the Axmen connection, the Purina partnership, who staff members are, what a Livestock Performance Specialist does, how to order, delivery, financing, custom mixes, commodity loads. It does NOT cover nutrition, feed, minerals, cattle health, or product recommendations — that advice is turned off on this agent (ADVISORY_MODE, 2026-09-01) and those queries return NO_MATCH by design. On NO_MATCH, do not guess: defer to the caller's livestock specialist and take a message.",
       "url": "https://mfc-single-agent-production.up.railway.app/retell/functions/search_knowledge_base",
       "speak_during_execution": true,
       "speak_after_execution": false,
-      "execution_message_description": "Let me check our ranch consultation guides",
+      "execution_message_description": "Let me pull that up",
       "parameters": {
         "type": "object",
         "properties": {
@@ -206,56 +201,6 @@
         "required": [
           "query"
         ]
-      }
-    },
-    {
-      "type": "custom",
-      "name": "search_products",
-      "description": "Searches Purina product catalog for specific products or details",
-      "url": "https://mfc-single-agent-production.up.railway.app/retell/functions/search_products",
-      "speak_during_execution": true,
-      "speak_after_execution": false,
-      "execution_message_description": "Searching our product catalog",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "query": {
-            "type": "string",
-            "description": "Search term like product name or keyword"
-          },
-          "category": {
-            "type": "string",
-            "description": "Product category like Minerals, Protein Supplements, Complete Feeds"
-          },
-          "livestock_type": {
-            "type": "string",
-            "description": "Type of livestock the product is for"
-          }
-        },
-        "required": []
-      }
-    },
-    {
-      "type": "custom",
-      "name": "get_recommendations",
-      "description": "Provides personalized Purina product recommendations",
-      "url": "https://mfc-single-agent-production.up.railway.app/retell/functions/get_recommendations",
-      "speak_during_execution": true,
-      "speak_after_execution": false,
-      "execution_message_description": "Finding the best recommendations for you",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "livestock_type": {
-            "type": "string",
-            "description": "Type of livestock like beef cattle, dairy cattle, horses"
-          },
-          "need": {
-            "type": "string",
-            "description": "Specific need like winter feeding, minerals, protein supplement, fly control, weaning stress"
-          }
-        },
-        "required": []
       }
     },
     {
@@ -306,5 +251,5 @@
       }
     }
   ],
-  "_note": "REFERENCE FILE — Retell agent config is managed in the Retell dashboard, EXCEPT call_transfer_destinations, which is now generated: deploy_retell_config.py reads active LPSs from the Supabase specialists table and regenerates BOTH this file's call_transfer_destinations AND the live transfer_call tool's inferred-destination prompt (dry-run by default; --apply pushes via create-agent-version -> update-retell-llm -> publish-agent-version, since direct PATCH of a published LLM 400s). Do not hand-edit names/numbers here — fix the specialists table and re-run; hand-editing the description text IS supported (the script preserves it, matched by full name). Other tool schemas below still must be mirrored to the dashboard manually. Last verified against the live LLM via API 2026-07-31 (agent v55, 'fix-tool-urls'): voice is 11labs-Brian; tool URL drift (uppercase host, search_products tab) is FIXED; the live transfer tool is Retell-native transfer_call with an INFERRED destination (the Railway /retell/functions/transfer_call_tool endpoint remains dormant)."
+  "_note": "REFERENCE FILE — Retell agent config is managed in the Retell dashboard, EXCEPT call_transfer_destinations, which is now generated: deploy_retell_config.py reads active LPSs from the Supabase specialists table and regenerates BOTH this file's call_transfer_destinations AND the live transfer_call tool's inferred-destination prompt (dry-run by default; --apply pushes via create-agent-version -> update-retell-llm -> publish-agent-version, since direct PATCH of a published LLM 400s). Do not hand-edit names/numbers here — fix the specialists table and re-run; hand-editing the description text IS supported (the script preserves it, matched by full name). Other tool schemas below still must be mirrored to the dashboard manually. Last verified against the live LLM via API 2026-07-31 (agent v55, 'fix-tool-urls'): voice is 11labs-Brian; tool URL drift (uppercase host, search_products tab) is FIXED; the live transfer tool is Retell-native transfer_call with an INFERRED destination (the Railway /retell/functions/transfer_call_tool endpoint remains dormant).\n\n2026-09-01 ADVISORY OFF: search_products and get_recommendations removed at MFC staff request — the agent no longer gives nutrition or product advice. search_knowledge_base is gated server-side to non-advisory categories by config.ADVISORY_MODE (default 'off'). System prompt is v14. To restore: set ADVISORY_MODE=on on Railway, re-add both tools here, and republish with v13."
 }

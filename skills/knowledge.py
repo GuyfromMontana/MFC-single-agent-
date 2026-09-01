@@ -5,7 +5,25 @@ Semantic search over company Q&A entries
 
 import asyncio
 
-from config import supabase, logger
+from config import (
+    supabase,
+    logger,
+    ADVISORY_ENABLED,
+    KB_NON_ADVISORY_CATEGORIES,
+)
+
+
+# Returned instead of an answer when the advisor is off and the only matching
+# knowledge is nutrition / product content. Prefixed NO_MATCH: on purpose —
+# every system prompt version already has a hard rule for that token ("do not
+# guess, offer a specialist follow-up"), so the fallback behaves correctly even
+# if a stale prompt version is ever republished.
+ADVISORY_OFF_RESULT = (
+    "NO_MATCH: Nutrition, feeding, health, and product-recommendation answers "
+    "are turned off for this agent. Do NOT answer this from general knowledge "
+    "and do NOT improvise. Tell the caller that's a question for their "
+    "livestock specialist, and offer to take a message or set up a callback."
+)
 
 
 async def search_knowledge_base(query: str, top_k: int = 5) -> str:
@@ -23,15 +41,35 @@ async def search_knowledge_base(query: str, top_k: int = 5) -> str:
 
     logger.info(f"[KB_SEARCH] query={query!r}")
     try:
+        # While the advisor is off we over-fetch, then drop everything that
+        # isn't in the non-advisory allowlist. The semantic match doesn't know
+        # about categories, so asking for exactly top_k here would routinely
+        # return 5 nutrition rows that all get filtered to nothing on a
+        # question the KB CAN legitimately answer ("who owns Montana Feed").
+        fetch_k = top_k if ADVISORY_ENABLED else max(top_k * 6, 25)
+
         result = await asyncio.to_thread(
             lambda: supabase.rpc(
                 "match_knowledge_base",
                 # text-embedding-3-small: strong matches top out ~0.65-0.70,
                 # so 0.7 filtered out nearly everything (drought best = 0.691).
                 # 0.4 admits relevant content while still rejecting true noise.
-                {"query_text": query, "match_threshold": 0.4, "match_count": top_k},
+                {"query_text": query, "match_threshold": 0.4, "match_count": fetch_k},
             ).execute()
         )
+
+        if result.data and not ADVISORY_ENABLED:
+            before = len(result.data)
+            result.data = [
+                item for item in result.data
+                if item.get("category") in KB_NON_ADVISORY_CATEGORIES
+            ][:top_k]
+            logger.info(
+                f"[KB_SEARCH] advisory OFF: {before} hits -> "
+                f"{len(result.data)} after category allowlist"
+            )
+            if not result.data:
+                return ADVISORY_OFF_RESULT
 
         if result.data:
             # Log what matched + how strongly, so retrieval quality is
