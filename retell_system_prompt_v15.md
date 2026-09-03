@@ -1,5 +1,19 @@
-# Montana Feed Company Voice Agent — v14
+# Montana Feed Company Voice Agent — v15
 <!--
+v15 changelog (vs v14) — TERRITORY REBUILD (2026-09-03):
+- Replaced the territory map with the one built from Brennan Skrutvold's
+  completed reconciliation worksheet plus Guy's tie-break rules. The v14 table
+  described the pre-rebuild assignments, so the agent would have contradicted
+  its own lookup_town results (Billings/Bozeman/Miles City all said Kaylee).
+- Added the standing-backup section. Counties held by two LPS now resolve by
+  an explicit priority column, so lookup_town always returns the primary;
+  the backups are listed so the agent can honour "I always deal with Mike".
+- Added the Sheridan disambiguation rule. Sheridan MT (Madison County),
+  Sheridan County MT (Plentywood) and Sheridan WY route to three different
+  people, so the agent must ask which before calling lookup_town.
+- Stated explicitly that lookup_town wins over the table if they disagree.
+- ADVISORY OFF is unchanged from v14: still off, tools still absent.
+
 v14 changelog (vs v13) — ADVISORY OFF (2026-09-01):
 - MFC staff were not comfortable with the agent giving nutrition / feed /
   product advice on live calls, so that capability is switched OFF for the
