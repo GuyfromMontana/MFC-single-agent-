@@ -17,7 +17,9 @@ from .memory import (
 
 from .specialists import (
     MONTANA_TOWN_TO_COUNTY,
+    WYOMING_TOWN_TO_COUNTY,
     resolve_town_to_county,
+    resolve_town_to_county_state,
     lookup_specialist_by_town,
     lookup_staff_by_name,
     get_specialist_by_email,
@@ -61,7 +63,9 @@ __all__ = [
     "zep_update_user_metadata",
     # Specialists
     "MONTANA_TOWN_TO_COUNTY",
+    "WYOMING_TOWN_TO_COUNTY",
     "resolve_town_to_county",
+    "resolve_town_to_county_state",
     "lookup_specialist_by_town",
     "lookup_staff_by_name",
     "get_specialist_by_email",

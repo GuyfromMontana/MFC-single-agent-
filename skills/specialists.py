@@ -58,10 +58,14 @@ MONTANA_TOWN_TO_COUNTY = {
     "twin bridges": "Madison County",
     "alder": "Madison County",
     "boulder": "Jefferson County",
+    "townsend": "Broadwater County",
+    "toston": "Broadwater County",
     "whitehall": "Jefferson County",
     "butte": "Silver Bow County",
     "anaconda": "Deer Lodge County",
-    "deer lodge": "Deer Lodge County",
+    # The TOWN of Deer Lodge sits in Powell County; Deer Lodge County's
+    # seat is Anaconda. Both are Taylor's today, so this was invisible.
+    "deer lodge": "Powell County",
     "philipsburg": "Granite County",
     "hamilton": "Ravalli County",
     "stevensville": "Ravalli County",
@@ -199,18 +203,6 @@ MONTANA_TOWN_TO_COUNTY = {
     "hysham": "Treasure County",
     "miles city": "Custer County",
     "ismay": "Custer County",
-    # Wyoming towns served from Riverton store
-    "riverton": "Wyoming",
-    "lander": "Wyoming",
-    "dubois": "Wyoming",
-    "thermopolis": "Wyoming",
-    "worland": "Wyoming",
-    "shoshoni": "Wyoming",
-    "shoshone": "Wyoming",  # ASR/common spelling of Shoshoni
-    "hudson": "Wyoming",
-    "pavillion": "Wyoming",
-    "pavilion": "Wyoming",  # ASR/common spelling of Pavillion
-    "buffalo": "Wyoming",
 
     # EASTERN MONTANA — Caitlin Lapicki
     "jordan": "Garfield County",
@@ -230,6 +222,170 @@ MONTANA_TOWN_TO_COUNTY = {
     "gt falls": "Cascade County",
     "gf": "Cascade County",
 }
+
+
+# ============================================================================
+# WYOMING TOWN → COUNTY
+# ============================================================================
+#
+# Until 2026-09-03 every Wyoming town resolved to a single pseudo-county, the
+# literal string "Wyoming", and Kaylee Klaahsen was the only rep holding it.
+# That worked only because she was the sole WY rep. Brennan's reconciliation
+# splits Wyoming across Kaylee and Hannah Imer by county, which the pseudo-
+# county cannot express — so WY towns now resolve to real counties.
+#
+# Towns are included for every WY county MFC actually covers, not just the
+# Riverton-store towns; otherwise a county assignment is unreachable and the
+# caller silently falls through to the main office.
+#
+# Four keys here are also Montana place names, so they only ever resolve to
+# Wyoming when the caller supplies the state ("Sheridan, WY"):
+#   "sheridan" → bare form is Sheridan MT (Madison County); Sheridan WY is
+#                 the far larger town, but Madison is a Dillon-store county
+#   "powell"   → bare form is Powell County MT; Powell WY is in Park County
+#   "boulder"  → bare form is Boulder MT (Jefferson County)
+#   "big horn" → bare form reads as the county, not the Sheridan-County town
+# `resolve_town_to_county_state` checks the state hint before falling back to
+# Montana-first, so the bare forms are unchanged. The system prompt makes the
+# agent ask "Montana or Wyoming?" for Sheridan, which is the only one of the
+# four where both sides have real customers.
+WYOMING_TOWN_TO_COUNTY = {
+    # Fremont County — the Riverton store's home county
+    "riverton": "Fremont County",
+    "lander": "Fremont County",
+    "hudson": "Fremont County",
+    "shoshoni": "Fremont County",
+    "shoshone": "Fremont County",      # ASR/common spelling of Shoshoni
+    "pavillion": "Fremont County",
+    "pavilion": "Fremont County",      # ASR/common spelling of Pavillion
+    "dubois": "Fremont County",
+    "kinnear": "Fremont County",
+    "crowheart": "Fremont County",
+    "arapahoe": "Fremont County",
+    "ethete": "Fremont County",
+    "fort washakie": "Fremont County",
+
+    # Hot Springs County
+    "thermopolis": "Hot Springs County",
+    "east thermopolis": "Hot Springs County",
+    "kirby": "Hot Springs County",
+    "lucerne": "Hot Springs County",
+
+    # Washakie County
+    "worland": "Washakie County",
+    "ten sleep": "Washakie County",
+
+    # Johnson County — Brandt Downing's old book (Eagle salesrep 07)
+    "buffalo": "Johnson County",
+    "kaycee": "Johnson County",
+
+    # Big Horn County, WY
+    "basin": "Big Horn County",
+    "greybull": "Big Horn County",
+    "lovell": "Big Horn County",
+    "byron": "Big Horn County",
+    "cowley": "Big Horn County",
+    "deaver": "Big Horn County",
+    "manderson": "Big Horn County",
+
+    # Park County, WY
+    "cody": "Park County",
+    "meeteetse": "Park County",
+    "wapiti": "Park County",
+    "ralston": "Park County",
+
+    # Sheridan County, WY
+    "ranchester": "Sheridan County",
+    "dayton": "Sheridan County",
+    "clearmont": "Sheridan County",
+    "story": "Sheridan County",
+
+    # Campbell County
+    "gillette": "Campbell County",
+    "recluse": "Campbell County",
+
+    # Converse County
+    "douglas": "Converse County",
+    "glenrock": "Converse County",
+
+    # Crook County
+    "sundance": "Crook County",
+    "moorcroft": "Crook County",
+    "hulett": "Crook County",
+
+    # Natrona County
+    "casper": "Natrona County",
+    "evansville": "Natrona County",
+    "midwest": "Natrona County",
+    "edgerton": "Natrona County",
+
+    # Sublette County
+    "pinedale": "Sublette County",
+    "big piney": "Sublette County",
+    "marbleton": "Sublette County",
+
+    # Names Montana also owns. Listed here so that an explicit state hint
+    # ("Sheridan, WY") can resolve them — `resolve_town_to_county_state`
+    # checks the hint before it falls back to Montana-first, so a bare
+    # "Sheridan" still lands on Sheridan MT and nothing regresses.
+    "sheridan": "Sheridan County",     # bare "sheridan" -> Madison County, MT
+    "powell": "Park County",           # bare "powell"   -> Powell County, MT
+    "boulder": "Sublette County",      # bare "boulder"  -> Jefferson County, MT
+    "big horn": "Sheridan County",     # the town, not the county
+}
+
+
+# Trailing state on a caller-supplied place: "Sheridan, WY", "Cody Wyoming".
+_STATE_HINT = re.compile(
+    r",?\s*\b(?:(mt|mont|montana)|(wy|wyo|wyoming))\b\.?\s*$", re.IGNORECASE
+)
+
+
+def _split_state_hint(location: str) -> tuple:
+    """Peel a trailing state off a place name.
+
+    "Sheridan, WY" -> ("Sheridan", "WY");  "Billings" -> ("Billings", None).
+    """
+    if not location:
+        return "", None
+    m = _STATE_HINT.search(location)
+    if not m:
+        return location.strip(), None
+    state = "MT" if m.group(1) else "WY"
+    return location[: m.start()].strip().strip(",").strip(), state
+
+
+def resolve_town_to_county_state(location: str) -> tuple:
+    """Resolve a caller-supplied place to (county, state).
+
+    State-qualified because Park, Big Horn, Sheridan, Carbon and Teton are
+    county names in BOTH Montana and Wyoming and route to different people.
+    Returns state=None only when the place is an unrecognised county name with
+    no state given; `find_territory_specialist` then breaks the tie toward MT.
+    """
+    raw = (location or "").strip()
+    if not raw:
+        return "", None
+
+    bare, hint = _split_state_hint(raw)
+    key = bare.lower()
+
+    # An explicit state overrides the Montana-first default.
+    if hint == "WY" and key in WYOMING_TOWN_TO_COUNTY:
+        return WYOMING_TOWN_TO_COUNTY[key], "WY"
+    if hint == "MT" and key in MONTANA_TOWN_TO_COUNTY:
+        return MONTANA_TOWN_TO_COUNTY[key], "MT"
+
+    # No usable hint: Montana is the home state and much the larger book.
+    if key in MONTANA_TOWN_TO_COUNTY:
+        return MONTANA_TOWN_TO_COUNTY[key], "MT"
+    if key in WYOMING_TOWN_TO_COUNTY:
+        return WYOMING_TOWN_TO_COUNTY[key], "WY"
+
+    # Already phrased as a county.
+    if "county" in key:
+        return bare, hint
+    return f"{bare} County", hint
 
 
 def resolve_town_to_county(location: str) -> str:
@@ -489,43 +645,58 @@ async def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         if not town_name or not town_name.strip():
             return None
 
-        county_name = resolve_town_to_county(town_name.strip())
-        logger.info(f"[SPECIALIST] Looking up: '{town_name}' → '{county_name}'")
-
-        # Table scan — needed so we can read `role` and `is_active` to compute
-        # is_lps. The RPC `find_specialist_by_county` doesn't return those
-        # fields, so a non-LPS like Sheryl Shea would silently look like an LPS
-        # via the RPC path and the agent would try to live-transfer her. With
-        # ~13 specialists this scan is cheap.
-        result = await asyncio.to_thread(
-            lambda: supabase.table("specialists")
-                .select("id, first_name, last_name, phone, email, role, specialties, counties, is_active")
-                .eq("is_active", True)
-                .execute()
+        county_name, state = resolve_town_to_county_state(town_name.strip())
+        logger.info(
+            f"[SPECIALIST] Looking up: '{town_name}' → "
+            f"'{county_name}' / {state or 'state unknown'}"
         )
 
-        if result.data:
-            for s in result.data:
-                counties = s.get("counties", []) or []
-                if any(town_name.lower() in c.lower() or county_name.lower() in c.lower() for c in counties):
-                    full_name = f"{s.get('first_name', '')} {s.get('last_name', '')}".strip()
-                    specialist_info = {
-                        "id": s.get("id"),
-                        "specialist_name": full_name,
-                        "specialist_phone": s.get("phone", ""),
-                        "specialist_email": s.get("email", ""),
-                        "role": s.get("role", ""),
-                        "specialties": s.get("specialties") or [],
-                        "territory": county_name,
-                        "is_lps": is_lps(s),
-                    }
-                    logger.info(
-                        f"[SPECIALIST] Found: {full_name} "
-                        f"(role={s.get('role')}, is_lps={specialist_info['is_lps']})"
-                    )
-                    return specialist_info
+        # `find_territory_specialist` does the join and the ordering in
+        # Postgres. Two things it fixes that the old table scan could not:
+        #
+        #   1. Matching is exact on (county, state). The old code asked
+        #      `county_name.lower() in c.lower()` against a bare-string array,
+        #      so "Valley County" matched "Golden Valley County" and "Park
+        #      County" matched "Park County, WY" — Glasgow and Livingston both
+        #      resolved to the wrong specialist.
+        #   2. Ties resolve by an explicit priority column. Counties held by
+        #      two LPS used to return whichever row PostgREST handed back
+        #      first, with no ORDER BY anywhere.
+        result = await asyncio.to_thread(
+            lambda: supabase.rpc(
+                "find_territory_specialist",
+                {"p_county": county_name, "p_state": state},
+            ).execute()
+        )
 
-        logger.info(f"[SPECIALIST] No match for: '{town_name}' or '{county_name}'")
+        rows = result.data or []
+        if rows:
+            s = rows[0]
+            full_name = f"{s.get('first_name', '')} {s.get('last_name', '')}".strip()
+            # The RPC already filtered on is_active, so is_lps only has to
+            # judge the role. Non-LPS staff stay message-only.
+            specialist_info = {
+                "id": s.get("specialist_id"),
+                "specialist_name": full_name,
+                "specialist_phone": s.get("phone", ""),
+                "specialist_email": s.get("email", ""),
+                "role": s.get("role", ""),
+                "specialties": s.get("specialties") or [],
+                "territory": county_name,
+                "territory_state": s.get("matched_state"),
+                "is_lps": is_lps({**s, "is_active": True}),
+            }
+            logger.info(
+                f"[SPECIALIST] Found: {full_name} "
+                f"({county_name}, {s.get('matched_state')}, "
+                f"priority={s.get('priority')}, is_lps={specialist_info['is_lps']})"
+            )
+            return specialist_info
+
+        logger.info(
+            f"[SPECIALIST] No match for: '{town_name}' "
+            f"({county_name} / {state or 'state unknown'})"
+        )
         return None
 
     except Exception as e:
