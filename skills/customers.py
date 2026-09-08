@@ -22,6 +22,7 @@ directly without a county-based fallback.
 """
 
 import asyncio
+import re
 from typing import Optional, Dict
 
 from config import supabase, logger
@@ -73,6 +74,29 @@ async def lookup_customer_by_phone(phone: str) -> Optional[Dict]:
             return None
 
         row = rows[0]
+
+        # Guard: an Eagle house/cash account is not a person. Blank the name
+        # (so the prompt falls back to "New caller" and simply ASKS) and drop
+        # the fake purchase history that came with the shared account — a
+        # walk-in account's last_purchase belongs to whoever last used it,
+        # not to this caller, and "you got the AI again" to a first-time
+        # caller is worse than no recognition at all.
+        _raw_name = row.get("customer_name")
+        if _is_placeholder_name(_raw_name, row.get("customer_id")):
+            logger.warning(
+                "[CUSTOMER] Placeholder account matched for %s -> %r "
+                "(customer_id=%r); suppressing name/history. The real buyer "
+                "may be in first_name=%r. Fix the phone on this Eagle account.",
+                phone, _raw_name, row.get("customer_id"), row.get("first_name"),
+            )
+            row = dict(row)
+            row["customer_name"] = None
+            row["first_name"] = None
+            row["last_name"] = None
+            row["last_purchase"] = None
+            row["is_existing_customer"] = False
+            row["transaction_count"] = 0
+            row["total_sales"] = 0
         # Stringify everything Retell will consume as a dynamic variable —
         # Retell dynamic vars are string-only and None values cause the
         # agent to render literal "None" if not handled.
@@ -103,6 +127,50 @@ async def lookup_customer_by_phone(phone: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"[CUSTOMER] lookup_customer_by_phone error: {e}")
         return None
+
+
+# Eagle system/house accounts that are NOT people. A walk-in rung up under
+# one of these lands in caller_contacts with the account label sitting in
+# customer_name, so without this guard the agent greets the caller by the
+# account name.
+#
+# Real production failure (2026-09-04): a brand-new prospect was greeted
+# "Well hey there, Cash Customer — you got the AI again" and had to correct
+# the agent in his first breath. The row was Eagle's generic CASH CUSTOMER
+# account carrying MFC's OWN main office number (+1 406-728-7020), with the
+# actual buyer ("RAMBLIN M RANCH LLC") stuffed into first_name. Every call
+# forwarded through the main line matched it.
+#
+# Mirrors the junk-name blocklist the Zep path already has in skills/memory.py.
+_PLACEHOLDER_NAMES = frozenset({
+    "cash customer", "cash sale", "cash", "walk in", "walkin", "walk-in",
+    "counter sale", "counter", "house account", "house acct", "misc",
+    "miscellaneous", "customer", "unknown", "no name", "n/a", "na", "none",
+    "test", "test customer",
+})
+
+
+def _is_placeholder_name(value: Optional[str], customer_id: Optional[str] = None) -> bool:
+    """True when `value` is an Eagle account label rather than a person's name.
+
+    Three independent tells, any one of which is enough:
+      1. the normalized name is in the blocklist above;
+      2. the name is `*`-prefixed — Eagle's convention for cash accounts;
+      3. the name is identical to customer_id, which only happens for
+         system accounts (real customers have a numeric/coded id).
+    """
+    if not value:
+        return True
+    v = value.strip()
+    if v.startswith("*"):
+        return True
+    norm = re.sub(r"[^a-z ]", " ", v.lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if norm in _PLACEHOLDER_NAMES:
+        return True
+    if customer_id and v.upper() == str(customer_id).strip().upper():
+        return True
+    return False
 
 
 def _title_or_empty(value: Optional[str]) -> str:
