@@ -546,6 +546,22 @@ async def lookup_staff_by_phone(phone: str) -> Optional[Dict]:
     in mixed formats ("4066487033", "406-855-9929") and Retell sends
     E.164 ("+14066487033"). Returns the matched row dict (same shape as
     lookup_staff_by_name results) or None.
+
+    TWO-TIER LOOKUP (2026-09-08). `specialists` holds 13 curated rows and
+    misses 5 active employees outright — Brennan (GM), Kase Stoddard
+    (Dillon), Kristena Dickinson (Riverton), Tillie Goddard, Guy — plus
+    Sheryl has a second cell that isn't in it. Those people all called in
+    and were treated as customers, which also meant the v17 STAFF MODE
+    tone could never fire for them. So:
+
+      tier 1: `specialists` (authoritative for PHONE — Taylor's number in
+              order_users, 406-925-3394, is known STALE per Guy's notes;
+              596-5995 in `specialists` is the live one)
+      tier 2: `order_users` (authoritative for the employee ROSTER, roles
+              and emails) for anyone tier 1 didn't match
+
+    Order matters: never let tier 2's stale phones shadow tier 1's good
+    ones. Tier 2 is purely additive coverage.
     """
     if not supabase or not phone:
         return None
@@ -582,6 +598,44 @@ async def lookup_staff_by_phone(phone: str) -> Optional[Dict]:
                     "counties": s.get("counties") or [],
                     "is_lps": is_lps(s),
                 }
+
+        # ---- tier 2: order_users, the authoritative employee roster ----
+        def _run_order_users():
+            return (
+                supabase.table("order_users")
+                .select("id, display_name, email, phone, role, active")
+                .eq("active", True)
+                .execute()
+            )
+
+        ou = await asyncio.to_thread(_run_order_users)
+        for u in ou.data or []:
+            row_digits = "".join(c for c in (u.get("phone") or "") if c.isdigit())[-10:]
+            if not row_digits or row_digits != digits:
+                continue
+            name = (u.get("display_name") or "").strip()
+            parts = name.split(None, 1)
+            role = (u.get("role") or "").strip()
+            logger.info(
+                "[STAFF] Caller phone matched order_users (not in specialists): "
+                "%s (role=%s)", name or "?", role or "-",
+            )
+            return {
+                "id": u.get("id"),
+                "first_name": parts[0] if parts else name,
+                "last_name": parts[1] if len(parts) > 1 else "",
+                "full_name": name,
+                "email": u.get("email"),
+                "phone": u.get("phone"),
+                "role": role,
+                "specialties": [],
+                "counties": [],
+                # order_users roles are 'lps' | 'store_manager' | 'admin'.
+                # Only an LPS is live-transfer eligible; managers and admins
+                # stay message-only, same as the specialists-table rule.
+                "is_lps": role.lower() == "lps",
+            }
+
         return None
 
     except Exception as e:
