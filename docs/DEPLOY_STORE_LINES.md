@@ -2,7 +2,9 @@
 
 **Goal:** each store's phone rings a few times; if nobody picks up, the call rolls to that store's own Retell number and the AI answers **knowing which store was dialed** — so it gives Miles City's hours to a Miles City caller and emails Tamra, not the global catch-all.
 
-Written 2026-09-09. Audited against live Retell + Supabase the same day.
+Written 2026-09-09. **Updated 2026-09-11: steps 2 through 5 are DONE.**
+Only the Verizon forwarding (step 6) and verification (step 7) remain, and both
+have to happen on the physical store phones.
 
 ---
 
@@ -15,9 +17,10 @@ Measured, not assumed:
 | MFC's live DID | **+1 406-510-2925** → `agent_b1331271e65ded31ad45657e96`, version `latest_published` |
 | Its webhook | `https://mfc-single-agent-production.up.railway.app/retell-inbound-webhook` OK |
 | Other Retell number | +1 406-926-0235 → `agent_95e9478f…` = **the Axmen store agent. Not available for MFC.** |
-| `warehouses.retell_did` | **NULL on all 5 stores** |
-| `is_store_line` ever true | **0 of 185 calls.** This path has never once run. |
-| Prompt reference to store vars | **NONE.** See the blocker below. |
+| `warehouses.retell_did` | **populated on all 5 stores (2026-09-11)** |
+| Prompt | **v18 live as agent v70** — reads all five store variables |
+| Store DIDs | **bought and bound 2026-09-11** — see the table in step 3 |
+| `is_store_line` ever true | still 0 — waits on step 6, the Verizon forward |
 
 The backend work is already done, and has been since 2026-08-04. `lookup_warehouse_by_did()` in `skills/warehouses.py` matches the inbound `to_number` against `warehouses.retell_did` (last 10 digits, so any format works), and `main.py` sets five dynamic variables from it:
 
@@ -27,7 +30,7 @@ is_store_line   store_name   store_manager   store_hours   store_phone
 
 It also stashes `store_manager_email` on the caller cache so `schedule_callback` and `call_ended` prefer the **store manager** over the global catch-all.
 
-### Blocker — do step 2 first or none of this does anything
+### ~~Blocker~~ RESOLVED 2026-09-11 — prompt v18 is live
 
 **Prompt v17 never references any of those five variables.** Retell only substitutes a variable where `{{var}}` literally appears in the prompt. Right now the backend computes all five and throws them away. If you wire the DIDs and skip step 2, every store call behaves exactly like a main-line call and you will think the DIDs are broken.
 
@@ -45,7 +48,7 @@ Also note `reason=unconditional`: whoever tested forwarding used **immediate** f
 
 ---
 
-## 2. Add store-line mode to the prompt (v18)
+## 2. Add store-line mode to the prompt (v18) — ✅ DONE, live as agent v70
 
 Copy v17 first, then make two edits.
 
@@ -101,7 +104,37 @@ Reminder from `deploy_prompt.py`: a published Retell LLM cannot be PATCHed, so i
 
 ---
 
-## 3. Buy 5 Retell numbers — your call, this costs money
+## 3. Buy 5 Retell numbers — ✅ DONE 2026-09-11 ($10.00/month total)
+
+| Store | Code | Retell DID (internal — never advertise this) | Nickname |
+|---|---|---|---|
+| Dillon (HQ) | DL | **+1 406-642-7529** | MFC Dillon store line |
+| Miles City | MC | **+1 406-612-1362** | MFC Miles City store line |
+| Lewistown | LT | **+1 406-521-4752** | MFC Lewistown store line |
+| Columbus | CB | **+1 406-760-1961** | MFC Columbus store line |
+| Riverton, WY | RV | **+1 307-312-5070** | MFC Riverton store line |
+
+All five verified bound to `agent_b1331271e65ded31ad45657e96`, version
+`latest_published`, webhook set. `warehouses.retell_did` populated and
+`lookup_warehouse_by_did()` resolves all five to the right store, manager and
+hours; the main line correctly resolves to `None`.
+
+### Two API gotchas if you ever buy more
+
+`create-phone-number` rejects `inbound_agent_version` as a string, **and**
+`inbound_agent_id` is deprecated outright
+(`deprecation-notice/2026/03-31_phone_number_agent_fields`). Use the
+`inbound_agents` array instead:
+
+```json
+{"area_code": 406,
+ "nickname": "MFC <city> store line",
+ "inbound_agents": [{"weight": 1, "agent_id": "agent_b1331271e65ded31ad45657e96", "agent_version": "latest_published"}],
+ "inbound_webhook_url": "https://mfc-single-agent-production.up.railway.app/retell-inbound-webhook"}
+```
+
+<details>
+<summary>Original step 3 (kept for reference)</summary>
 
 I did not purchase these. Five numbers, one per active store. Match the local area code so it looks right on caller ID:
 
@@ -121,9 +154,11 @@ curl -X POST https://api.retellai.com/create-phone-number -H "Authorization: Bea
 
 Set a `nickname` on every one. The current main number has an empty nickname and it is already annoying to tell them apart.
 
+</details>
+
 ---
 
-## 4. Bind each number (if you bought them in the dashboard)
+## 4. Bind each number — ✅ DONE (done at purchase)
 
 Both fields matter. **The Axmen number has no `inbound_webhook_url` set — if you miss this, the agent answers with zero caller context and no store awareness.**
 
@@ -139,7 +174,7 @@ curl -s https://api.retellai.com/list-phone-numbers -H "Authorization: Bearer $R
 
 ---
 
-## 5. Populate `warehouses.retell_did`
+## 5. Populate `warehouses.retell_did` — ✅ DONE 2026-09-11
 
 This is the switch that turns store mode on. Any format works — the lookup strips to the last 10 digits.
 
@@ -165,19 +200,19 @@ select warehouse_code, city, phone, retell_did from warehouses where is_active o
 
 **The store lines are Verizon cell phones**, not a PBX — per the `lookup_warehouse_by_did` docstring, and consistent with the numbers below. So this is a Verizon star code dialed **from each store's own phone**.
 
-| Store | Store cell to dial from | Manager |
-|---|---|---|
-| Dillon | 406-499-9642 | Kase Stoddard |
-| Miles City | 406-851-1833 | Tamra Hodgins |
-| Lewistown | 406-380-2099 | Brenda Atchison-Curry |
-| Columbus | 406-931-0030 | Dan Otis |
-| Riverton | 307-840-5469 | Kristena Dickinson |
+**Dial these exactly. Each string is different — they are not interchangeable.**
 
-On the store's phone, dial — **no dashes** — then press call:
+| Store | Manager | On this phone… | …dial exactly this, then press call |
+|---|---|---|---|
+| Dillon | Kase Stoddard | 406-499-9642 | `*9214066427529` |
+| Miles City | Tamra Hodgins | 406-851-1833 | `*9214066121362` |
+| Lewistown | Brenda Atchison-Curry | 406-380-2099 | `*9214065214752` |
+| Columbus | Dan Otis | 406-931-0030 | `*9214067601961` |
+| Riverton | Kristena Dickinson | 307-840-5469 | `*9213073125070` |
 
-```
-*92 1406XXXXXXX
-```
+No dashes, no spaces, no +1 — just `*92` then `1` then the ten digits. If a manager
+dials the wrong store's string, that store's calls land in the wrong store's
+greeting and messages go to the wrong manager, so double-check before sending.
 
 | Code | Does |
 |---|---|
@@ -246,11 +281,13 @@ Nothing here touches the main line (+1 406-510-2925), the territory routing, or 
 
 ## Order of operations
 
-1. **Prompt v18** — must be first, or the DIDs appear broken
-2. Buy 5 numbers *(needs your approval — this is a purchase)*
-3. Bind agent + webhook on each
-4. Populate `warehouses.retell_did`
-5. `*92` on **one** store, verify end to end
-6. Roll out the remaining four
+1. ~~Prompt v18~~ ✅ live as agent v70
+2. ~~Buy 5 numbers~~ ✅ $10/month
+3. ~~Bind agent + webhook~~ ✅ verified on all five
+4. ~~Populate `warehouses.retell_did`~~ ✅ 5 of 5, no duplicates
+5. **← YOU ARE HERE.** `*92` on **Dillon only**, verify end to end
+6. Then roll out the remaining four
 
-Steps 1 and 4 can be done on request. Step 2 needs a go-ahead. Steps 5–6 have to happen on the physical store phones.
+Everything reachable from a keyboard is done. What's left needs the physical
+store phones. Start with Dillon: if `*92` behaves differently than expected on
+your Verizon account, you find out on one store instead of five.
