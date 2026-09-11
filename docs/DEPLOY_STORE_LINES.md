@@ -32,7 +32,7 @@ It also stashes `store_manager_email` on the caller cache so `schedule_callback`
 
 ### ~~Blocker~~ RESOLVED 2026-09-11 — prompt v18 is live
 
-**Prompt v17 never references any of those five variables.** Retell only substitutes a variable where `{{var}}` literally appears in the prompt. Right now the backend computes all five and throws them away. If you wire the DIDs and skip step 2, every store call behaves exactly like a main-line call and you will think the DIDs are broken.
+**Prompt v17 referenced none of those five variables**, so the backend computed all five and threw them away. Retell only substitutes a variable where `{{var}}` literally appears in the prompt. **v18 fixed this and is live as agent v70.** Keep the lesson: if you ever add a new dynamic variable in `main.py`, it does nothing until a prompt version actually reads it — and the failure is silent, which is what made this one survive since 2026-08-04.
 
 ### One DID per store is required — you cannot share one
 
