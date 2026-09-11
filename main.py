@@ -784,6 +784,18 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
             if supabase:
                 try:
                     now_iso = datetime.now(timezone.utc).isoformat()
+
+                    # Per-store attribution (2026-09-11). Prefer the cache set at
+                    # call_inbound; fall back to a fresh DID lookup if this pod
+                    # never saw call_inbound (multi-worker, or a restart mid-call).
+                    store_code = ""
+                    store_city = (cached or {}).get("store_name") or ""
+                    if to_number:
+                        store_row = await lookup_warehouse_by_did(to_number)
+                        if store_row:
+                            store_code = store_row.get("warehouse_code") or ""
+                            store_city = store_row.get("city") or store_city
+
                     conversation_data = {
                         "id": str(uuid.uuid4()),
                         "phone_number": from_number or f"widget_{call_id}",
@@ -794,7 +806,14 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                         "end_time": end_datetime.isoformat() if end_datetime else None,
                         "duration_seconds": duration_seconds,
                         "vapi_call_id": call_id,
-                        "ai_summary": call_summary[:500] if call_summary else None,
+                        # ai_summary is `text` in Postgres with no length limit, but
+                        # this was clipped to 500 chars — which silently truncated
+                        # every call over ~90 seconds and made the stored transcript
+                        # useless for reviewing what actually happened. Store it all.
+                        "ai_summary": call_summary or None,
+                        "to_number": to_number or None,
+                        "store_code": store_code or None,
+                        "store_name": store_city or None,
                         "created_at": now_iso,
                         "updated_at": now_iso,
                     }
