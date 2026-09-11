@@ -598,18 +598,29 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                 if staff_match:
                     memory_data["staff_name"] = staff_match["full_name"]
                     memory_data["staff_role"] = staff_match.get("role") or ""
-                    zep_name = (memory_data.get("caller_name") or "").strip()
-                    if zep_name.lower() in {"", "caller", "unknown", "new caller"}:
-                        memory_data["caller_name"] = staff_match["full_name"]
+                    # The employee directory is AUTHORITATIVE for a staff
+                    # member's name — it beats whatever Zep learned, not just a
+                    # placeholder. Hannah Imer's cell is the phone on the Kraft
+                    # Farms account (caller_contacts C-200171, "KRAFT FARMS -
+                    # HANNAH IMER"), so an early call taught Zep that as her
+                    # name. Once Zep held it, it was no longer a placeholder and
+                    # the old condition below never fired again — she was
+                    # greeted "Kraft Farms - Hannah Imer" on every call since.
+                    memory_data["caller_name"] = staff_match["full_name"]
                 else:
                     memory_data["staff_name"] = ""
                     memory_data["staff_role"] = ""
 
                 if customer_data:
                     # Prefer Zep name when set + non-placeholder; otherwise use
-                    # customer name from caller_contacts.
+                    # customer name from caller_contacts. Never for staff — an
+                    # employee whose cell is listed on a customer account (as a
+                    # ranch's contact person) must stay themselves.
                     zep_name = (memory_data.get("caller_name") or "").strip()
-                    placeholder = zep_name.lower() in {"", "caller", "unknown", "new caller"}
+                    placeholder = (
+                        not staff_match
+                        and zep_name.lower() in {"", "caller", "unknown", "new caller"}
+                    )
                     if placeholder and customer_data.get("customer_name"):
                         memory_data["caller_name"] = customer_data["customer_name"]
                         logger.info(
