@@ -51,9 +51,21 @@ async def search_knowledge_base(query: str, top_k: int = 5) -> str:
         result = await sb_exec(
             lambda: supabase.rpc(
                 "match_knowledge_base",
-                # text-embedding-3-small: strong matches top out ~0.65-0.70,
-                # so 0.7 filtered out nearly everything (drought best = 0.691).
-                # 0.4 admits relevant content while still rejecting true noise.
+                # 0.4 stays, but the reasoning behind it changed on 2026-09-14
+                # when rows moved to question-only embeddings. The old note here
+                # ("strong matches top out ~0.65-0.70") described a compressed
+                # scale caused by embedding rows as Question+Answer documents.
+                # Decompressed, exact phrasings now score ~0.90+.
+                #
+                # 0.4 is NOT a clean separator and no threshold is -- measured,
+                # the distributions interleave. Legitimate phrasings nobody wrote
+                # a row for land 0.40-0.70; true noise lands 0.33-0.67 ("what
+                # time does the bank close" hits 0.6675 against "What time do you
+                # close?"). Raising to 0.7 rejected all 12 unseen-but-answerable
+                # queries in the test set, so 0.4 stands: a false positive is
+                # recoverable because the model sees the matched question text
+                # and can judge it, while a false negative is the agent flatly
+                # telling a caller it doesn't know.
                 {"query_text": query, "match_threshold": 0.4, "match_count": fetch_k},
             ).execute(),
             what="match_knowledge_base rpc",

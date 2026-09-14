@@ -93,18 +93,30 @@ Zep's PATCH `/users/{id}` body `{"metadata": {key: null}}` preserves the existin
 
 The `supabase` client is a module-level singleton whose httpx client outlives the pod, and postgrest-py hardcodes `http2=True`. Supabase's edge periodically retires those long-lived connections with a graceful GOAWAY (`ConnectionTerminated error_code:0`), and httpcore does not replay the request that raced it — it raises `RemoteProtocolError`. On **2026-09-12** that silently dropped a completed call from `conversations`: webhook returned 200, transcript email still sent, nothing looked broken until Sentry fired. `sb_exec` retries only errors the server proved it never processed; `idempotent=True` additionally replays read-style timeouts. Adding a new Supabase query? Use `sb_exec`, and think about which flag it deserves — an INSERT without a client-side PK must stay `idempotent=False`.
 
-### KB rows are embedded as `Question: … 
+### KB rows are embedded on `question` ONLY — both writers must agree
 
-Answer: …`, queries as bare text — that asymmetry is the main retrieval defect
+Changed 2026-09-14. Rows used to be embedded as `'Question: ' || question || E'
 
-Both writers agree on the format: the `generate-embedding` edge function and the SQL `regenerate_embedding`. So a row's vector is a 200-500 char *document* while a caller query is four words, and cosine between them is structurally low. A row scores **0.826** against its own question text, not ~1.0. The old note claiming "embeddings cover `question` only" was wrong, and it hid this.
+Answer: ' || answer`, making each vector a 200-500 char document while a caller query is four words. That asymmetry compressed the whole similarity scale: a row scored **0.826** against its own question text instead of ~1.0.
 
-Consequences worth knowing before you touch retrieval:
-- The "strong matches top out ~0.65-0.70" comment in `skills/knowledge.py` is an artifact of this compression, not a property of `text-embedding-3-small`.
-- **A long answer sinks its own row.** Keep new rows' answers short — it is a retrieval parameter, not just style.
-- Adding a row phrased exactly like the caller still may not clear 0.4: "Where are you located?" exists verbatim and scores **0.3742**. Embedded question-only it would score **0.9148**.
+Two writers produce these vectors and they MUST stay in agreement, or new rows land in a different vector space than the backfilled ones and retrieval degrades invisibly:
+- the `generate-embedding` edge function (`textToEmbed`), and
+- `public.regenerate_embedding()` in SQL.
 
-The real fix, when you want it: embed `question` only in both writers and re-embed ~1,140 rows (one OpenAI call each). Cost is pennies. The tradeoff is that answer-only facts stop being searchable — which is what caller-phrasing sibling rows are for.
+**The tradeoff is real: a fact that appears only in an ANSWER is no longer semantically reachable.** If a fact matters, it needs a question that asks for it. That is what the caller-phrasing sibling rows are for.
+
+Measured before → after (same query sets, ~1,264 rows re-embedded):
+
+| set | avg before | avg after | pass @0.4 before | after |
+|---|---|---|---|---|
+| 21 written caller phrasings | 0.5976 | **0.9032** | 20/21 | **21/21** |
+| 12 phrasings nobody wrote a row for | 0.4126 | **0.5051** | 8/12 | **11/12** |
+| 5 advisory/nutrition | 0.6223 | 0.7446 | 5/5 | 5/5 |
+| 5 true-noise controls | 0.3631 | 0.4675 | 2/5 | 3/5 |
+
+Noise rose too — the scale decompressed in both directions. **The 0.4 threshold still stands anyway, and this was measured, not assumed:** legitimate unseen phrasings land 0.40-0.70 and true noise lands 0.33-0.67, so the distributions interleave and no threshold separates them. 0.7 would have rejected all 12 unseen-but-answerable queries. A false positive is recoverable (the model sees the matched question text and can judge it); a false negative is the agent telling a caller it doesn't know.
+
+**Rollback:** `update knowledge_base kb set embedding = b.old_embedding from kb_embedding_backup_20260914 b where b.id = kb.id;` — then revert both writers. Drop that table once this is proven on real calls.
 
 ### `match_knowledge_base` timings are coupled to the client timeout — don't move one alone
 
@@ -151,6 +163,7 @@ Roster names/numbers come from Supabase (`is_lps()` rows, phones via the same `_
 
 ## Done (recent)
 
+- **2026-09-14 (5)** — Switched KB to **question-only embeddings** and re-embedded all 1,264 rows (0 failures). Changed both writers, snapshotted every old vector to `kb_embedding_backup_20260914` first so rollback is one UPDATE instead of 1,264 OpenAI calls. Caller-phrasing answer rate **21/21**; unseen phrasings 8/12 → 11/12. Advisory gate verified still closed (drought-mineral and pregnancy-rate questions still return the advisory-off refusal). Threshold left at 0.4 on measurement, not habit.
 - **2026-09-14 (4)** — Added 16 caller-phrasing KB rows across the six allowlisted categories (`source='caller_phrasing_2026-09-14'`; `delete from knowledge_base where source=…` reverts). Short answers on purpose (dilution), and they name towns instead of restating addresses/phones so the store-fact drift surface doesn't grow. End-to-end answer rate on a 21-question caller set: **20/21**. Only "where are you located" still misses (0.3788) — that one needs the embedding change above, not more phrasing.
 - **2026-09-14 (3)** — KB search timeout fixed server-side. Added `kb_query_embedding_cache` + rewrote `match_knowledge_base` to memoize the embedding, cut the per-attempt HTTP timeout 5s -> 3.5s (transaction-local, can't leak across the pooler), and retry once on transport failure or a retryable status (408/429/5xx) while still failing fast on 401/4xx. Measured: cold 1445ms, cached **13ms**, identical similarity. Empty/blank/null queries now short-circuit to zero rows instead of embedding an empty string. Also silenced the `function_search_path_mutable` advisor for this function.
 - **2026-09-14 (2)** — Pinned `postgrest_client_timeout` to `httpx.Timeout(10.0, connect=2.0)` via `ClientOptions`, replacing the 120s library default. Verified the value actually reaches `supabase.postgrest.session.timeout` (ClientOptions can silently no-op).
