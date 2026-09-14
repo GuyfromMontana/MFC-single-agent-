@@ -93,6 +93,14 @@ Zep's PATCH `/users/{id}` body `{"metadata": {key: null}}` preserves the existin
 
 The `supabase` client is a module-level singleton whose httpx client outlives the pod, and postgrest-py hardcodes `http2=True`. Supabase's edge periodically retires those long-lived connections with a graceful GOAWAY (`ConnectionTerminated error_code:0`), and httpcore does not replay the request that raced it — it raises `RemoteProtocolError`. On **2026-09-12** that silently dropped a completed call from `conversations`: webhook returned 200, transcript email still sent, nothing looked broken until Sentry fired. `sb_exec` retries only errors the server proved it never processed; `idempotent=True` additionally replays read-style timeouts. Adding a new Supabase query? Use `sb_exec`, and think about which flag it deserves — an INSERT without a client-side PK must stay `idempotent=False`.
 
+### `match_knowledge_base` timings are coupled to the client timeout — don't move one alone
+
+The RPC generates its query embedding by calling OpenAI **synchronously from inside Postgres** via the `http` extension, because OpenAI is unreachable from Railway's network (see above). That leg is the only part that can hang, and pgsql-http's 5s default was blowing intermittently — surfacing to callers as `SEARCH_ERROR`.
+
+Now: a `kb_query_embedding_cache` hit skips OpenAI entirely; a miss gets **2 attempts at 3.5s each**. `2 x 3.5s = 7s` is deliberately under the **10s** `SUPABASE_TIMEOUT` in `config.py`. Raise either number without the other and the client starts timing out mid-retry. Note `sb_exec` will NOT save you here: a blown RPC returns a PostgREST `XX000`, which is a server error, not a transport error — it retries the pipe, not the query.
+
+The cache is keyed on the **exact** query text, not a normalized form. Lowercasing or collapsing whitespace would change the embedding and shift every similarity score, and KB scores already sit near the 0.4 threshold. Verified as a pure memo: cold and cached runs of the same query return identical similarity (0.7950), 1445ms vs 13ms. **If the embedding model ever changes, TRUNCATE that table.**
+
 `SUPABASE_TIMEOUT` (`config.py`) pins the postgrest client to **10s read / 2s connect**. The library default is 120s, which parks a Retell tool call for two minutes on a single hung connection. The largest read this service issues is ~19 product rows, so anything still running at 10s is hung, not slow. Note the interaction with retries: an `idempotent=True` call that keeps hitting `ReadTimeout` can stack to ~30s across 3 attempts.
 
 
@@ -130,6 +138,7 @@ Roster names/numbers come from Supabase (`is_lps()` rows, phones via the same `_
 
 ## Done (recent)
 
+- **2026-09-14 (3)** — KB search timeout fixed server-side. Added `kb_query_embedding_cache` + rewrote `match_knowledge_base` to memoize the embedding, cut the per-attempt HTTP timeout 5s -> 3.5s (transaction-local, can't leak across the pooler), and retry once on transport failure or a retryable status (408/429/5xx) while still failing fast on 401/4xx. Measured: cold 1445ms, cached **13ms**, identical similarity. Empty/blank/null queries now short-circuit to zero rows instead of embedding an empty string. Also silenced the `function_search_path_mutable` advisor for this function.
 - **2026-09-14 (2)** — Pinned `postgrest_client_timeout` to `httpx.Timeout(10.0, connect=2.0)` via `ClientOptions`, replacing the 120s library default. Verified the value actually reaches `supabase.postgrest.session.timeout` (ClientOptions can silently no-op).
 - **2026-09-14** — Supabase transport retry. Sentry caught a GOAWAY (`RemoteProtocolError`) on the `conversations` insert that silently lost the 2026-09-12 09:41 MDT call (confirmed: zero rows for 9/12). Added `sb_exec` to `config.py` and converted **all 19** Supabase call sites across `main.py` + `skills/` off bare `asyncio.to_thread`. Verified: 5 unit cases (GOAWAY replayed, write does NOT replay `ReadTimeout`, read does, exhaustion re-raises, non-transport errors pass straight through) + live reads against prod (territory RPC, KB RPC, warehouses, specialists, products).
 - **2026-07-31** — LPS-list drift fix: rewrote `deploy_retell_config.py` as a Supabase→Retell roster sync (old version's assumptions were dead: destinations are now INFERRED not predefined, and published LLMs reject direct PATCH). Reads active LPSs from `specialists`, regenerates the transfer prompt + `retell_mfc_config.json` destinations, pushes via draft→patch→publish, verifies post-publish. Dry-run verified against live agent v55; not yet applied (pending diffs are cosmetic: alphabetical ordering + generic non-LPS refusal line replacing the Sheryl-by-name one).
@@ -181,6 +190,7 @@ See `env.template` for the full set. Critical ones:
 - **`lookup_staff` is misnamed** — does territorial lookup, not name lookup. Kept as a backwards-compat shim alongside `lookup_staff_by_name`. Can be removed once Retell dashboard config is verified to no longer reference it.
 - **Specialist territory routing** uses `MONTANA_TOWN_TO_COUNTY` dict in `skills/specialists.py`. Adding a town here means a code change + deploy — known tech debt.
 - **Per-call specialist cache** is what makes the agent reliable when ASR mishears a name later in the same call. Don't shorten the TTL below 1 hour.
+- **`kb_query_embedding_cache` is disposable.** Safe to `TRUNCATE` at any time — it rebuilds on demand, at the cost of one OpenAI round trip per distinct query. It is also the thing that caps the blast radius of `match_knowledge_base` being callable by `anon`: repeat queries cost nothing, novel ones still hit OpenAI.
 - **Pinned `--workers 1`** in `Procfile` is deliberate (Zep client + cache state isn't safe across workers yet).
 
 ---
