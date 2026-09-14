@@ -10,7 +10,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 
 # ============================================================================
 # LOGGING
@@ -75,8 +75,26 @@ if not ZEP_API_KEY:
 # CLIENT INITIALIZATION
 # ============================================================================
 
-# Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+# Supabase client.
+#
+# supabase-py defaults `postgrest_client_timeout` to 120s (postgrest/constants.py).
+# That is a webhook-killer: a single hung connection parks a Retell tool call for
+# two minutes while the caller listens to silence. 10s is far longer than any
+# query this service issues — the biggest table read is ~19 product rows — so a
+# request still running at 10s is hung, not slow. Connect is tightened to 2s to
+# match the Zep and outbound clients below; a connect failure is in sb_exec's
+# "never processed" tier, so it retries cleanly rather than surfacing.
+SUPABASE_TIMEOUT = httpx.Timeout(10.0, connect=2.0)
+
+supabase: Client = (
+    create_client(
+        SUPABASE_URL,
+        SUPABASE_KEY,
+        options=ClientOptions(postgrest_client_timeout=SUPABASE_TIMEOUT),
+    )
+    if SUPABASE_URL and SUPABASE_KEY
+    else None
+)
 
 # ============================================================================
 # SUPABASE TRANSPORT RETRY (2026-09-14)
