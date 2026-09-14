@@ -146,7 +146,9 @@ I did not purchase these. Five numbers, one per active store. Match the local ar
 | Columbus | CB | 406 |
 | Riverton, WY | RV | **307** |
 
-Buy in the Retell dashboard, or one at a time:
+Buy in the Retell dashboard, or one at a time. **The curl below is the original,
+pre-deprecation form and will now be rejected — use the `inbound_agents` payload
+shown above this block instead:**
 
 ```bash
 curl -X POST https://api.retellai.com/create-phone-number -H "Authorization: Bearer $RETELL_API_KEY" -H 'Content-Type: application/json' -d '{"area_code":406,"nickname":"MFC Miles City store line","inbound_agent_id":"agent_b1331271e65ded31ad45657e96","inbound_agent_version":"latest_published","inbound_webhook_url":"https://mfc-single-agent-production.up.railway.app/retell-inbound-webhook"}'
@@ -162,15 +164,22 @@ Set a `nickname` on every one. The current main number has an empty nickname and
 
 Both fields matter. **The Axmen number has no `inbound_webhook_url` set — if you miss this, the agent answers with zero caller context and no store awareness.**
 
+`inbound_agent_id` / `inbound_agent_version` are **deprecated and rejected** here
+too (same notice as step 3). Bind with the `inbound_agents` array:
+
 ```bash
-curl -X PATCH https://api.retellai.com/update-phone-number/+1406XXXXXXX -H "Authorization: Bearer $RETELL_API_KEY" -H 'Content-Type: application/json' -d '{"inbound_agent_id":"agent_b1331271e65ded31ad45657e96","inbound_agent_version":"latest_published","inbound_webhook_url":"https://mfc-single-agent-production.up.railway.app/retell-inbound-webhook"}'
+curl -X PATCH https://api.retellai.com/update-phone-number/+1406XXXXXXX -H "Authorization: Bearer $RETELL_API_KEY" -H 'Content-Type: application/json' -d '{"inbound_agents":[{"weight":1,"agent_id":"agent_b1331271e65ded31ad45657e96","agent_version":"latest_published"}],"inbound_webhook_url":"https://mfc-single-agent-production.up.railway.app/retell-inbound-webhook"}'
 ```
 
 Verify them all at once:
 
 ```bash
-curl -s https://api.retellai.com/list-phone-numbers -H "Authorization: Bearer $RETELL_API_KEY" | py -m json.tool
+curl -s https://api.retellai.com/v2/list-phone-numbers -H "Authorization: Bearer $RETELL_API_KEY" | py -m json.tool
 ```
+
+The legacy (un-prefixed) list endpoints were removed 2026-06-15. `/v2` returns
+`{"items": [...], "pagination_key": ..., "has_more": ...}`, not a bare array —
+read `items`, and page with `has_more` / `pagination_key` if you ever exceed one page.
 
 ---
 
