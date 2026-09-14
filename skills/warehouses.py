@@ -15,10 +15,9 @@ DB-touching function is async + offloads the synchronous Supabase client to a
 worker thread so it never blocks the FastAPI event loop.
 """
 
-import asyncio
 from typing import Optional, Dict, List
 
-from config import supabase, logger
+from config import supabase, sb_exec, logger
 from .specialists import resolve_town_to_county
 
 
@@ -92,14 +91,16 @@ async def lookup_warehouse_by_did(to_number: str) -> Optional[Dict]:
         return None
 
     try:
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.table("warehouses")
                 .select("warehouse_name, warehouse_code, city, region, address, "
                         "phone, manager_name, manager_email, operating_hours, "
                         "retell_did, is_active")
                 .eq("is_active", True)
                 .not_.is_("retell_did", "null")
-                .execute()
+                .execute(),
+            what="warehouses by DID",
+            idempotent=True,
         )
         for w in result.data or []:
             did_digits = "".join(c for c in (w.get("retell_did") or "") if c.isdigit())[-10:]
@@ -129,13 +130,15 @@ async def lookup_warehouse(terms: List[str]) -> Optional[Dict]:
     logger.info(f"[WAREHOUSE] Looking up warehouse for terms: {cleaned}")
 
     try:
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.table("warehouses")
                 .select("warehouse_name, warehouse_code, city, region, address, "
                         "phone, manager_name, operating_hours, "
                         "service_area_description, is_active")
                 .eq("is_active", True)
-                .execute()
+                .execute(),
+            what="warehouses by terms",
+            idempotent=True,
         )
         rows = result.data or []
 

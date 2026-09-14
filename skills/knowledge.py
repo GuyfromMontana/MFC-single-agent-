@@ -3,10 +3,10 @@ Montana Feed Company - Knowledge Base Skills
 Semantic search over company Q&A entries
 """
 
-import asyncio
 
 from config import (
     supabase,
+    sb_exec,
     logger,
     ADVISORY_ENABLED,
     KB_NON_ADVISORY_CATEGORIES,
@@ -48,14 +48,16 @@ async def search_knowledge_base(query: str, top_k: int = 5) -> str:
         # question the KB CAN legitimately answer ("who owns Montana Feed").
         fetch_k = top_k if ADVISORY_ENABLED else max(top_k * 6, 25)
 
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.rpc(
                 "match_knowledge_base",
                 # text-embedding-3-small: strong matches top out ~0.65-0.70,
                 # so 0.7 filtered out nearly everything (drought best = 0.691).
                 # 0.4 admits relevant content while still rejecting true noise.
                 {"query_text": query, "match_threshold": 0.4, "match_count": fetch_k},
-            ).execute()
+            ).execute(),
+            what="match_knowledge_base rpc",
+            idempotent=True,
         )
 
         if result.data and not ADVISORY_ENABLED:

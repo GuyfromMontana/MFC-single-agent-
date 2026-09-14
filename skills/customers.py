@@ -21,11 +21,10 @@ to `caller_contacts.salesrep_code`, and let us go phone -> specialist
 directly without a county-based fallback.
 """
 
-import asyncio
 import re
 from typing import Optional, Dict
 
-from config import supabase, logger
+from config import supabase, sb_exec, logger
 
 
 async def lookup_customer_by_phone(phone: str) -> Optional[Dict]:
@@ -56,7 +55,7 @@ async def lookup_customer_by_phone(phone: str) -> Optional[Dict]:
         return None
 
     try:
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.table("caller_contacts")
                 .select(
                     "customer_id, customer_name, first_name, last_name, "
@@ -66,7 +65,9 @@ async def lookup_customer_by_phone(phone: str) -> Optional[Dict]:
                 )
                 .eq("phone_normalized", phone)
                 .limit(1)
-                .execute()
+                .execute(),
+            what="caller_contacts lookup",
+            idempotent=True,
         )
 
         rows = result.data or []

@@ -4,16 +4,15 @@ Montana Feed Company - Specialist Lookup Skills
 
 DB-touching functions (lookup_staff_by_name, lookup_specialist_by_town) are
 `async` and offload the synchronous Supabase client to a worker thread via
-`asyncio.to_thread`, so they don't block the FastAPI event loop. Pure helpers
+`config.sb_exec`, so they don't block the FastAPI event loop. Pure helpers
 (`is_lps`, `resolve_town_to_county`) stay synchronous.
 """
 
-import asyncio
 import logging
 import re
 from typing import Optional, Dict
 
-from config import supabase, logger
+from config import supabase, sb_exec, logger
 
 # Whitelist of characters allowed in a staff-name search. Everything else is
 # stripped before the value is interpolated into a PostgREST `or_()` filter —
@@ -468,7 +467,7 @@ async def lookup_staff_by_name(name: str) -> list:
                 .execute()
             )
 
-        result = await asyncio.to_thread(_run_query)
+        result = await sb_exec(_run_query, what="specialists by name", idempotent=True)
         rows = result.data or []
 
         # Tokens for matching. Most callers say "first last" but we also
@@ -579,7 +578,7 @@ async def lookup_staff_by_phone(phone: str) -> Optional[Dict]:
                 .execute()
             )
 
-        result = await asyncio.to_thread(_run_query)
+        result = await sb_exec(_run_query, what="specialists by phone", idempotent=True)
         for s in result.data or []:
             row_digits = "".join(c for c in (s.get("phone") or "") if c.isdigit())[-10:]
             if row_digits and row_digits == digits:
@@ -608,7 +607,7 @@ async def lookup_staff_by_phone(phone: str) -> Optional[Dict]:
                 .execute()
             )
 
-        ou = await asyncio.to_thread(_run_order_users)
+        ou = await sb_exec(_run_order_users, what="order_users roster", idempotent=True)
         for u in ou.data or []:
             row_digits = "".join(c for c in (u.get("phone") or "") if c.isdigit())[-10:]
             if not row_digits or row_digits != digits:
@@ -660,11 +659,13 @@ async def get_specialist_by_email(email: str) -> Optional[Dict]:
     if not target or "@" not in target:
         return None
     try:
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.table("specialists")
                 .select("id, first_name, last_name, email, phone, role, specialties, is_active")
                 .eq("is_active", True)
-                .execute()
+                .execute(),
+            what="specialists by email",
+            idempotent=True,
         )
         for s in result.data or []:
             if (s.get("email") or "").strip().lower() == target:
@@ -716,11 +717,13 @@ async def lookup_specialist_by_town(town_name: str) -> Optional[Dict[str, str]]:
         #   2. Ties resolve by an explicit priority column. Counties held by
         #      two LPS used to return whichever row PostgREST handed back
         #      first, with no ORDER BY anywhere.
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.rpc(
                 "find_territory_specialist",
                 {"p_county": county_name, "p_state": state},
-            ).execute()
+            ).execute(),
+            what="find_territory_specialist rpc",
+            idempotent=True,
         )
 
         rows = result.data or []

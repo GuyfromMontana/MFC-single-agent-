@@ -4,6 +4,7 @@ Version 3.0.0 - Modular Refactor
 """
 
 import os
+import asyncio
 import logging
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -76,6 +77,85 @@ if not ZEP_API_KEY:
 
 # Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+# ============================================================================
+# SUPABASE TRANSPORT RETRY (2026-09-14)
+# ============================================================================
+#
+# The client above is a module-level singleton whose httpx client is built once
+# and lives as long as the Railway pod, and postgrest-py hardcodes `http2=True`
+# (postgrest/_sync/client.py). So every query rides a long-lived HTTP/2
+# connection that Supabase's edge periodically retires with a *graceful* GOAWAY
+# (`ConnectionTerminated error_code:0`). httpcore does not transparently replay
+# a request that raced that GOAWAY — it raises RemoteProtocolError straight
+# through. On 2026-09-12 that silently dropped a completed call from
+# `conversations`: the webhook still returned 200 and the transcript email still
+# went out, so nothing looked broken until Sentry fired.
+#
+# We retry only failures the server has told us it did NOT process:
+#   * GOAWAY carries `last_stream_id` — streams above it were never handled.
+#   * Connect/pool failures never put bytes on the wire.
+#
+# A ReadTimeout is deliberately NOT in that set: the request did reach
+# PostgREST and we merely never saw the response, so replaying an INSERT could
+# double-write. Call sites that are safe to replay anyway — every read, plus
+# the fixed-value UPDATE in skills/leads.py — opt in with `idempotent=True`.
+
+SB_RETRY_ATTEMPTS = 3
+SB_RETRY_BASE_DELAY = 0.25  # seconds; doubles each attempt (0.25s, 0.5s)
+
+# Provably never processed — safe to replay even for writes.
+_SB_UNPROCESSED_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.RemoteProtocolError,
+    httpx.CloseError,
+)
+
+# Ambiguous — the request may already have been applied. Replayed only when
+# the caller asserts the operation is safe to repeat.
+_SB_AMBIGUOUS_ERRORS = (
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+)
+
+
+async def sb_exec(run, *, what: str = "supabase", idempotent: bool = False):
+    """Run a blocking postgrest call off the event loop, retrying transport errors.
+
+    `run` is a zero-arg callable that both builds and executes the query, e.g.
+    `lambda: supabase.table("leads").select("id").execute()`. It is re-invoked
+    from scratch on every attempt, so a builder is never reused across retries.
+
+    Drop-in replacement for `asyncio.to_thread(run)` at Supabase call sites.
+    Non-transport failures (PostgREST 4xx/5xx, APIError) propagate untouched on
+    the first attempt — this retries the pipe, not the query.
+    """
+    retryable = _SB_UNPROCESSED_ERRORS + (_SB_AMBIGUOUS_ERRORS if idempotent else ())
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(1, SB_RETRY_ATTEMPTS + 1):
+        try:
+            return await asyncio.to_thread(run)
+        except retryable as e:
+            last_exc = e
+            if attempt == SB_RETRY_ATTEMPTS:
+                break
+            delay = SB_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning(
+                "[SB] %s: %s on attempt %d/%d (%s) — retrying in %.2fs",
+                what, type(e).__name__, attempt, SB_RETRY_ATTEMPTS, e, delay,
+            )
+            await asyncio.sleep(delay)
+
+    logger.error(
+        "[SB] %s: transport failure, gave up after %d attempts (%s: %s)",
+        what, SB_RETRY_ATTEMPTS, type(last_exc).__name__, last_exc,
+    )
+    raise last_exc
 
 # ============================================================================
 # ZEP CLOUD REST API CONFIGURATION

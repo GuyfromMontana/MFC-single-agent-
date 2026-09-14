@@ -17,10 +17,9 @@ DB-touching functions are async + offload the synchronous Supabase client to a
 worker thread so they never block the FastAPI event loop.
 """
 
-import asyncio
 from typing import List, Dict
 
-from config import supabase, logger
+from config import supabase, sb_exec, logger
 
 # Map common caller "needs" to the catalog. Each need has a set of trigger
 # words (what a rancher might say) and the category/subcategory/keywords that
@@ -109,13 +108,15 @@ async def _all_active_products() -> List[Dict]:
         logger.warning("[PRODUCTS] Supabase not configured")
         return []
     try:
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.table("products")
                 .select("product_name, product_code, brand, category, subcategory, "
                         "livestock_type, protein_percentage, fat_percentage, "
                         "unit_type, in_stock, description, is_active")
                 .eq("is_active", True)
-                .execute()
+                .execute(),
+            what="active products list",
+            idempotent=True,
         )
         return result.data or []
     except Exception as e:

@@ -3,15 +3,14 @@ Montana Feed Company - Lead Management Skills
 Lead capture, lookup, and updates.
 
 All DB-touching functions are `async` and offload the synchronous Supabase
-client to a worker thread via `asyncio.to_thread`, so they don't block the
+client to a worker thread via `config.sb_exec`, so they don't block the
 FastAPI event loop.
 """
 
-import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
-from config import supabase, logger
+from config import supabase, sb_exec, logger
 
 
 def _now_iso() -> str:
@@ -23,13 +22,15 @@ async def get_caller_name_from_leads(phone: str) -> Optional[str]:
     if not supabase:
         return None
     try:
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.table("leads")
                 .select("first_name, last_name")
                 .eq("phone", phone)
                 .order("created_at", desc=True)
                 .limit(1)
-                .execute()
+                .execute(),
+            what="leads name lookup",
+            idempotent=True,
         )
 
         if result.data and len(result.data) > 0:
@@ -57,19 +58,21 @@ async def update_lead_with_name(phone: str, first_name: str, last_name: str = ""
     if not supabase:
         return False
     try:
-        existing = await asyncio.to_thread(
+        existing = await sb_exec(
             lambda: supabase.table("leads")
                 .select("id, first_name")
                 .eq("phone", phone)
                 .limit(1)
-                .execute()
+                .execute(),
+            what="leads existence check",
+            idempotent=True,
         )
 
         if existing.data and len(existing.data) > 0:
             lead = existing.data[0]
             current_name = (lead.get("first_name") or "").lower()
             if not current_name or current_name in ["unknown", "caller"]:
-                await asyncio.to_thread(
+                await sb_exec(
                     lambda: supabase.table("leads")
                         .update({
                             "first_name": first_name,
@@ -77,12 +80,14 @@ async def update_lead_with_name(phone: str, first_name: str, last_name: str = ""
                             "updated_at": _now_iso(),
                         })
                         .eq("id", lead["id"])
-                        .execute()
+                        .execute(),
+                    what="leads name update",
+                    idempotent=True,
                 )
                 logger.info(f"Updated lead {phone} with name: {first_name} {last_name}")
                 return True
         else:
-            await asyncio.to_thread(
+            await sb_exec(
                 lambda: supabase.table("leads").insert({
                     "first_name": first_name,
                     "last_name": last_name,
@@ -91,7 +96,9 @@ async def update_lead_with_name(phone: str, first_name: str, last_name: str = ""
                     "lead_status": "new",
                     "created_at": _now_iso(),
                     "updated_at": _now_iso(),
-                }).execute()
+                }).execute(),
+                what="leads insert (name)",
+                idempotent=False,
             )
             logger.info(f"Created new lead for {phone}: {first_name} {last_name}")
             return True
@@ -111,7 +118,7 @@ async def capture_lead(name: str, phone: str, location: str, interests: str) -> 
         first_name = name_parts[0] if name_parts else "Unknown"
         last_name = name_parts[1] if len(name_parts) > 1 else ""
 
-        result = await asyncio.to_thread(
+        result = await sb_exec(
             lambda: supabase.table("leads").insert({
                 "first_name": first_name,
                 "last_name": last_name,
@@ -122,7 +129,9 @@ async def capture_lead(name: str, phone: str, location: str, interests: str) -> 
                 "lead_status": "new",
                 "created_at": _now_iso(),
                 "updated_at": _now_iso(),
-            }).execute()
+            }).execute(),
+            what="leads insert (capture)",
+            idempotent=False,
         )
 
         logger.info(f"Lead captured: {first_name} {last_name}")
@@ -169,8 +178,10 @@ async def create_message_for_specialist(
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
-        result = await asyncio.to_thread(
-            lambda: supabase.table("callbacks").insert(payload).execute()
+        result = await sb_exec(
+            lambda: supabase.table("callbacks").insert(payload).execute(),
+            what="callbacks insert",
+            idempotent=False,
         )
         if result.data and len(result.data) > 0:
             row_id = result.data[0].get("id")

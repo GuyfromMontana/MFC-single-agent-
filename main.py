@@ -55,6 +55,7 @@ from retell_auth import (
 # Import configuration and clients
 from config import (
     supabase,
+    sb_exec,
     ZEP_API_KEY,
     ZEP_BASE_URL,
     ZEP_HEADERS,
@@ -830,8 +831,10 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                     }
 
                     # Wrap blocking Supabase call so it doesn't block the event loop
-                    conversation_result = await asyncio.to_thread(
-                        lambda: supabase.table("conversations").insert(conversation_data).execute()
+                    conversation_result = await sb_exec(
+                        lambda: supabase.table("conversations").insert(conversation_data).execute(),
+                        what="conversations insert",
+                        idempotent=False,
                     )
 
                     if conversation_result.data and len(conversation_result.data) > 0:
@@ -858,8 +861,10 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
 
                             if messages_payload:
                                 # Single batched insert instead of N inserts
-                                await asyncio.to_thread(
-                                    lambda: supabase.table("conversation_messages").insert(messages_payload).execute()
+                                await sb_exec(
+                                    lambda: supabase.table("conversation_messages").insert(messages_payload).execute(),
+                                    what="conversation_messages insert",
+                                    idempotent=False,
                                 )
                                 logger.info(f"✅ Saved {len(messages_payload)} messages to conversation_messages (batched)")
 
@@ -879,13 +884,15 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
 
                     logger.info(f"[EMAIL] Looking up email for: {first_name} {last_name}")
 
-                    result = await asyncio.to_thread(
+                    result = await sb_exec(
                         lambda: supabase.table("specialists")
                             .select("email, first_name, last_name")
                             .ilike("first_name", first_name)
                             .ilike("last_name", last_name)
                             .eq("is_active", True)
-                            .execute()
+                            .execute(),
+                        what="specialist email lookup",
+                        idempotent=True,
                     )
 
                     if result.data and len(result.data) > 0:
