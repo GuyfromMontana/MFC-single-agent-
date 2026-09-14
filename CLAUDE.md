@@ -93,6 +93,19 @@ Zep's PATCH `/users/{id}` body `{"metadata": {key: null}}` preserves the existin
 
 The `supabase` client is a module-level singleton whose httpx client outlives the pod, and postgrest-py hardcodes `http2=True`. Supabase's edge periodically retires those long-lived connections with a graceful GOAWAY (`ConnectionTerminated error_code:0`), and httpcore does not replay the request that raced it — it raises `RemoteProtocolError`. On **2026-09-12** that silently dropped a completed call from `conversations`: webhook returned 200, transcript email still sent, nothing looked broken until Sentry fired. `sb_exec` retries only errors the server proved it never processed; `idempotent=True` additionally replays read-style timeouts. Adding a new Supabase query? Use `sb_exec`, and think about which flag it deserves — an INSERT without a client-side PK must stay `idempotent=False`.
 
+### KB rows are embedded as `Question: … 
+
+Answer: …`, queries as bare text — that asymmetry is the main retrieval defect
+
+Both writers agree on the format: the `generate-embedding` edge function and the SQL `regenerate_embedding`. So a row's vector is a 200-500 char *document* while a caller query is four words, and cosine between them is structurally low. A row scores **0.826** against its own question text, not ~1.0. The old note claiming "embeddings cover `question` only" was wrong, and it hid this.
+
+Consequences worth knowing before you touch retrieval:
+- The "strong matches top out ~0.65-0.70" comment in `skills/knowledge.py` is an artifact of this compression, not a property of `text-embedding-3-small`.
+- **A long answer sinks its own row.** Keep new rows' answers short — it is a retrieval parameter, not just style.
+- Adding a row phrased exactly like the caller still may not clear 0.4: "Where are you located?" exists verbatim and scores **0.3742**. Embedded question-only it would score **0.9148**.
+
+The real fix, when you want it: embed `question` only in both writers and re-embed ~1,140 rows (one OpenAI call each). Cost is pennies. The tradeoff is that answer-only facts stop being searchable — which is what caller-phrasing sibling rows are for.
+
 ### `match_knowledge_base` timings are coupled to the client timeout — don't move one alone
 
 The RPC generates its query embedding by calling OpenAI **synchronously from inside Postgres** via the `http` extension, because OpenAI is unreachable from Railway's network (see above). That leg is the only part that can hang, and pgsql-http's 5s default was blowing intermittently — surfacing to callers as `SEARCH_ERROR`.
@@ -138,6 +151,7 @@ Roster names/numbers come from Supabase (`is_lps()` rows, phones via the same `_
 
 ## Done (recent)
 
+- **2026-09-14 (4)** — Added 16 caller-phrasing KB rows across the six allowlisted categories (`source='caller_phrasing_2026-09-14'`; `delete from knowledge_base where source=…` reverts). Short answers on purpose (dilution), and they name towns instead of restating addresses/phones so the store-fact drift surface doesn't grow. End-to-end answer rate on a 21-question caller set: **20/21**. Only "where are you located" still misses (0.3788) — that one needs the embedding change above, not more phrasing.
 - **2026-09-14 (3)** — KB search timeout fixed server-side. Added `kb_query_embedding_cache` + rewrote `match_knowledge_base` to memoize the embedding, cut the per-attempt HTTP timeout 5s -> 3.5s (transaction-local, can't leak across the pooler), and retry once on transport failure or a retryable status (408/429/5xx) while still failing fast on 401/4xx. Measured: cold 1445ms, cached **13ms**, identical similarity. Empty/blank/null queries now short-circuit to zero rows instead of embedding an empty string. Also silenced the `function_search_path_mutable` advisor for this function.
 - **2026-09-14 (2)** — Pinned `postgrest_client_timeout` to `httpx.Timeout(10.0, connect=2.0)` via `ClientOptions`, replacing the 120s library default. Verified the value actually reaches `supabase.postgrest.session.timeout` (ClientOptions can silently no-op).
 - **2026-09-14** — Supabase transport retry. Sentry caught a GOAWAY (`RemoteProtocolError`) on the `conversations` insert that silently lost the 2026-09-12 09:41 MDT call (confirmed: zero rows for 9/12). Added `sb_exec` to `config.py` and converted **all 19** Supabase call sites across `main.py` + `skills/` off bare `asyncio.to_thread`. Verified: 5 unit cases (GOAWAY replayed, write does NOT replay `ReadTimeout`, read does, exhaustion re-raises, non-transport errors pass straight through) + live reads against prod (territory RPC, KB RPC, warehouses, specialists, products).
