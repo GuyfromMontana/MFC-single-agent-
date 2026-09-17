@@ -421,9 +421,56 @@ def is_lps(specialist: Dict) -> bool:
     return "livestock performance" in role or role == "lps"
 
 
+def _name_matches(query_lower: str, tokens: list, first: str, last: str) -> bool:
+    """Shared fuzzy name test for both staff directories.
+
+    Match conditions (any one wins):
+      1. Full query substring of the full name — "Sheryl Shea" for Sheryl Shea.
+      2. Any token matches first OR last. Forgiving of ASR mishears where one
+         of two tokens is wrong ("Cheryl Shea": "Cheryl" matches nothing,
+         "Shea" matches the last name, so it counts).
+      3. Single-token query matching first or last.
+    """
+    first_lower = (first or "").strip().lower()
+    last_lower = (last or "").strip().lower()
+    full_lower = f"{first_lower} {last_lower}".strip()
+
+    if query_lower and query_lower in full_lower:
+        return True
+    token_hits = sum(1 for t in tokens if (t in first_lower) or (t in last_lower))
+    return token_hits >= 1
+
+
+def _same_person(candidate_name: str, candidate_email: str, existing: list) -> bool:
+    """True when an order_users row is someone already matched from `specialists`.
+
+    Needed because the two tables spell people differently: `specialists` has
+    "Brenda Atchison-Curry" where order_users has just "Brenda", and Dan Otis
+    appears in both with possibly different email aliases (warehouses carries
+    Dan@axmen.com, order_users danotis@axmen.com — one is an alias, unverified).
+    So match on email OR on either name containing the other.
+    """
+    cand = " ".join((candidate_name or "").lower().split())
+    mail = (candidate_email or "").strip().lower()
+    for m in existing:
+        if mail and (m.get("email") or "").strip().lower() == mail:
+            return True
+        full = " ".join((m.get("full_name") or "").lower().split())
+        if cand and full and (cand in full or full in cand):
+            return True
+    return False
+
+
 async def lookup_staff_by_name(name: str) -> list:
     """
-    Fuzzy-match active staff in the `specialists` table by name.
+    Fuzzy-match active staff by name across BOTH staff directories.
+
+    Two-tier (2026-09-17), mirroring lookup_staff_by_phone:
+      tier 1  `specialists`  — curated, owns the good phone numbers
+      tier 2  `order_users`  — the authoritative employee roster; adds the
+              store managers (Kase, Kristena) and admins (Brennan, Tillie)
+              that tier 1 has never contained. Additive only; a person found
+              in tier 1 is never duplicated by tier 2.
 
     Accepts single names ("Sheryl"), full names ("Sheryl Shea"), or partials
     ("shea"). Inactive staff are excluded. Returns 0, 1, or many matches.
@@ -481,35 +528,7 @@ async def lookup_staff_by_name(name: str) -> list:
         for s in rows:
             first = (s.get("first_name") or "").strip()
             last = (s.get("last_name") or "").strip()
-            first_lower = first.lower()
-            last_lower = last.lower()
-            full_lower = f"{first_lower} {last_lower}".strip()
-
-            # Match conditions (any one wins):
-            # 1. Full query substring of full name (the natural case for
-            #    "Sheryl Shea" being asked about "Sheryl Shea").
-            # 2. Each token matches first OR last (handles ASR mishears
-            #    where one of two tokens is wrong — e.g. "Cheryl Shea":
-            #    "Cheryl" matches nothing, "Shea" matches Sheryl Shea's
-            #    last name, so we count it).
-            # 3. Single-token query that matches first or last name.
-            matched = False
-            if query_lower and query_lower in full_lower:
-                matched = True
-            else:
-                token_hits = sum(
-                    1 for t in tokens
-                    if (t in first_lower) or (t in last_lower)
-                )
-                if len(tokens) == 1 and token_hits >= 1:
-                    matched = True
-                elif len(tokens) >= 2 and token_hits >= 1:
-                    # At least one token of a multi-word query matched —
-                    # forgiving of ASR errors. Caller can disambiguate
-                    # downstream if multiple specialists match.
-                    matched = True
-
-            if matched:
+            if _name_matches(query_lower, tokens, first, last):
                 matches.append({
                     "id": s.get("id"),
                     "first_name": s.get("first_name"),
@@ -522,6 +541,59 @@ async def lookup_staff_by_name(name: str) -> list:
                     "counties": s.get("counties") or [],
                     "is_lps": is_lps(s),
                 })
+
+        # ---- tier 2: order_users, the authoritative employee ROSTER ----
+        # `specialists` holds 13 curated rows and misses the store managers
+        # Kase Stoddard and Kristena Dickinson, plus Brennan and Tillie. That
+        # gap cost a real customer: 2026-09-12, Shane Truby left a message on
+        # the Dillon store line asking Kase to call him back. The agent passed
+        # specialist_name="Kase Stoddard" but nothing could resolve it to an
+        # email, so schedule_callback fell through to the catch-all and the
+        # message landed in Guy's inbox instead of Kase's.
+        #
+        # Same two-tier shape as lookup_staff_by_phone: `specialists` stays
+        # authoritative (it owns the good phone numbers — Taylor's order_users
+        # number is known stale), and this pass is purely additive coverage.
+        def _run_order_users():
+            return (
+                supabase.table("order_users")
+                .select("id, display_name, email, phone, role, active")
+                .eq("active", True)
+                .execute()
+            )
+
+        ou = await sb_exec(_run_order_users, what="order_users by name", idempotent=True)
+        for u in ou.data or []:
+            display = (u.get("display_name") or "").strip()
+            if not display:
+                continue
+            parts = display.split(None, 1)
+            first = parts[0]
+            last = parts[1] if len(parts) > 1 else ""
+            if not _name_matches(query_lower, tokens, first, last):
+                continue
+            if _same_person(display, u.get("email"), matches):
+                continue
+            role = (u.get("role") or "").strip()
+            matches.append({
+                "id": u.get("id"),
+                "first_name": first,
+                "last_name": last,
+                "full_name": display,
+                "email": u.get("email"),
+                "phone": u.get("phone"),
+                "role": role,
+                "specialties": [],
+                "counties": [],
+                # order_users roles are 'lps' | 'store_manager' | 'admin'.
+                # Only an LPS is live-transfer eligible; managers and admins
+                # stay message-only, same rule as the specialists table.
+                "is_lps": role.lower() == "lps",
+            })
+            logger.info(
+                "[STAFF] name matched order_users (not in specialists): %s (role=%s)",
+                display, role or "-",
+            )
 
         logger.info(f"[STAFF] Found {len(matches)} match(es) for '{query}': "
                     f"{[m['full_name'] for m in matches]}")
