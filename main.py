@@ -393,6 +393,45 @@ async def _scan_args_for_specialist(args: dict, caller_name: str | None) -> dict
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "notifications@axmen.com")
 
+# ---------------------------------------------------------------------------
+# OVERSIGHT CC (2026-09-17)
+# ---------------------------------------------------------------------------
+# Every call notification — the call_ended transcript AND the schedule_callback
+# message — also copies this address, so there is one inbox that sees what the
+# phone is actually catching and what callers are asking for.
+#
+# Why this became necessary: before the store lines went live, anything without
+# a resolved specialist fell to the catch-all, which IS Guy — so he saw most
+# traffic by accident. Store-line calls now route to the store manager instead
+# (Kase, Tamra, Brenda, Dan, Kristena), and on 2026-09-12 that silently took
+# Guy out of the loop on the first real customer message.
+#
+# Defaults to CATCHALL_MESSAGE_EMAIL so no new Railway variable is needed.
+# Set ALWAYS_CC_EMAIL="" to switch the copies off.
+ALWAYS_CC_EMAIL = os.getenv(
+    "ALWAYS_CC_EMAIL",
+    os.getenv("CATCHALL_MESSAGE_EMAIL", ""),
+).strip()
+
+def _email_payload(to_email: str, subject: str, html_content: str) -> dict:
+    """Resend payload, adding the oversight CC when one is configured.
+
+    Skipped when the CC address IS the primary recipient — otherwise a call
+    that already fell through to the catch-all would deliver twice to the
+    same inbox and look like a duplicate-send bug.
+    """
+    payload = {
+        "from": FROM_EMAIL,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_content,
+    }
+    primary = (to_email or "").strip().lower()
+    if ALWAYS_CC_EMAIL and ALWAYS_CC_EMAIL.lower() != primary:
+        payload["cc"] = [ALWAYS_CC_EMAIL]
+    return payload
+
+
 async def send_specialist_email(specialist_email: str, specialist_name: str, caller_name: str, 
                                 caller_phone: str, caller_location: str, call_summary: str,
                                 duration: int = None):
@@ -453,16 +492,14 @@ async def send_specialist_email(specialist_email: str, specialist_name: str, cal
                 "Authorization": f"Bearer {RESEND_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={
-                "from": FROM_EMAIL,
-                "to": [specialist_email],
-                "subject": subject,
-                "html": html_content,
-            },
+            json=_email_payload(specialist_email, subject, html_content),
         )
 
         if response.status_code == 200:
-            logger.info(f"✅ Email sent to {specialist_email}")
+            cc_note = ""
+            if ALWAYS_CC_EMAIL and ALWAYS_CC_EMAIL.lower() != (specialist_email or "").strip().lower():
+                cc_note = f" (cc {ALWAYS_CC_EMAIL})"
+            logger.info(f"✅ Email sent to {specialist_email}{cc_note}")
             return True
         else:
             logger.error(f"❌ Email failed: {response.status_code} - {response.text}")
