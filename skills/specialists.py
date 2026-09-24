@@ -424,21 +424,33 @@ def is_lps(specialist: Dict) -> bool:
 def _name_matches(query_lower: str, tokens: list, first: str, last: str) -> bool:
     """Shared fuzzy name test for both staff directories.
 
-    Match conditions (any one wins):
-      1. Full query substring of the full name — "Sheryl Shea" for Sheryl Shea.
-      2. Any token matches first OR last. Forgiving of ASR mishears where one
-         of two tokens is wrong ("Cheryl Shea": "Cheryl" matches nothing,
-         "Shea" matches the last name, so it counts).
-      3. Single-token query matching first or last.
-    """
-    first_lower = (first or "").strip().lower()
-    last_lower = (last or "").strip().lower()
-    full_lower = f"{first_lower} {last_lower}".strip()
+    A match needs at least one query token to EQUAL a whole word of the
+    first or last name ("Atchison-Curry" counts as two words). Forgiving of
+    ASR mishears where one of two tokens is wrong ("Cheryl Shea": "Cheryl"
+    matches nothing, "Shea" matches the last name, so it counts).
 
-    if query_lower and query_lower in full_lower:
-        return True
-    token_hits = sum(1 for t in tokens if (t in first_lower) or (t in last_lower))
-    return token_hits >= 1
+    WHOLE WORDS ONLY (2026-09-24). This used to be a substring test, so
+    "Ann" matched Hannah, "Lee"/"Kay" matched Kaylee, and "John" matched
+    Brady Johnson. schedule_callback's Layer 1.5 runs every Capitalized word
+    of a message through here BEFORE store-manager routing, so "John Smith
+    wants tub prices" on the Dillon line was emailed to Brady, not Kase.
+    `query_lower` is kept for call-site compatibility; tokens carry the match.
+    """
+    words = set()
+    for part in (first or "", last or ""):
+        for w in re.split(r"[\s\-]+", part.lower()):
+            w = _strip_possessive(w)
+            if w:
+                words.add(w)
+    return any(_strip_possessive(t) in words for t in tokens if t)
+
+
+def _strip_possessive(word: str) -> str:
+    """'kase's' -> 'kase'; drop stray apostrophes ("o'neil" stays one word)."""
+    w = word.strip().strip("'")
+    if w.endswith("'s"):
+        w = w[:-2]
+    return w
 
 
 def _same_person(candidate_name: str, candidate_email: str, existing: list) -> bool:

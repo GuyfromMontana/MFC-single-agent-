@@ -7,6 +7,7 @@ client to a worker thread via `config.sb_exec`, so they don't block the
 FastAPI event loop.
 """
 
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -141,6 +142,44 @@ async def capture_lead(name: str, phone: str, location: str, interests: str) -> 
         return False
 
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+
+async def _valid_specialist_id(specialist_id: Optional[str]) -> Optional[str]:
+    """Return specialist_id only if it is a real `specialists.id`, else None.
+
+    `callbacks.specialist_id` is a FOREIGN KEY to `specialists.id`. Since
+    2026-09-17 lookup_staff_by_name also resolves people from `order_users`
+    (Kase, Kristena, Brennan, Tillie), whose ids are NOT specialists ids —
+    0 of 17 overlap. Passing one made the insert fail, and a failed insert
+    used to cancel the message email, so "have Kase call me" reached no one.
+    The agent can also pass junk ("", a name) that isn't a uuid at all.
+    specialist_email / specialist_assigned still carry who the message is
+    for; only the FK column is dropped.
+    """
+    sid = (specialist_id or "").strip()
+    if not sid:
+        return None
+    if not _UUID_RE.match(sid):
+        logger.info(f"[MESSAGE] specialist_id {sid!r} is not a uuid; storing null")
+        return None
+    try:
+        res = await sb_exec(
+            lambda: supabase.table("specialists").select("id").eq("id", sid).limit(1).execute(),
+            what="specialists id check",
+            idempotent=True,
+        )
+        if res.data:
+            return sid
+    except Exception as e:
+        logger.warning(f"[MESSAGE] specialist_id check failed ({e}); storing null")
+        return None
+    logger.info(f"[MESSAGE] specialist_id {sid} not in specialists (order_users?); storing null")
+    return None
+
+
 async def create_message_for_specialist(
     specialist_id: Optional[str],
     specialist_name: Optional[str],
@@ -166,6 +205,7 @@ async def create_message_for_specialist(
         logger.warning("[MESSAGE] Cannot create message - Supabase not configured")
         return None
     try:
+        specialist_id = await _valid_specialist_id(specialist_id)
         payload = {
             "caller_phone": caller_phone or "unknown",
             "caller_name": caller_name,

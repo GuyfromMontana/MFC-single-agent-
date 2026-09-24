@@ -1593,6 +1593,8 @@ async def schedule_callback(request: Request):
         if not callback_id:
             # Fallback: at least log a lead so nothing is lost
             await capture_lead(caller_name, caller_phone, "callback", notes[:500])
+        if not callback_id and not specialist_email:
+            # No row AND no recipient — nothing else we can promise.
             return JSONResponse(content={
                 "result": (
                     "I've noted your request. Our team will follow up with you at "
@@ -1604,8 +1606,10 @@ async def schedule_callback(request: Request):
         # Queue the email in the background — the caller is on the line
         # waiting for this tool to answer, and a slow Resend round-trip
         # (up to the client's 10s timeout) is dead air. Failures are logged
-        # by _fire_and_forget; the callbacks row above is the durable record
-        # either way.
+        # by _fire_and_forget; the callbacks row above (or the lead fallback
+        # when that insert failed) is the durable record either way. A failed
+        # insert must NOT cancel the email — that is how order_users messages
+        # were silently dropped before 2026-09-24.
         email_queued = False
         if specialist_email:
             _fire_and_forget(
