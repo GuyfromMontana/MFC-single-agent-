@@ -778,7 +778,12 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
 
             # Use cached memory data if available, otherwise fall back to Zep
             cached = _cache_get(caller_key)
-            if cached is not None:
+            # A tool call can create a cache entry holding ONLY
+            # recent_specialist (_stash_recent_specialist on a cache miss,
+            # e.g. after a mid-call redeploy). That is not caller data —
+            # treating it as a hit skipped the lookup and mailed "Unknown
+            # Caller". Only an entry call_inbound wrote (it has "found") counts.
+            if isinstance(cached, dict) and "found" in cached:
                 memory_data = cached
                 logger.info(f"[CACHE HIT] Using cached Zep data for call_ended")
             elif is_widget:
@@ -909,10 +914,29 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
                     logger.error(f"❌ Failed to save to Supabase: {e}", exc_info=True)
 
             # ====================================================================
-            # SEND EMAIL — to the assigned specialist if known, else catch-all
+            # SEND EMAIL — store line → store manager; else specialist; else catch-all
             # ====================================================================
+            # Store-line calls go to the STORE MANAGER first (2026-09-24).
+            # Before, a returning caller's remembered specialist won — and
+            # lookup_caller_fast auto-assigns one to anyone with a known
+            # location — so most Dillon-line transcripts went to the LPS
+            # instead of Kase. A call on a store's own line belongs to that
+            # store. The shared main line still routes to the specialist.
             specialist_email = None
-            if specialist_name and supabase:
+            cached = _cache_get(caller_key) or {}
+            store_email = cached.get("store_manager_email") or ""
+            store_label = cached.get("store_name") or ""
+            if not store_email and to_number:
+                store_row = await lookup_warehouse_by_did(to_number)
+                if store_row:
+                    store_email = store_row.get("manager_email") or ""
+                    store_label = store_row.get("city") or ""
+            if store_email:
+                specialist_email = store_email
+                specialist_name = f"{store_label} store manager"
+                logger.info(f"[EMAIL] Store-line call — routing transcript to {store_label} manager")
+
+            if not specialist_email and specialist_name and supabase:
                 try:
                     # Sanity-cap inputs before sending to ilike()
                     name_parts = specialist_name.split(None, 1)
@@ -940,27 +964,6 @@ async def retell_inbound_webhook(request: Request, background_tasks: BackgroundT
 
                 except Exception as e:
                     logger.error(f"[EMAIL] Specialist lookup error: {e}")
-
-            # Store-manager routing (2026-08-04): a call that came in on a
-            # store's dedicated line belongs to that store. If no specialist
-            # was resolved, the store manager gets the transcript — the
-            # global catch-all is only for the shared/widget number.
-            if not specialist_email and RESEND_API_KEY:
-                cached = _cache_get(caller_key) or {}
-                store_email = cached.get("store_manager_email") or ""
-                store_label = cached.get("store_name") or ""
-                if not store_email and to_number:
-                    store_row = await lookup_warehouse_by_did(to_number)
-                    if store_row:
-                        store_email = store_row.get("manager_email") or ""
-                        store_label = store_row.get("city") or ""
-                if store_email:
-                    specialist_email = store_email
-                    specialist_name = specialist_name or f"{store_label} store manager"
-                    logger.info(
-                        f"[EMAIL] No specialist identified — store-line call, "
-                        f"routing transcript to {store_label} manager"
-                    )
 
             # Catch-all: if no specialist could be resolved, send the
             # full-transcript email to a triage inbox instead of dropping it.
@@ -1524,6 +1527,13 @@ async def schedule_callback(request: Request):
                         source="schedule_callback_scan",
                     )
 
+        # Who the caller/agent ASKED for, before any fallback below replaces
+        # it. If the message falls through to a store manager or the
+        # catch-all, the agent must not tell the caller "Sheryl will get
+        # your message" when Sheryl gets nothing (2026-09-24).
+        requested_name = None if specialist_email else specialist_name
+        fallback_route = False
+
         # === Layer 1.75 — store-line calls route to the store manager. ===
         # A generic "have somebody call me" on a store's dedicated line
         # belongs to that store's manager, not the global triage inbox.
@@ -1538,7 +1548,8 @@ async def schedule_callback(request: Request):
                     store_label = store_row.get("city") or ""
             if store_email:
                 specialist_email = store_email
-                specialist_name = specialist_name or f"{store_label} store manager"
+                specialist_name = f"the {store_label} store manager"
+                fallback_route = True
                 logger.info(
                     f"[SCHEDULE_CALLBACK] No specialist resolved — store-line "
                     f"call, routing message to {store_label} manager"
@@ -1552,7 +1563,8 @@ async def schedule_callback(request: Request):
             catchall = os.getenv("CATCHALL_MESSAGE_EMAIL", FROM_EMAIL).strip()
             if catchall:
                 specialist_email = catchall
-                specialist_name = specialist_name or "Montana Feed Team"
+                specialist_name = "the Montana Feed team"
+                fallback_route = True
                 logger.warning(
                     f"[SCHEDULE_CALLBACK] No specialist resolved (args empty, "
                     f"cache empty) — routing to catchall {catchall}"
@@ -1578,6 +1590,8 @@ async def schedule_callback(request: Request):
 
         if territory_id:
             notes += f"\n\n(territory_id: {territory_id})"
+        if fallback_route and requested_name:
+            notes = f"Caller asked for: {requested_name} (couldn't match them in the directory)\n\n{notes}"
 
         # Write to callbacks table via the skill function
         callback_id = await create_message_for_specialist(
@@ -1611,7 +1625,7 @@ async def schedule_callback(request: Request):
         # insert must NOT cancel the email — that is how order_users messages
         # were silently dropped before 2026-09-24.
         email_queued = False
-        if specialist_email:
+        if specialist_email and RESEND_API_KEY:
             _fire_and_forget(
                 send_specialist_email(
                     specialist_email=specialist_email,
@@ -1633,7 +1647,12 @@ async def schedule_callback(request: Request):
             if caller_phone else
             "They'll reach out using the contact info you gave me."
         )
-        if reason == "message" and specialist_name:
+        if fallback_route and requested_name:
+            spoken = (
+                f"I couldn't reach {requested_name} directly, so I've sent your "
+                f"message to {specialist_name} to pass along. {reach_line}"
+            )
+        elif reason == "message" and specialist_name:
             spoken = (
                 f"Got it. I'll make sure {specialist_name} gets your message"
                 f"{' by email' if email_queued else ''}. {reach_line}"

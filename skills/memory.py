@@ -60,6 +60,9 @@ async def zep_get_user(user_id: str) -> Optional[Dict]:
         return None
 
 
+_PLACEHOLDER_NAMES = {"", "caller", "unknown", "new caller"}
+
+
 async def zep_create_or_update_user(user_id: str, phone: str, first_name: str = "Caller", metadata: Dict = None) -> Optional[Dict]:
     """Create or update a Zep user with metadata."""
     _zep_client = get_zep_client()
@@ -88,6 +91,16 @@ async def zep_create_or_update_user(user_id: str, phone: str, first_name: str = 
             # replace wholesale), and a `null` value is a no-op rather than a
             # delete — so pre-merging locally keeps the behavior explicit and
             # lets callers "clear" fields by sending "".
+            #
+            # NEVER overwrite an existing user's name with a placeholder
+            # (2026-09-24). If the call_inbound Zep read blipped, the caller
+            # looked new, save_call_to_zep sent first_name="Caller", and this
+            # PATCH erased a real name for good — every later call greeted a
+            # known customer as a stranger. "Caller" is only for creation.
+            if (first_name or "").strip().lower() in _PLACEHOLDER_NAMES:
+                if metadata:
+                    await zep_update_user_metadata(user_id, metadata)
+                return {"user_id": user_id, "exists": True}
             response = await _zep_client.patch(
                 f"{ZEP_BASE_URL}/users/{user_id}",
                 headers=ZEP_HEADERS,
@@ -355,16 +368,33 @@ async def lookup_caller_fast(phone: str) -> Dict[str, Any]:
                 # specialist name for THIS call's dynamic vars. The Zep PATCH
                 # (which just saves the result for next time) is fire-and-forget
                 # so Retell gets its `call_inbound` response ~80ms sooner.
-                if caller_location and not caller_specialist:
+                #
+                # RE-RESOLVED EVERY CALL (2026-09-24). This used to run only
+                # when no specialist was stored, so a Zep value written once
+                # was never refreshed: territory reassignments (Hannah and
+                # Isabell to Columbus, the 9/3 specialist_territories priority
+                # rebuild) never reached returning callers, who kept getting
+                # the old name in {{specialist}} and the old person's
+                # transcript email. The live table wins; the stored value is
+                # only a fallback when the lookup finds nothing or errors.
+                if caller_location:
                     from .specialists import lookup_specialist_by_town
-                    specialist_info = await lookup_specialist_by_town(caller_location)
-                    if specialist_info:
-                        caller_specialist = specialist_info["specialist_name"]
+                    try:
+                        specialist_info = await lookup_specialist_by_town(caller_location)
+                    except Exception as e:
+                        logger.warning(f"[MEMORY] Specialist re-resolve failed, keeping stored: {e}")
+                        specialist_info = None
+                    current = (specialist_info or {}).get("specialist_name")
+                    if current and current != caller_specialist:
+                        if caller_specialist:
+                            logger.info(f"[MEMORY] Specialist refreshed: {caller_specialist} -> {current}")
+                        else:
+                            logger.info(f"[MEMORY] Auto-assigned specialist: {current}")
+                        caller_specialist = current
                         _fire_and_forget(
                             zep_update_user_metadata(user_id, {"specialist": caller_specialist}),
                             label=f"save_specialist({user_id})",
                         )
-                        logger.info(f"[MEMORY] Auto-assigned specialist: {caller_specialist}")
 
                 if caller_location:
                     logger.info(f"[MEMORY] Location: {caller_location}")
